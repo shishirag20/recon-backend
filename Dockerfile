@@ -1,14 +1,25 @@
-FROM python:3.13-slim
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
 
-# `recon` is a namespace package (no __init__.py at its root), so the app
-# code is copied under /app/recon and imported as `recon.app.main`.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev
+
 COPY app ./recon/app
 COPY migrations ./recon/migrations
+COPY pyproject.toml ./
+COPY uv.lock ./
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 
