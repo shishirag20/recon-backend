@@ -14,15 +14,15 @@ import os
 from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
-from recon.app.datahub import transforms
-from recon.app.datahub.constants import (
+from app.datahub import transforms
+from app.datahub.constants import (
     DataHubErrors,
     MAX_UPLOAD_BYTES,
     STREAM_VALUES,
     SUPPORTED_UPLOAD_FORMATS,
     UPLOAD_CHUNK_BYTES,
 )
-from recon.app.datahub.dao import DataHubDAO, new_id
+from app.datahub.dao import DataHubDAO, new_id
 
 UPLOAD_ROOT = "/data/uploads"
 

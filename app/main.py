@@ -6,13 +6,16 @@ with ``schema`` (Pydantic in/out) and ``constants`` shared across the module.
 
 Run: ``uvicorn app.main:app --reload``
 """
+
+import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from recon.app.auth.router import router as auth_router
-from recon.app.datahub.router import router as datahub_router
-from recon.app.db.pool import create_pool
+from app.auth.router import router as auth_router
+from app.datahub.router import router as datahub_router
+from app.db.pool import create_pool
 
 
 @asynccontextmanager
@@ -47,9 +50,28 @@ def create_app() -> FastAPI:
         openapi_tags=OPENAPI_TAGS,
     )
 
-    # Feature routers are registered here as modules are added.
-    app.include_router(auth_router)
-    app.include_router(datahub_router)
+    # CORS middleware with environment variable configuration
+    raw_origins = os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5173",
+    )
+    allowed_origins = [
+        origin.strip() for origin in raw_origins.split(",") if origin.strip()
+    ]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
+
+    api_v1_router = APIRouter(prefix="/api/v1")
+    api_v1_router.include_router(auth_router)
+    api_v1_router.include_router(datahub_router)
+
+    app.include_router(api_v1_router)
 
     @app.get("/health", tags=["Health"])
     async def health() -> dict[str, str]:

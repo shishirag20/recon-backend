@@ -20,9 +20,9 @@ from datetime import timedelta
 
 import asyncpg
 
-from recon.app.datahub.dao import DataHubDAO
-from recon.app.datahub.transforms import apply_mapping
-from recon.app.db.pool import create_pool
+from app.datahub.dao import DataHubDAO
+from app.datahub.transforms import apply_mapping
+from app.db.pool import create_pool
 
 logger = logging.getLogger(__name__)
 

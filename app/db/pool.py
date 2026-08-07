@@ -24,7 +24,9 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 
 
 async def create_pool(min_size: int = 1, max_size: int = 10) -> asyncpg.Pool:
-    database_url = os.environ["DATABASE_URL"]
+    database_url = os.environ.get(
+        "DATABASE_URL", "postgresql://recon:recon@127.0.0.1:5432/recon"
+    )
     return await asyncpg.create_pool(
         database_url, min_size=min_size, max_size=max_size, init=_init_connection
     )

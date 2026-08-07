@@ -14,9 +14,9 @@ from uuid import UUID
 import asyncpg
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 
-from recon.app.datahub.constants import ROUTER_TAGS
-from recon.app.datahub.dao import DataHubDAO
-from recon.app.datahub.schema import (
+from app.datahub.constants import ROUTER_TAGS
+from app.datahub.dao import DataHubDAO
+from app.datahub.schema import (
     DataSourceCreate,
     DataSourceOut,
     DataSourceUpdate,
@@ -28,8 +28,8 @@ from recon.app.datahub.schema import (
     StagingRecordOut,
     StagingRecordUpdate,
 )
-from recon.app.datahub.service import DataHubService
-from recon.app.db.pool import get_connection
+from app.datahub.service import DataHubService
+from app.db.pool import get_connection
 
 router = APIRouter(tags=ROUTER_TAGS)
 
