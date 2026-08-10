@@ -6,6 +6,11 @@ claim a different pending job with zero contention. A crashed worker's job is
 recovered automatically once its lease expires (self-healing, not a stuck
 row) rather than needing manual intervention.
 
+Parses an uploaded file and writes each row directly into its stream's real
+canonical table (bank_statements / invoices / customers) - see
+app/datahub/canonical.py. A row that can't be turned into a canonical record
+doesn't fail the batch; it's collected into the job's `failed_rows` instead.
+
 Run: python -m recon.app.workers.ingestion_worker
 """
 from __future__ import annotations
@@ -20,6 +25,7 @@ from datetime import timedelta
 
 import asyncpg
 
+from recon.app.datahub.canonical import STREAM_INSERTERS, RowRejected, unknown_field_issues
 from recon.app.datahub.dao import DataHubDAO
 from recon.app.datahub.transforms import apply_mapping
 from recon.app.db.pool import create_pool
@@ -50,7 +56,7 @@ SET status = 'RUNNING',
     attempt_count = j.attempt_count + 1
 FROM claimed
 WHERE j.job_id = claimed.job_id
-RETURNING j.job_id, j.file_uri, j.file_name, j.format, j.source_id, j.job_type, j.parent_job_id, j.stream,
+RETURNING j.job_id, j.file_uri, j.file_name, j.format, j.source_id, j.stream,
           j.attempt_count, j.max_attempts;
 """
 
@@ -63,7 +69,7 @@ RETURNING job_id;
 
 _COMPLETE_SQL = """
 UPDATE ingestion_jobs
-SET status = $3, row_count = $4, error_count = $5,
+SET status = $3, row_count = $4, error_count = $5, failed_rows = $6,
     locked_by = NULL, lease_expires_at = NULL
 WHERE job_id = $1 AND locked_by = $2
 RETURNING job_id;
@@ -108,15 +114,19 @@ async def _heartbeat_loop(pool: asyncpg.Pool, job_id: str, stop_event: asyncio.E
             return
 
 
-async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tuple[int, int]:
-    """Parses the uploaded file at job['file_uri'] into staging_records using
-    the data source's currently-active field_mappings.
+async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tuple[int, int, list[dict]]:
+    """Parses the uploaded file at job['file_uri'] and writes each row
+    directly into its stream's canonical table.
 
-    Only CSV is implemented (see SUPPORTED_UPLOAD_FORMATS) - anything else
+    Only CSV is implemented (see SUPPORTED_UPLOAD_FORMATS), and only the
+    BANK/INVOICE/CUSTOMER streams have a canonical inserter - anything else
     raises, which run_one_job turns into a normal retry/dead-letter failure.
     """
     if job["format"] != "CSV":
         raise ValueError(f"unsupported format {job['format']!r} (only CSV implemented so far)")
+    insert_fn = STREAM_INSERTERS.get(job["stream"])
+    if insert_fn is None:
+        raise ValueError(f"unsupported stream {job['stream']!r} for direct-to-canonical ingestion")
     if not job["file_uri"] or not os.path.exists(job["file_uri"]):
         raise FileNotFoundError(f"no file at {job['file_uri']!r}")
 
@@ -125,69 +135,51 @@ async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tupl
         mappings = await dao.get_active_mappings(job["source_id"])
         if not mappings:
             raise ValueError(f"data source {job['source_id']} has no active field mapping")
+        source = await dao.get_data_source(job["source_id"])
+        entity_id = source["entity_id"]
 
     row_count = 0
     error_count = 0
-    staged_rows = []
-    with open(job["file_uri"], newline="", encoding="utf-8-sig") as f:
-        for raw_row in csv.DictReader(f):
-            canonical, issues = apply_mapping(raw_row, mappings)
-            row_count += 1
-            if issues:
-                error_count += 1
-            staged_rows.append((
-                uuid.uuid4(), job["job_id"], job["stream"],
-                canonical.get("txn_date"), canonical.get("reference"), canonical.get("counterparty"),
-                canonical.get("amount_minor"), canonical.get("amount_home_minor"),
-                canonical.get("currency"), canonical.get("dr_cr"),
-                raw_row, len(issues) == 0, issues or None,
-            ))
+    failed_rows: list[dict] = []
+
+    async with pool.acquire() as conn:
+        with open(job["file_uri"], newline="", encoding="utf-8-sig") as f:
+            for raw_row in csv.DictReader(f):
+                row_count += 1
+                canonical, issues = apply_mapping(raw_row, mappings)
+                issues = issues + unknown_field_issues(job["stream"], canonical)
+                try:
+                    await insert_fn(
+                        conn, entity_id=entity_id, source_job_id=job["job_id"],
+                        canonical=canonical, raw=raw_row, issues=issues,
+                    )
+                    if issues:
+                        error_count += 1
+                except RowRejected as exc:
+                    error_count += 1
+                    failed_rows.append({"raw": raw_row, "issues": issues + [str(exc)]})
 
     mapping_version = mappings[0]["version"]
     async with pool.acquire() as conn:
-        dao = DataHubDAO(conn)
-        async with conn.transaction():
-            await dao.insert_staging_rows(staged_rows)
-            await conn.execute(
-                "UPDATE ingestion_jobs SET mapping_version = $2 WHERE job_id = $1", job["job_id"], mapping_version
-            )
-    return row_count, error_count
-
-
-async def process_promotion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tuple[int, int]:
-    """Placeholder: writing reviewed staging_records into canonical tables
-    (business_partners/invoices/bank_statements/...) per stream belongs here.
-
-    For now this only proves the job_type dispatch and parent_job_id linkage
-    by reporting how many of the parent INGEST job's rows are promotable.
-    """
-    async with pool.acquire() as conn:
-        counts = await conn.fetchrow(
-            "SELECT count(*) FILTER (WHERE valid) AS valid_count, "
-            "count(*) FILTER (WHERE NOT valid) AS invalid_count "
-            "FROM staging_records WHERE job_id = $1",
-            job["parent_job_id"],
+        await conn.execute(
+            "UPDATE ingestion_jobs SET mapping_version = $2 WHERE job_id = $1", job["job_id"], mapping_version
         )
-    return counts["valid_count"], counts["invalid_count"]
-
-
-async def process_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tuple[int, int]:
-    if job["job_type"] == "PROMOTE":
-        return await process_promotion_job(pool, job)
-    return await process_ingestion_job(pool, job)
+    return row_count, error_count, failed_rows
 
 
 async def run_one_job(pool: asyncpg.Pool, job: asyncpg.Record) -> None:
     stop_event = asyncio.Event()
     heartbeat_task = asyncio.create_task(_heartbeat_loop(pool, job["job_id"], stop_event))
     try:
-        row_count, error_count = await process_job(pool, job)
+        row_count, error_count, failed_rows = await process_ingestion_job(pool, job)
         if stop_event.is_set():
             logger.warning("job %s lease was lost mid-processing; discarding result", job["job_id"])
             return
         status = "SUCCESS" if error_count == 0 else "PARTIAL"
         async with pool.acquire() as conn:
-            await conn.execute(_COMPLETE_SQL, job["job_id"], WORKER_ID, status, row_count, error_count)
+            await conn.execute(
+                _COMPLETE_SQL, job["job_id"], WORKER_ID, status, row_count, error_count, failed_rows or None
+            )
         logger.info("job %s completed: %s (%d rows, %d errors)", job["job_id"], status, row_count, error_count)
     except Exception as exc:  # noqa: BLE001 - any failure here is a job-level failure that must be recorded
         logger.exception("job %s failed", job["job_id"])

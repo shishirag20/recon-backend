@@ -7,6 +7,11 @@ follows throughout. Every function takes an `asyncpg.Connection`/`Pool`.
 can't cross into Pydantic response models as-is - every fetch result is
 converted to a plain dict at the DAO boundary (`_row`/`_rows`) so nothing
 above this module ever touches the driver-specific type.
+
+`list_records`/`get_record`/`update_record` build SQL against a `table`/
+`pk_column`/`search_column` - always one of the fixed values in
+app/datahub/canonical.py's STREAM_TABLES, never user input, so the
+interpolation is safe.
 """
 from __future__ import annotations
 
@@ -106,20 +111,10 @@ class DataHubDAO:
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO ingestion_jobs "
-            "(job_id, source_id, job_type, stream, file_name, file_uri, format, trigger_type, status, started_by) "
-            "VALUES ($1, $2, 'INGEST', $3, $4, $5, $6, 'MANUAL', 'PENDING', $7) "
+            "(job_id, source_id, stream, file_name, file_uri, format, trigger_type, status, started_by) "
+            "VALUES ($1, $2, $3, $4, $5, $6, 'MANUAL', 'PENDING', $7) "
             "RETURNING *",
             job_id, source_id, stream, file_name, file_uri, fmt, started_by,
-        )
-        return _row(row)
-
-    async def insert_promote_job(self, *, parent_job_id: str, source_id: str | None) -> dict:
-        row = await self.conn.fetchrow(
-            "INSERT INTO ingestion_jobs "
-            "(job_id, source_id, job_type, parent_job_id, status) "
-            "VALUES (gen_random_uuid(), $1, 'PROMOTE', $2, 'PENDING') "
-            "RETURNING *",
-            source_id, parent_job_id,
         )
         return _row(row)
 
@@ -128,15 +123,14 @@ class DataHubDAO:
         return _row(row)
 
     async def list_jobs(
-        self, *, source_id: str | None, status: str | None, job_type: str | None, limit: int, offset: int
+        self, *, source_id: str | None, status: str | None, limit: int, offset: int
     ) -> list[dict]:
         rows = await self.conn.fetch(
             "SELECT * FROM ingestion_jobs "
             "WHERE ($1::uuid IS NULL OR source_id = $1) "
             "AND ($2::text IS NULL OR status = $2) "
-            "AND ($3::text IS NULL OR job_type = $3) "
-            "ORDER BY started_at DESC LIMIT $4 OFFSET $5",
-            source_id, status, job_type, limit, offset,
+            "ORDER BY started_at DESC LIMIT $3 OFFSET $4",
+            source_id, status, limit, offset,
         )
         return _rows(rows)
 
@@ -149,44 +143,42 @@ class DataHubDAO:
         )
         return _row(row)
 
-    # -- staging_records --------------------------------------------------------
-    async def list_staging_records(
-        self, *, job_id: str, valid: bool | None, search: str | None, limit: int, offset: int
+    # -- canonical records (Data Explorer) --------------------------------------------------------
+    async def list_records(
+        self, *, table: str, pk_column: str, search_column: str | None,
+        job_id: str, valid: bool | None, search: str | None, limit: int, offset: int,
     ) -> list[dict]:
-        rows = await self.conn.fetch(
-            "SELECT * FROM staging_records "
-            "WHERE job_id = $1 "
-            "AND ($2::boolean IS NULL OR valid = $2) "
-            "AND ($3::text IS NULL OR reference ILIKE '%' || $3 || '%' OR counterparty ILIKE '%' || $3 || '%') "
-            "ORDER BY staging_id LIMIT $4 OFFSET $5",
-            job_id, valid, search, limit, offset,
+        conditions = ["source_job_id = $1"]
+        params: list = [job_id]
+        if valid is not None:
+            params.append(valid)
+            conditions.append(f"valid = ${len(params)}")
+        if search_column and search:
+            params.append(f"%{search}%")
+            conditions.append(f"{search_column} ILIKE ${len(params)}")
+        params.extend([limit, offset])
+        sql = (
+            f"SELECT * FROM {table} WHERE {' AND '.join(conditions)} "
+            f"ORDER BY {pk_column} LIMIT ${len(params) - 1} OFFSET ${len(params)}"
         )
+        rows = await self.conn.fetch(sql, *params)
         return _rows(rows)
 
-    async def get_staging_record(self, staging_id: str) -> dict | None:
-        row = await self.conn.fetchrow("SELECT * FROM staging_records WHERE staging_id = $1", staging_id)
+    async def get_record(self, *, table: str, pk_column: str, record_id: str) -> dict | None:
+        row = await self.conn.fetchrow(f"SELECT * FROM {table} WHERE {pk_column} = $1", record_id)
         return _row(row)
 
-    async def update_staging_record(self, staging_id: str, fields: dict) -> dict | None:
+    async def update_record(self, *, table: str, pk_column: str, record_id: str, fields: dict) -> dict | None:
         if not fields:
-            return await self.get_staging_record(staging_id)
+            return await self.get_record(table=table, pk_column=pk_column, record_id=record_id)
         set_clauses = []
-        params: list = [staging_id]
-        for i, (col, value) in enumerate(fields.items(), start=2):
-            set_clauses.append(f"{col} = ${i}")
+        params: list = [record_id]
+        for col, value in fields.items():
             params.append(value)
-        sql = f"UPDATE staging_records SET {', '.join(set_clauses)} WHERE staging_id = $1 RETURNING *"
+            set_clauses.append(f"{col} = ${len(params)}")
+        sql = f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {pk_column} = $1 RETURNING *"
         row = await self.conn.fetchrow(sql, *params)
         return _row(row)
-
-    async def insert_staging_rows(self, rows: list[tuple]) -> None:
-        await self.conn.executemany(
-            "INSERT INTO staging_records "
-            "(staging_id, job_id, stream, txn_date, reference, counterparty, "
-            "amount_minor, amount_home_minor, currency, dr_cr, raw, valid, issues) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-            rows,
-        )
 
 
 def new_id() -> str:

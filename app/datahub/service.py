@@ -15,6 +15,7 @@ from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from recon.app.datahub import transforms
+from recon.app.datahub.canonical import STREAM_TABLES, SEARCH_COLUMNS
 from recon.app.datahub.constants import (
     DataHubErrors,
     MAX_UPLOAD_BYTES,
@@ -120,8 +121,8 @@ class DataHubService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.JOB_NOT_FOUND)
         return row
 
-    async def list_jobs(self, *, source_id: str | None, status_: str | None, job_type: str | None, limit: int, offset: int):
-        return await self.dao.list_jobs(source_id=source_id, status=status_, job_type=job_type, limit=limit, offset=offset)
+    async def list_jobs(self, *, source_id: str | None, status_: str | None, limit: int, offset: int):
+        return await self.dao.list_jobs(source_id=source_id, status=status_, limit=limit, offset=offset)
 
     async def retry_job(self, job_id: str):
         await self.get_job(job_id)  # 404s if missing
@@ -130,28 +131,38 @@ class DataHubService:
             raise HTTPException(status.HTTP_409_CONFLICT, DataHubErrors.JOB_NOT_RETRYABLE)
         return row
 
-    async def create_promote_job(self, parent_job_id: str):
-        parent = await self.get_job(parent_job_id)
-        if parent["job_type"] != "INGEST" or parent["status"] not in ("SUCCESS", "PARTIAL"):
-            raise HTTPException(status.HTTP_409_CONFLICT, DataHubErrors.JOB_NOT_PROMOTABLE)
-        return await self.dao.insert_promote_job(parent_job_id=parent_job_id, source_id=parent["source_id"])
+    # -- canonical records (Data Explorer) --------------------------------------------------------
+    async def list_records(self, job_id: str, *, valid: bool | None, search: str | None, limit: int, offset: int):
+        job = await self.get_job(job_id)
+        table, pk_column = self._stream_table(job["stream"])
+        return await self.dao.list_records(
+            table=table, pk_column=pk_column, search_column=SEARCH_COLUMNS.get(job["stream"]),
+            job_id=job_id, valid=valid, search=search, limit=limit, offset=offset,
+        )
 
-    # -- staging_records --------------------------------------------------------
-    async def list_staging_records(self, job_id: str, *, valid: bool | None, search: str | None, limit: int, offset: int):
-        await self.get_job(job_id)
-        return await self.dao.list_staging_records(job_id=job_id, valid=valid, search=search, limit=limit, offset=offset)
-
-    async def get_staging_record(self, staging_id: str):
-        row = await self.dao.get_staging_record(staging_id)
+    async def get_record(self, job_id: str, record_id: str):
+        job = await self.get_job(job_id)
+        table, pk_column = self._stream_table(job["stream"])
+        row = await self.dao.get_record(table=table, pk_column=pk_column, record_id=record_id)
         if row is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.STAGING_RECORD_NOT_FOUND)
+            raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.RECORD_NOT_FOUND)
         return row
 
-    async def update_staging_record(self, staging_id: str, fields: dict):
-        await self.get_staging_record(staging_id)
+    async def update_record(self, job_id: str, record_id: str, fields: dict):
+        job = await self.get_job(job_id)
+        table, pk_column = self._stream_table(job["stream"])
         fields = {k: v for k, v in fields.items() if v is not None}
-        row = await self.dao.update_staging_record(staging_id, fields)
+        row = await self.dao.update_record(table=table, pk_column=pk_column, record_id=record_id, fields=fields)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.RECORD_NOT_FOUND)
         return row
+
+    @staticmethod
+    def _stream_table(stream: str) -> tuple[str, str]:
+        table = STREAM_TABLES.get(stream)
+        if table is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, DataHubErrors.UNSUPPORTED_STREAM_FOR_EXPLORER)
+        return table
 
 
 def _remove_quietly(path: str) -> None:

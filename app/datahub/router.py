@@ -5,7 +5,7 @@ see app/auth/router.py). Where it belongs, once `require_permission` exists:
   - datahub:configure -> data source / field mapping writes
   - ingestion:upload   -> POST /ingestion-jobs
   - ingestion:view     -> every GET below
-  - ingestion:manage   -> retry, promote, PATCH staging-records
+  - ingestion:manage   -> retry, PATCH records
 """
 from __future__ import annotations
 
@@ -25,8 +25,6 @@ from recon.app.datahub.schema import (
     IngestionJobOut,
     MappingPreviewRequest,
     MappingPreviewResponse,
-    StagingRecordOut,
-    StagingRecordUpdate,
 )
 from recon.app.datahub.service import DataHubService
 from recon.app.db.pool import get_connection
@@ -131,18 +129,21 @@ async def preview_field_mapping(
 )
 async def upload_ingestion_job(
     source_id: UUID = Form(..., description="Must already exist and have an active field mapping."),
-    stream: str = Form(..., description="One of: BANK, LEDGER, INVOICE, GATEWAY, CUSTOMER."),
+    stream: str = Form(..., description="One of: BANK, INVOICE, CUSTOMER (LEDGER/GATEWAY accepted but not yet implemented)."),
     format: str = Form(..., description="Only CSV is parsed today; other values are accepted but the job will fail."),
     file: UploadFile = File(...),
     service: DataHubService = Depends(get_service),
 ):
     """Saves the file and creates a job with `status=PENDING`, then returns
     immediately - it does **not** wait for parsing. A background worker polls
-    for pending jobs (typically picks one up within a few seconds) and does
-    the actual parsing asynchronously.
+    for pending jobs (typically picks one up within a few seconds), maps each
+    row, and writes it directly into the stream's canonical table
+    (bank_statements / invoices / customers) - there's no intermediate
+    staging step or separate promote action.
 
     Poll `GET /ingestion-jobs/{job_id}` until `status` leaves `PENDING`/`RUNNING`
-    to see the outcome (`SUCCESS`, `PARTIAL`, or `FAILED` with `last_error` set)."""
+    to see the outcome. Rows that couldn't satisfy a required column end up in
+    that response's `failed_rows`, not in any table."""
     # started_by is None until real auth provides the caller's user id
     return await service.create_upload_job(source_id=source_id, stream=stream, fmt=format, file=file, started_by=None)
 
@@ -151,12 +152,11 @@ async def upload_ingestion_job(
 async def list_ingestion_jobs(
     source_id: UUID | None = None,
     status: str | None = None,
-    job_type: str | None = None,
     limit: int = 50,
     offset: int = 0,
     service: DataHubService = Depends(get_service),
 ):
-    return await service.list_jobs(source_id=source_id, status_=status, job_type=job_type, limit=limit, offset=offset)
+    return await service.list_jobs(source_id=source_id, status_=status, limit=limit, offset=offset)
 
 
 @router.get("/ingestion-jobs/{job_id}", response_model=IngestionJobOut, summary="Get an ingestion job")
@@ -175,50 +175,36 @@ async def retry_ingestion_job(job_id: UUID, service: DataHubService = Depends(ge
     return await service.retry_job(job_id)
 
 
-@router.post(
-    "/ingestion-jobs/{job_id}/promote",
-    response_model=IngestionJobOut,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Promote a completed ingestion job",
-)
-async def promote_ingestion_job(job_id: UUID, service: DataHubService = Depends(get_service)):
-    """Creates a new `job_type=PROMOTE` job (queued the same way as an upload)
-    that writes this job's reviewed staging_records into canonical tables.
-    Only valid when the target job is `job_type=INGEST` and
-    `status` is `SUCCESS` or `PARTIAL` (409 otherwise) - this is a deliberate
-    human checkpoint, not automatic, even for a batch with zero errors."""
-    return await service.create_promote_job(job_id)
-
-
-# -- staging_records --------------------------------------------------------
+# -- Data Explorer: canonical records produced by a job --------------------------------------------------------
 @router.get(
-    "/ingestion-jobs/{job_id}/staging-records",
-    response_model=list[StagingRecordOut],
-    summary="List staged rows for a job",
+    "/ingestion-jobs/{job_id}/records",
+    summary="List the canonical rows a job produced",
 )
-async def list_staging_records(
+async def list_records(
     job_id: UUID,
     valid: bool | None = None,
-    search: str | None = Query(default=None, description="Matches against `reference` or `counterparty`."),
+    search: str | None = Query(default=None, description="Matches the stream's natural-key-ish column (bank_reference / invoice_number / company_name)."),
     limit: int = 50,
     offset: int = 0,
     service: DataHubService = Depends(get_service),
 ):
-    return await service.list_staging_records(job_id, valid=valid, search=search, limit=limit, offset=offset)
+    """Reads directly from whichever canonical table this job's `stream`
+    writes to (bank_statements / invoices / customers) - the response shape
+    therefore differs by stream, which is why this isn't a typed Pydantic
+    model. `valid=false` finds rows that were inserted but flagged with
+    issues; rows that couldn't be inserted at all are in the job's
+    `failed_rows`, not here."""
+    return await service.list_records(job_id, valid=valid, search=search, limit=limit, offset=offset)
 
 
-@router.get("/staging-records/{staging_id}", response_model=StagingRecordOut, summary="Get a staged row")
-async def get_staging_record(staging_id: UUID, service: DataHubService = Depends(get_service)):
-    return await service.get_staging_record(staging_id)
+@router.get("/ingestion-jobs/{job_id}/records/{record_id}", summary="Get one canonical row")
+async def get_record(job_id: UUID, record_id: UUID, service: DataHubService = Depends(get_service)):
+    return await service.get_record(job_id, record_id)
 
 
-@router.patch(
-    "/staging-records/{staging_id}",
-    response_model=StagingRecordOut,
-    summary="Manually correct a staged row",
-)
-async def update_staging_record(staging_id: UUID, payload: StagingRecordUpdate, service: DataHubService = Depends(get_service)):
-    """For fixing a row that failed a transform before it's promoted - e.g. an
-    operator supplies the correct `amount_minor` by hand and sets `valid=true`.
-    Only send the fields you want to change."""
-    return await service.update_staging_record(staging_id, payload.model_dump(exclude_unset=True))
+@router.patch("/ingestion-jobs/{job_id}/records/{record_id}", summary="Correct a canonical row")
+async def update_record(job_id: UUID, record_id: UUID, fields: dict, service: DataHubService = Depends(get_service)):
+    """For fixing a row that was inserted with `valid=false` - pass any
+    subset of the stream's columns (e.g. `{"amount_minor": 100000, "valid": true}`).
+    Not a typed body since the editable columns differ by stream."""
+    return await service.update_record(job_id, record_id, fields)
