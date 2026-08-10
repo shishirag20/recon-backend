@@ -34,13 +34,15 @@ class DataHubService:
         self.dao = dao
 
     # -- data_sources --------------------------------------------------------
-    async def create_data_source(self, *, entity_id: str, name: str, kind: str):
+    async def create_data_source(self, *, entity_id: str, name: str, kind: str, stream: str):
+        if stream not in STREAM_VALUES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM)
         if not await self.dao.entity_exists(entity_id):
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, DataHubErrors.ENTITY_NOT_FOUND
             )
         return await self.dao.insert_data_source(
-            entity_id=entity_id, name=name, kind=kind
+            entity_id=entity_id, name=name, kind=kind, stream=stream
         )
 
     async def get_data_source(self, source_id: str):
@@ -100,20 +102,16 @@ class DataHubService:
         self,
         *,
         source_id: str,
-        stream: str,
         fmt: str,
         file: UploadFile,
         started_by: str | None,
     ):
-        if stream not in STREAM_VALUES:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM
-            )
         if fmt not in SUPPORTED_UPLOAD_FORMATS:
             raise HTTPException(
                 status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, DataHubErrors.UNSUPPORTED_FORMAT
             )
-        await self.get_data_source(source_id)  # 404s if missing
+        source = await self.get_data_source(source_id)  # 404s if missing
+        stream = source["stream"]  # derived from the source, never client-supplied - see migration 0023's rationale
 
         job_id = new_id()
         safe_filename = os.path.basename(file.filename or "upload")
@@ -196,6 +194,32 @@ class DataHubService:
             pk_column=pk_column,
             search_column=SEARCH_COLUMNS.get(job["stream"]),
             job_id=job_id,
+            valid=valid,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def list_records_by_stream(
+        self,
+        *,
+        stream: str,
+        entity_id: str,
+        valid: bool | None,
+        search: str | None,
+        limit: int,
+        offset: int,
+    ):
+        """Every record of this stream ever ingested for an entity, across
+        every job/data source that ever fed it - not scoped to one upload."""
+        if not await self.dao.entity_exists(entity_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.ENTITY_NOT_FOUND)
+        table, pk_column = self._stream_table(stream)
+        return await self.dao.list_records_by_entity(
+            table=table,
+            pk_column=pk_column,
+            search_column=SEARCH_COLUMNS.get(stream),
+            entity_id=entity_id,
             valid=valid,
             search=search,
             limit=limit,

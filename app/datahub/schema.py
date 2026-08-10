@@ -36,6 +36,13 @@ class DataSourceCreate(BaseModel):
     entity_id: UUID = Field(description="The legal entity this feed belongs to.")
     name: str = Field(min_length=1, max_length=200, description="Human-readable label, e.g. 'HDFC CMRG-1240'.")
     kind: str = Field(description="One of: BANK_FEED, GATEWAY, ERP, MANUAL_UPLOAD.")
+    stream: str = Field(
+        description=(
+            "One of: BANK, INVOICE, CUSTOMER (LEDGER/GATEWAY accepted but not yet implemented). "
+            "Fixed for the lifetime of this source - every upload against it writes to this stream's "
+            "canonical table, so this is set once here rather than re-specified per upload."
+        )
+    )
 
 
 class DataSourceUpdate(BaseModel):
@@ -48,6 +55,7 @@ class DataSourceOut(BaseModel):
     entity_id: UUID
     name: str
     kind: str
+    stream: str
     status: str
 
     model_config = {"from_attributes": True}

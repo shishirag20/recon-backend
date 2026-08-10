@@ -48,7 +48,9 @@ async def create_data_source(payload: DataSourceCreate, service: DataHubService 
     bucket) for an entity. A data source must exist - and have an active field
     mapping (see `POST /data-sources/{source_id}/field-mappings/versions`) -
     before any file can be uploaded against it."""
-    return await service.create_data_source(entity_id=payload.entity_id, name=payload.name, kind=payload.kind)
+    return await service.create_data_source(
+        entity_id=payload.entity_id, name=payload.name, kind=payload.kind, stream=payload.stream
+    )
 
 
 @router.get("/data-sources", response_model=list[DataSourceOut], summary="List data sources")
@@ -129,7 +131,6 @@ async def preview_field_mapping(
 )
 async def upload_ingestion_job(
     source_id: UUID = Form(..., description="Must already exist and have an active field mapping."),
-    stream: str = Form(..., description="One of: BANK, INVOICE, CUSTOMER (LEDGER/GATEWAY accepted but not yet implemented)."),
     format: str = Form(..., description="Only CSV is parsed today; other values are accepted but the job will fail."),
     file: UploadFile = File(...),
     service: DataHubService = Depends(get_service),
@@ -141,11 +142,16 @@ async def upload_ingestion_job(
     (bank_statements / invoices / customers) - there's no intermediate
     staging step or separate promote action.
 
+    `stream` is not a request parameter - it's fixed on the data source
+    itself (set at `POST /data-sources` creation) and looked up from
+    `source_id` server-side, so a client can't accidentally mismatch a file
+    against the wrong canonical table.
+
     Poll `GET /ingestion-jobs/{job_id}` until `status` leaves `PENDING`/`RUNNING`
     to see the outcome. Rows that couldn't satisfy a required column end up in
     that response's `failed_rows`, not in any table."""
     # started_by is None until real auth provides the caller's user id
-    return await service.create_upload_job(source_id=source_id, stream=stream, fmt=format, file=file, started_by=None)
+    return await service.create_upload_job(source_id=source_id, fmt=format, file=file, started_by=None)
 
 
 @router.get("/ingestion-jobs", response_model=list[IngestionJobOut], summary="List ingestion jobs")
@@ -195,6 +201,29 @@ async def list_records(
     issues; rows that couldn't be inserted at all are in the job's
     `failed_rows`, not here."""
     return await service.list_records(job_id, valid=valid, search=search, limit=limit, offset=offset)
+
+
+@router.get(
+    "/records",
+    summary="List every canonical row of a stream, across all jobs/sources",
+)
+async def list_records_by_stream(
+    stream: str = Query(..., description="One of: BANK, INVOICE, CUSTOMER."),
+    entity_id: UUID = Query(..., description="Scopes results to one tenant entity."),
+    valid: bool | None = None,
+    search: str | None = Query(default=None, description="Matches the stream's natural-key-ish column (bank_reference / invoice_number / company_name)."),
+    limit: int = 50,
+    offset: int = 0,
+    service: DataHubService = Depends(get_service),
+):
+    """Unlike `GET /ingestion-jobs/{job_id}/records` (one upload's batch),
+    this returns every row of the given stream's canonical table for the
+    entity, regardless of which job or data source produced it - the
+    "Bank Statements" / "Sub-Ledger" / "Customer Master" tab view rather than
+    a per-upload view."""
+    return await service.list_records_by_stream(
+        stream=stream, entity_id=entity_id, valid=valid, search=search, limit=limit, offset=offset
+    )
 
 
 @router.get("/ingestion-jobs/{job_id}/records/{record_id}", summary="Get one canonical row")

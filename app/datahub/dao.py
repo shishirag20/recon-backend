@@ -38,25 +38,25 @@ class DataHubDAO:
         return row is not None
 
     # -- data_sources --------------------------------------------------------
-    async def insert_data_source(self, *, entity_id: str, name: str, kind: str) -> dict:
+    async def insert_data_source(self, *, entity_id: str, name: str, kind: str, stream: str) -> dict:
         row = await self.conn.fetchrow(
-            "INSERT INTO data_sources (source_id, entity_id, name, kind, status) "
-            "VALUES (gen_random_uuid(), $1, $2, $3, 'CONNECTED') "
-            "RETURNING source_id, entity_id, name, kind, status",
-            entity_id, name, kind,
+            "INSERT INTO data_sources (source_id, entity_id, name, kind, stream, status) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $4, 'CONNECTED') "
+            "RETURNING source_id, entity_id, name, kind, stream, status",
+            entity_id, name, kind, stream,
         )
         return _row(row)
 
     async def get_data_source(self, source_id: str) -> dict | None:
         row = await self.conn.fetchrow(
-            "SELECT source_id, entity_id, name, kind, status FROM data_sources WHERE source_id = $1",
+            "SELECT source_id, entity_id, name, kind, stream, status FROM data_sources WHERE source_id = $1",
             source_id,
         )
         return _row(row)
 
     async def list_data_sources(self, *, entity_id: str | None, kind: str | None) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT source_id, entity_id, name, kind, status FROM data_sources "
+            "SELECT source_id, entity_id, name, kind, stream, status FROM data_sources "
             "WHERE ($1::uuid IS NULL OR entity_id = $1) AND ($2::text IS NULL OR kind = $2) "
             "ORDER BY name",
             entity_id, kind,
@@ -67,7 +67,7 @@ class DataHubDAO:
         row = await self.conn.fetchrow(
             "UPDATE data_sources SET name = COALESCE($2, name), status = COALESCE($3, status) "
             "WHERE source_id = $1 "
-            "RETURNING source_id, entity_id, name, kind, status",
+            "RETURNING source_id, entity_id, name, kind, stream, status",
             source_id, name, status,
         )
         return _row(row)
@@ -144,12 +144,12 @@ class DataHubDAO:
         return _row(row)
 
     # -- canonical records (Data Explorer) --------------------------------------------------------
-    async def list_records(
-        self, *, table: str, pk_column: str, search_column: str | None,
-        job_id: str, valid: bool | None, search: str | None, limit: int, offset: int,
+    async def _list_records(
+        self, *, table: str, pk_column: str, search_column: str | None, scope_column: str, scope_value: str,
+        valid: bool | None, search: str | None, limit: int, offset: int,
     ) -> list[dict]:
-        conditions = ["source_job_id = $1"]
-        params: list = [job_id]
+        conditions = [f"{scope_column} = $1"]
+        params: list = [scope_value]
         if valid is not None:
             params.append(valid)
             conditions.append(f"valid = ${len(params)}")
@@ -163,6 +163,28 @@ class DataHubDAO:
         )
         rows = await self.conn.fetch(sql, *params)
         return _rows(rows)
+
+    async def list_records(
+        self, *, table: str, pk_column: str, search_column: str | None,
+        job_id: str, valid: bool | None, search: str | None, limit: int, offset: int,
+    ) -> list[dict]:
+        """All records a single ingestion job produced."""
+        return await self._list_records(
+            table=table, pk_column=pk_column, search_column=search_column,
+            scope_column="source_job_id", scope_value=job_id,
+            valid=valid, search=search, limit=limit, offset=offset,
+        )
+
+    async def list_records_by_entity(
+        self, *, table: str, pk_column: str, search_column: str | None,
+        entity_id: str, valid: bool | None, search: str | None, limit: int, offset: int,
+    ) -> list[dict]:
+        """Every record of this stream ever ingested for an entity, across all jobs/sources."""
+        return await self._list_records(
+            table=table, pk_column=pk_column, search_column=search_column,
+            scope_column="entity_id", scope_value=entity_id,
+            valid=valid, search=search, limit=limit, offset=offset,
+        )
 
     async def get_record(self, *, table: str, pk_column: str, record_id: str) -> dict | None:
         row = await self.conn.fetchrow(f"SELECT * FROM {table} WHERE {pk_column} = $1", record_id)
