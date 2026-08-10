@@ -11,7 +11,7 @@ canonical table (bank_statements / invoices / customers) - see
 app/datahub/canonical.py. A row that can't be turned into a canonical record
 doesn't fail the batch; it's collected into the job's `failed_rows` instead.
 
-Run: python -m recon.app.workers.ingestion_worker
+Run: python -m app.workers.ingestion_worker
 """
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ from datetime import timedelta
 
 import asyncpg
 
-from recon.app.datahub.canonical import STREAM_INSERTERS, RowRejected, unknown_field_issues
-from recon.app.datahub.dao import DataHubDAO
-from recon.app.datahub.transforms import apply_mapping
-from recon.app.db.pool import create_pool
+from app.datahub.canonical import STREAM_INSERTERS, RowRejected, unknown_field_issues
+from app.datahub.dao import DataHubDAO
+from app.datahub.transforms import apply_mapping
+from app.db.pool import create_pool
 
 logger = logging.getLogger(__name__)
 

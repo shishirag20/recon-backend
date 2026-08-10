@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
-from recon.app.auth.constants import DEFAULT_ROLE, AuthErrors
-from recon.app.auth.dao import AuthDAO
-from recon.app.auth.schema import LoginRequest, RegisterRequest, TokenResponse, UserOut
+from app.auth.constants import DEFAULT_ROLE, AuthErrors
+from app.auth.dao import AuthDAO
+from app.auth.schema import LoginRequest, RegisterRequest, TokenResponse, UserOut
 
 # Shared security helpers live under app/core (hashing + JWT); added later.
 # from app.core.security import hash_password, verify_password, create_token

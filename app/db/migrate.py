@@ -1,6 +1,6 @@
 """Applies pending SQL migrations from migrations/ against DATABASE_URL.
 
-Run: python -m recon.app.db.migrate
+Run: python -m app.db.migrate
 """
 from __future__ import annotations
 

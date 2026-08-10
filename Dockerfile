@@ -10,8 +10,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --no-dev
 
-COPY app ./recon/app
-COPY migrations ./recon/migrations
+COPY app ./app
+COPY migrations ./migrations
 COPY pyproject.toml ./
 COPY uv.lock ./
 
@@ -23,4 +23,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "recon.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

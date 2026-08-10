@@ -10,9 +10,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from recon.app.auth.router import router as auth_router
-from recon.app.datahub.router import router as datahub_router
-from recon.app.db.pool import create_pool
+from app.auth.router import router as auth_router
+from app.datahub.router import router as datahub_router
+from app.db.pool import create_pool
 
 
 @asynccontextmanager

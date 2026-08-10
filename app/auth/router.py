@@ -13,16 +13,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from recon.app.auth.constants import ROUTER_PREFIX, ROUTER_TAGS
-from recon.app.auth.dao import AuthDAO
-from recon.app.auth.schema import (
+from app.auth.constants import ROUTER_PREFIX, ROUTER_TAGS
+from app.auth.dao import AuthDAO
+from app.auth.schema import (
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
     TokenResponse,
     UserOut,
 )
-from recon.app.auth.service import AuthService
+from app.auth.service import AuthService
 
 router = APIRouter(prefix=ROUTER_PREFIX, tags=ROUTER_TAGS)
 
