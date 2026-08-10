@@ -3,10 +3,16 @@
 ID fields are typed `UUID`, not `str` - asyncpg returns `uuid.UUID` objects
 for uuid columns, and DAO results are passed straight through as dicts (see
 dao.py), so response models must accept the native type rather than a string.
+
+Canonical records (bank_statements/invoices/customers rows returned by the
+Data Explorer endpoints) are intentionally *not* modeled here - the three
+tables have genuinely different shapes, and forcing them through one Pydantic
+model would either lose fields or paper over real differences. Those
+endpoints return plain dicts; see router.py.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -53,8 +59,13 @@ class FieldMappingIn(BaseModel):
     canonical_field: str = Field(
         min_length=1,
         description=(
-            "Target column on staging_records, e.g. txn_date, reference, counterparty, "
-            "amount_minor, amount_home_minor, currency, dr_cr."
+            "Target column on the stream's canonical table. BANK: transaction_date, currency, "
+            "amount_minor, amount_home_minor, dr_cr, bank_reference, narration, payer_name, ... "
+            "INVOICE: customer_code (resolved by lookup, not stored directly), invoice_number, "
+            "issue_date, due_date, currency, total_amount_minor, ... "
+            "CUSTOMER: customer_code, company_name, pan, gstin, ... "
+            "See app/datahub/canonical.py's KNOWN_FIELDS for the authoritative per-stream list - "
+            "anything else is flagged as an issue on the row and ignored."
         ),
     )
     transform: str = Field(default="NONE", description=_TRANSFORM_DESCRIPTION)
@@ -83,19 +94,19 @@ class FieldMappingVersionCreate(BaseModel):
                     "mappings": [
                         {
                             "source_field": "transaction_date",
-                            "canonical_field": "txn_date",
+                            "canonical_field": "transaction_date",
                             "transform": "PARSE_DATE",
                             "transform_param": "%Y-%m-%d",
                         },
                         {
                             "source_field": "bank_reference_number",
-                            "canonical_field": "reference",
+                            "canonical_field": "bank_reference",
                             "transform": "TRIM",
                             "transform_param": None,
                         },
                         {
                             "source_field": "payer_name",
-                            "canonical_field": "counterparty",
+                            "canonical_field": "payer_name",
                             "transform": "TRIM",
                             "transform_param": None,
                         },
@@ -110,6 +121,12 @@ class FieldMappingVersionCreate(BaseModel):
                             "canonical_field": "currency",
                             "transform": "CONST",
                             "transform_param": "INR",
+                        },
+                        {
+                            "source_field": "amount",
+                            "canonical_field": "dr_cr",
+                            "transform": "CONST",
+                            "transform_param": "CREDIT",
                         },
                     ]
                 }
@@ -142,48 +159,21 @@ class MappingPreviewResponse(BaseModel):
 class IngestionJobOut(BaseModel):
     job_id: UUID
     source_id: UUID | None
-    job_type: str = Field(description="INGEST (parse a file into staging_records) or PROMOTE (write reviewed staging_records into canonical tables).")
-    parent_job_id: UUID | None = Field(description="For a PROMOTE job, the INGEST job it's promoting.")
-    stream: str | None = Field(description="BANK, LEDGER, INVOICE, GATEWAY, or CUSTOMER - only set on INGEST jobs.")
+    stream: str | None = Field(description="BANK, INVOICE, or CUSTOMER - determines which canonical table this job writes to.")
     file_name: str | None
     format: str | None
     status: str = Field(description="PENDING -> RUNNING -> SUCCESS/PARTIAL, or PENDING (retry) / FAILED on error.")
     row_count: int
-    error_count: int
+    error_count: int = Field(description="Rows with issues but still inserted, plus rows in failed_rows that couldn't be inserted at all.")
     attempt_count: int
     max_attempts: int
     last_error: str | None = Field(description="Set when status is FAILED or a retry is pending.")
     mapping_version: int | None = Field(description="Which field_mappings version was active when this job ran (audit trail).")
+    failed_rows: list[dict] | None = Field(
+        description="Rows that couldn't satisfy the canonical table's required columns at all - "
+        "each is {raw, issues}. These were never inserted anywhere; fixing one means correcting "
+        "the source file and re-uploading, not an in-app edit."
+    )
     started_at: datetime
 
     model_config = {"from_attributes": True}
-
-
-# -- staging_records ------------------------------------------------------------
-class StagingRecordOut(BaseModel):
-    staging_id: UUID
-    job_id: UUID
-    stream: str
-    txn_date: date | None
-    reference: str | None
-    counterparty: str | None
-    amount_minor: int | None
-    amount_home_minor: int | None
-    currency: str | None
-    dr_cr: str | None
-    raw: dict = Field(description="The original source row, verbatim, including any column not covered by a mapping.")
-    valid: bool = Field(description="False if any field's transform failed - see `issues`.")
-    issues: list[str] | None
-
-    model_config = {"from_attributes": True}
-
-
-class StagingRecordUpdate(BaseModel):
-    txn_date: date | None = None
-    reference: str | None = None
-    counterparty: str | None = None
-    amount_minor: int | None = None
-    amount_home_minor: int | None = None
-    currency: str | None = None
-    dr_cr: str | None = None
-    valid: bool | None = Field(default=None, description="Manually mark a corrected row valid so it's eligible for promotion.")
