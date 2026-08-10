@@ -16,6 +16,7 @@ from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from app.datahub import transforms
+from app.datahub.canonical import STREAM_TABLES, SEARCH_COLUMNS
 from app.datahub.constants import (
     DataHubErrors,
     MAX_UPLOAD_BYTES,

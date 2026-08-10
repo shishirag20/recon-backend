@@ -32,7 +32,7 @@ services:
   worker:
     build: .
     restart: unless-stopped
-    command: ["python", "-m", "recon.app.workers.ingestion_worker"]
+    command: ["python", "-m", "app.workers.ingestion_worker"]
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-recon}:${POSTGRES_PASSWORD:-recon}@db:5432/${POSTGRES_DB:-recon}
     volumes:
