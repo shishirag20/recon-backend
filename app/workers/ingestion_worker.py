@@ -13,6 +13,7 @@ doesn't fail the batch; it's collected into the job's `failed_rows` instead.
 
 Run: python -m app.workers.ingestion_worker
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -92,7 +93,9 @@ async def claim_job(pool: asyncpg.Pool) -> asyncpg.Record | None:
         return await conn.fetchrow(_CLAIM_SQL, WORKER_ID, LEASE_DURATION)
 
 
-async def _heartbeat_loop(pool: asyncpg.Pool, job_id: str, stop_event: asyncio.Event) -> None:
+async def _heartbeat_loop(
+    pool: asyncpg.Pool, job_id: str, stop_event: asyncio.Event
+) -> None:
     """Extends the lease periodically; sets stop_event if the lease was stolen.
 
     A stolen lease means another worker decided this job was abandoned and
@@ -101,20 +104,28 @@ async def _heartbeat_loop(pool: asyncpg.Pool, job_id: str, stop_event: asyncio.E
     """
     while not stop_event.is_set():
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=HEARTBEAT_INTERVAL_SECONDS
+            )
         except asyncio.TimeoutError:
             pass
         if stop_event.is_set():
             return
         async with pool.acquire() as conn:
-            renewed = await conn.fetchrow(_HEARTBEAT_SQL, job_id, WORKER_ID, LEASE_DURATION)
+            renewed = await conn.fetchrow(
+                _HEARTBEAT_SQL, job_id, WORKER_ID, LEASE_DURATION
+            )
         if renewed is None:
-            logger.warning("lease lost for job %s — another worker reclaimed it", job_id)
+            logger.warning(
+                "lease lost for job %s — another worker reclaimed it", job_id
+            )
             stop_event.set()
             return
 
 
-async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tuple[int, int, list[dict]]:
+async def process_ingestion_job(
+    pool: asyncpg.Pool, job: asyncpg.Record
+) -> tuple[int, int, list[dict]]:
     """Parses the uploaded file at job['file_uri'] and writes each row
     directly into its stream's canonical table.
 
@@ -123,10 +134,14 @@ async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tupl
     raises, which run_one_job turns into a normal retry/dead-letter failure.
     """
     if job["format"] != "CSV":
-        raise ValueError(f"unsupported format {job['format']!r} (only CSV implemented so far)")
+        raise ValueError(
+            f"unsupported format {job['format']!r} (only CSV implemented so far)"
+        )
     insert_fn = STREAM_INSERTERS.get(job["stream"])
     if insert_fn is None:
-        raise ValueError(f"unsupported stream {job['stream']!r} for direct-to-canonical ingestion")
+        raise ValueError(
+            f"unsupported stream {job['stream']!r} for direct-to-canonical ingestion"
+        )
     if not job["file_uri"] or not os.path.exists(job["file_uri"]):
         raise FileNotFoundError(f"no file at {job['file_uri']!r}")
 
@@ -134,7 +149,9 @@ async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tupl
         dao = DataHubDAO(conn)
         mappings = await dao.get_active_mappings(job["source_id"])
         if not mappings:
-            raise ValueError(f"data source {job['source_id']} has no active field mapping")
+            raise ValueError(
+                f"data source {job['source_id']} has no active field mapping"
+            )
         source = await dao.get_data_source(job["source_id"])
         entity_id = source["entity_id"]
 
@@ -150,8 +167,12 @@ async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tupl
                 issues = issues + unknown_field_issues(job["stream"], canonical)
                 try:
                     await insert_fn(
-                        conn, entity_id=entity_id, source_job_id=job["job_id"],
-                        canonical=canonical, raw=raw_row, issues=issues,
+                        conn,
+                        entity_id=entity_id,
+                        source_job_id=job["job_id"],
+                        canonical=canonical,
+                        raw=raw_row,
+                        issues=issues,
                     )
                     if issues:
                         error_count += 1
@@ -162,31 +183,59 @@ async def process_ingestion_job(pool: asyncpg.Pool, job: asyncpg.Record) -> tupl
     mapping_version = mappings[0]["version"]
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE ingestion_jobs SET mapping_version = $2 WHERE job_id = $1", job["job_id"], mapping_version
+            "UPDATE ingestion_jobs SET mapping_version = $2 WHERE job_id = $1",
+            job["job_id"],
+            mapping_version,
         )
     return row_count, error_count, failed_rows
 
 
 async def run_one_job(pool: asyncpg.Pool, job: asyncpg.Record) -> None:
     stop_event = asyncio.Event()
-    heartbeat_task = asyncio.create_task(_heartbeat_loop(pool, job["job_id"], stop_event))
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_loop(pool, job["job_id"], stop_event)
+    )
     try:
         row_count, error_count, failed_rows = await process_ingestion_job(pool, job)
         if stop_event.is_set():
-            logger.warning("job %s lease was lost mid-processing; discarding result", job["job_id"])
+            logger.warning(
+                "job %s lease was lost mid-processing; discarding result", job["job_id"]
+            )
             return
         status = "SUCCESS" if error_count == 0 else "PARTIAL"
         async with pool.acquire() as conn:
             await conn.execute(
-                _COMPLETE_SQL, job["job_id"], WORKER_ID, status, row_count, error_count, failed_rows or None
+                _COMPLETE_SQL,
+                job["job_id"],
+                WORKER_ID,
+                status,
+                row_count,
+                error_count,
+                failed_rows or None,
             )
-        logger.info("job %s completed: %s (%d rows, %d errors)", job["job_id"], status, row_count, error_count)
-    except Exception as exc:  # noqa: BLE001 - any failure here is a job-level failure that must be recorded
+        logger.info(
+            "job %s completed: %s (%d rows, %d errors)",
+            job["job_id"],
+            status,
+            row_count,
+            error_count,
+        )
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - any failure here is a job-level failure that must be recorded
         logger.exception("job %s failed", job["job_id"])
         async with pool.acquire() as conn:
-            result = await conn.fetchrow(_FAIL_SQL, job["job_id"], WORKER_ID, BASE_BACKOFF_SECONDS, str(exc))
+            result = await conn.fetchrow(
+                _FAIL_SQL, job["job_id"], WORKER_ID, BASE_BACKOFF_SECONDS, str(exc)
+            )
         if result:
-            logger.info("job %s -> %s (attempt %d/%d)", job["job_id"], result["status"], job["attempt_count"], job["max_attempts"])
+            logger.info(
+                "job %s -> %s (attempt %d/%d)",
+                job["job_id"],
+                result["status"],
+                job["attempt_count"],
+                job["max_attempts"],
+            )
     finally:
         stop_event.set()
         await heartbeat_task
@@ -199,12 +248,19 @@ async def run_forever(pool: asyncpg.Pool) -> None:
         if job is None:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
             continue
-        logger.info("claimed job %s (attempt %d/%d)", job["job_id"], job["attempt_count"], job["max_attempts"])
+        logger.info(
+            "claimed job %s (attempt %d/%d)",
+            job["job_id"],
+            job["attempt_count"],
+            job["max_attempts"],
+        )
         await run_one_job(pool, job)
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     pool = await create_pool()
     try:
         await run_forever(pool)
