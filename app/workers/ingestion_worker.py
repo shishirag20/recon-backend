@@ -202,7 +202,12 @@ async def run_one_job(pool: asyncpg.Pool, job: asyncpg.Record) -> None:
                 "job %s lease was lost mid-processing; discarding result", job["job_id"]
             )
             return
-        status = "SUCCESS" if error_count == 0 else "PARTIAL"
+        if error_count == 0:
+            status = "SUCCESS"
+        elif error_count == row_count:
+            status = "FAILED"
+        else:
+            status = "PARTIAL"
         async with pool.acquire() as conn:
             await conn.execute(
                 _COMPLETE_SQL,
