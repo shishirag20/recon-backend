@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "overthink": {
+      "source": "s0md3v/overthink",
+      "sourceType": "github",
+      "skillPath": "skill/SKILL.md",
+      "computedHash": "d1036a15936292e46d8cadbbdd9fe4308097e3ce594b2706a203a1ec30c86b43"
+    }
+  }
+}

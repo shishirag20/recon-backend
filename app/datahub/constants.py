@@ -31,4 +31,5 @@ class DataHubErrors:
     FILE_TOO_LARGE = "Uploaded file exceeds the maximum allowed size"
     INVALID_STREAM = "Invalid stream value"
     JOB_NOT_RETRYABLE = "Only a FAILED job can be retried"
-    NO_ACTIVE_MAPPING = "Data source has no active field mapping"
+    NO_ACTIVE_MAPPING = "This stream has no active field mapping"
+    DUPLICATE_UPLOAD = "An identical file has already been uploaded against this data source"

@@ -82,8 +82,8 @@ class FieldMappingIn(BaseModel):
 
 class FieldMappingOut(FieldMappingIn):
     mapping_id: UUID
-    source_id: UUID
-    version: int = Field(description="Mapping sets are versioned; only one version per source is is_active at a time.")
+    stream: str = Field(description="BANK, INVOICE, CUSTOMER, ... - mappings are shared globally per stream, not per data source.")
+    version: int = Field(description="Mapping sets are versioned; only one version per stream is is_active at a time.")
     is_active: bool
 
     model_config = {"from_attributes": True}
@@ -163,6 +163,31 @@ class MappingPreviewResponse(BaseModel):
     rows: list[MappingPreviewRow]
 
 
+class ResolveHeadersRequest(BaseModel):
+    columns: list[str] = Field(
+        min_length=1,
+        description="Raw column headers from an actual file - typically read client-side before upload.",
+    )
+
+
+class ResolvedHeader(BaseModel):
+    source_field: str
+    matched: bool = Field(
+        description="Whether this header matches an existing synonym (case/whitespace-insensitively) "
+        "in the stream's active mapping."
+    )
+
+
+class ResolveHeadersResponse(BaseModel):
+    results: list[ResolvedHeader]
+
+
+class CanonicalFieldsResponse(BaseModel):
+    canonical_fields: list[str] = Field(
+        description="Valid mapping targets for this stream - see app/datahub/canonical.py's KNOWN_FIELDS."
+    )
+
+
 # -- ingestion_jobs ------------------------------------------------------------
 class IngestionJobOut(BaseModel):
     job_id: UUID
@@ -177,6 +202,11 @@ class IngestionJobOut(BaseModel):
     max_attempts: int
     last_error: str | None = Field(description="Set when status is FAILED or a retry is pending.")
     mapping_version: int | None = Field(description="Which field_mappings version was active when this job ran (audit trail).")
+    unmapped_columns: list[str] | None = Field(
+        default=None,
+        description="Raw file headers that matched no synonym in the active stream mapping and that the "
+        "AI-suggestion stub couldn't resolve either - nothing auto-resolves these yet (see app/datahub/ai_mapping.py).",
+    )
     failed_rows: list[dict] | None = Field(
         description="Rows that couldn't satisfy the canonical table's required columns at all - "
         "each is {raw, issues}. These were never inserted anywhere; fixing one means correcting "

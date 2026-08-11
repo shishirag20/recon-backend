@@ -10,14 +10,25 @@ above this module ever touches the driver-specific type.
 
 `list_records`/`get_record`/`update_record` build SQL against a `table`/
 `pk_column`/`search_column` - always one of the fixed values in
-app/datahub/canonical.py's STREAM_TABLES, never user input, so the
-interpolation is safe.
+app/datahub/canonical.py's STREAM_TABLES, never user input, so that
+interpolation is safe. `update_record`'s column *names* are a different
+story: they come from the caller's `fields` dict, which service.py already
+allowlists against `canonical.EDITABLE_FIELDS` before calling here - but
+`_SAFE_IDENTIFIER` below is a second, independent check on top of that, so
+this function stays safe even if a future caller forgets the allowlist.
 """
 from __future__ import annotations
 
+import re
 import uuid
 
 import asyncpg
+
+# Column names in update_record's dynamic SET clause must look like a plain
+# identifier - defense in depth on top of the caller's allowlist, since this
+# is the one place a dict key becomes part of the SQL text itself, not a
+# bound parameter.
+_SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 def _row(record: asyncpg.Record | None) -> dict | None:
@@ -36,6 +47,10 @@ class DataHubDAO:
     async def entity_exists(self, entity_id: str) -> bool:
         row = await self.conn.fetchrow("SELECT 1 FROM entities WHERE entity_id = $1", entity_id)
         return row is not None
+
+    async def get_entity_home_currency(self, entity_id: str) -> str | None:
+        row = await self.conn.fetchrow("SELECT home_currency FROM entities WHERE entity_id = $1", entity_id)
+        return row["home_currency"] if row is not None else None
 
     # -- data_sources --------------------------------------------------------
     async def insert_data_source(self, *, entity_id: str, name: str, kind: str, stream: str) -> dict:
@@ -73,48 +88,56 @@ class DataHubDAO:
         return _row(row)
 
     # -- field_mappings --------------------------------------------------------
-    async def get_latest_version(self, source_id: str) -> int:
+    async def get_latest_version(self, stream: str) -> int:
         row = await self.conn.fetchrow(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM field_mappings WHERE source_id = $1", source_id
+            "SELECT COALESCE(MAX(version), 0) AS v FROM field_mappings WHERE stream = $1", stream
         )
         return row["v"]
 
-    async def get_active_mappings(self, source_id: str) -> list[dict]:
+    async def get_active_mappings(self, stream: str) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT mapping_id, source_id, version, source_field, canonical_field, transform, transform_param, is_active "
-            "FROM field_mappings WHERE source_id = $1 AND is_active = true",
-            source_id,
+            "SELECT mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active "
+            "FROM field_mappings WHERE stream = $1 AND is_active = true",
+            stream,
         )
         return _rows(rows)
 
-    async def insert_mapping_version(self, source_id: str, mappings: list[dict]) -> list[dict]:
+    async def insert_mapping_version(self, stream: str, mappings: list[dict]) -> list[dict]:
         async with self.conn.transaction():
             await self.conn.execute(
-                "UPDATE field_mappings SET is_active = false WHERE source_id = $1 AND is_active = true", source_id
+                "UPDATE field_mappings SET is_active = false WHERE stream = $1 AND is_active = true", stream
             )
-            next_version = await self.get_latest_version(source_id) + 1
+            next_version = await self.get_latest_version(stream) + 1
             rows = []
             for m in mappings:
                 row = await self.conn.fetchrow(
                     "INSERT INTO field_mappings "
-                    "(mapping_id, source_id, version, source_field, canonical_field, transform, transform_param, is_active) "
+                    "(mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active) "
                     "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, true) "
-                    "RETURNING mapping_id, source_id, version, source_field, canonical_field, transform, transform_param, is_active",
-                    source_id, next_version, m["source_field"], m["canonical_field"], m["transform"], m.get("transform_param"),
+                    "RETURNING mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active",
+                    stream, next_version, m["source_field"], m["canonical_field"], m["transform"], m.get("transform_param"),
                 )
                 rows.append(_row(row))
             return rows
 
     # -- ingestion_jobs --------------------------------------------------------
     async def insert_ingest_job(
-        self, *, job_id: str, source_id: str, stream: str, file_name: str, file_uri: str, fmt: str, started_by: str | None
+        self, *, job_id: str, source_id: str, stream: str, file_name: str, file_uri: str, fmt: str,
+        content_hash: str, started_by: str | None,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO ingestion_jobs "
-            "(job_id, source_id, stream, file_name, file_uri, format, trigger_type, status, started_by) "
-            "VALUES ($1, $2, $3, $4, $5, $6, 'MANUAL', 'PENDING', $7) "
+            "(job_id, source_id, stream, file_name, file_uri, format, content_hash, trigger_type, status, started_by) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, 'MANUAL', 'PENDING', $8) "
             "RETURNING *",
-            job_id, source_id, stream, file_name, file_uri, fmt, started_by,
+            job_id, source_id, stream, file_name, file_uri, fmt, content_hash, started_by,
+        )
+        return _row(row)
+
+    async def find_job_by_content_hash(self, *, source_id: str, content_hash: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT * FROM ingestion_jobs WHERE source_id = $1 AND content_hash = $2 LIMIT 1",
+            source_id, content_hash,
         )
         return _row(row)
 
@@ -196,6 +219,8 @@ class DataHubDAO:
         set_clauses = []
         params: list = [record_id]
         for col, value in fields.items():
+            if not _SAFE_IDENTIFIER.match(col):
+                raise ValueError(f"refusing to build SQL with unsafe column name {col!r}")
             params.append(value)
             set_clauses.append(f"{col} = ${len(params)}")
         sql = f"UPDATE {table} SET {', '.join(set_clauses)} WHERE {pk_column} = $1 RETURNING *"

@@ -91,6 +91,16 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
     raise AssertionError("unreachable")  # every TRANSFORMS value is handled above
 
 
+def normalize_header(name: str) -> str:
+    """Case/whitespace-insensitive key for matching a mapping's
+    `source_field` against a raw file's actual column header. Needed now
+    that one mapping is shared globally per stream (see migration 0026)
+    rather than configured per data source - independently-formatted files
+    for "the same" column (e.g. "Amount" vs "amount " vs "AMOUNT") must all
+    resolve to the same synonym row instead of requiring a byte-exact match."""
+    return name.strip().lower()
+
+
 def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
     """Returns (canonical_fields, issues) for one raw source row.
 
@@ -100,10 +110,11 @@ def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
     """
     canonical: dict = {}
     issues: list[str] = []
+    normalized_raw = {normalize_header(k): v for k, v in raw_row.items()}
     for m in mappings:
         source_field = m["source_field"]
         canonical_field = m["canonical_field"]
-        raw_value = raw_row.get(source_field)
+        raw_value = normalized_raw.get(normalize_header(source_field))
         try:
             value = apply_transform(raw_value, m["transform"], m["transform_param"])
             if canonical_field in _MONEY_CANONICAL_FIELDS and value is not None and not isinstance(value, int):

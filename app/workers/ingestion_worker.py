@@ -26,9 +26,10 @@ from datetime import timedelta
 
 import asyncpg
 
-from app.datahub.canonical import STREAM_INSERTERS, RowRejected, unknown_field_issues
+from app.datahub import ai_mapping
+from app.datahub.canonical import KNOWN_FIELDS, STREAM_INSERTERS, RowRejected, unknown_field_issues
 from app.datahub.dao import DataHubDAO
-from app.datahub.transforms import apply_mapping
+from app.datahub.transforms import apply_mapping, normalize_header
 from app.db.pool import create_pool
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,14 @@ async def process_ingestion_job(
     """Parses the uploaded file at job['file_uri'] and writes each row
     directly into its stream's canonical table.
 
+    The whole batch runs inside one outer transaction, with each row's
+    insert in a nested transaction (a Postgres savepoint, since asyncpg
+    detects the nesting automatically). A row-level failure only rolls back
+    that row - normal `failed_rows` behavior, unchanged. But if the worker
+    process itself dies mid-file, nothing has been committed at all, so a
+    retry starting from row 1 is correct instead of duplicating whatever
+    happened to have been inserted before the crash.
+
     Only CSV is implemented (see SUPPORTED_UPLOAD_FORMATS), and only the
     BANK/INVOICE/CUSTOMER streams have a canonical inserter - anything else
     raises, which run_one_job turns into a normal retry/dead-letter failure.
@@ -145,48 +154,75 @@ async def process_ingestion_job(
     if not job["file_uri"] or not os.path.exists(job["file_uri"]):
         raise FileNotFoundError(f"no file at {job['file_uri']!r}")
 
+    with open(job["file_uri"], newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        headers = reader.fieldnames or []
+
     async with pool.acquire() as conn:
         dao = DataHubDAO(conn)
-        mappings = await dao.get_active_mappings(job["source_id"])
+        mappings = await dao.get_active_mappings(job["stream"])
         if not mappings:
             raise ValueError(
-                f"data source {job['source_id']} has no active field mapping"
+                f"stream {job['stream']!r} has no active field mapping"
             )
         source = await dao.get_data_source(job["source_id"])
         entity_id = source["entity_id"]
+        home_currency = await dao.get_entity_home_currency(entity_id)
+        if home_currency is None:
+            raise ValueError(f"entity {entity_id} not found or has no home_currency")
 
-    row_count = 0
-    error_count = 0
-    failed_rows: list[dict] = []
+        # Any file header that matches no synonym in the shared mapping is a
+        # candidate for the AI-suggestion stub (currently a no-op - see
+        # app/datahub/ai_mapping.py); anything still unresolved after that is
+        # recorded on the job instead of silently failing every row.
+        mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+        unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
+        if unmapped_columns:
+            suggestions = ai_mapping.suggest_canonical_fields(
+                job["stream"], unmapped_columns, KNOWN_FIELDS.get(job["stream"], set())
+            )
+            if suggestions:
+                mappings = await dao.insert_mapping_version(
+                    job["stream"], [dict(m) for m in mappings] + suggestions
+                )
+                mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+                unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
 
-    async with pool.acquire() as conn:
-        with open(job["file_uri"], newline="", encoding="utf-8-sig") as f:
-            for raw_row in csv.DictReader(f):
+        row_count = 0
+        error_count = 0
+        failed_rows: list[dict] = []
+
+        async with conn.transaction():
+            for raw_row in rows:
                 row_count += 1
                 canonical, issues = apply_mapping(raw_row, mappings)
                 issues = issues + unknown_field_issues(job["stream"], canonical)
                 try:
-                    await insert_fn(
-                        conn,
-                        entity_id=entity_id,
-                        source_job_id=job["job_id"],
-                        canonical=canonical,
-                        raw=raw_row,
-                        issues=issues,
-                    )
+                    async with conn.transaction():  # nested -> savepoint, isolates this row only
+                        await insert_fn(
+                            conn,
+                            entity_id=entity_id,
+                            source_job_id=job["job_id"],
+                            canonical=canonical,
+                            raw=raw_row,
+                            issues=issues,
+                            home_currency=home_currency,
+                        )
                     if issues:
                         error_count += 1
                 except RowRejected as exc:
                     error_count += 1
                     failed_rows.append({"raw": raw_row, "issues": issues + [str(exc)]})
 
-    mapping_version = mappings[0]["version"]
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE ingestion_jobs SET mapping_version = $2 WHERE job_id = $1",
-            job["job_id"],
-            mapping_version,
-        )
+            mapping_version = mappings[0]["version"]
+            await conn.execute(
+                "UPDATE ingestion_jobs SET mapping_version = $2, unmapped_columns = $3 WHERE job_id = $1",
+                job["job_id"],
+                mapping_version,
+                unmapped_columns or None,
+            )
+
     return row_count, error_count, failed_rows
 
 

@@ -10,13 +10,14 @@ caller's organization owns it - that also depends on real auth.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from app.datahub import transforms
-from app.datahub.canonical import STREAM_TABLES, SEARCH_COLUMNS
+from app.datahub.canonical import EDITABLE_FIELDS, KNOWN_FIELDS, STREAM_TABLES, SEARCH_COLUMNS
 from app.datahub.constants import (
     DataHubErrors,
     MAX_UPLOAD_BYTES,
@@ -67,25 +68,30 @@ class DataHubService:
         return row
 
     # -- field_mappings --------------------------------------------------------
-    async def get_active_mappings(self, source_id: str):
-        await self.get_data_source(source_id)  # 404s if missing
-        return await self.dao.get_active_mappings(source_id)
+    @staticmethod
+    def _require_valid_stream(stream: str) -> None:
+        if stream not in STREAM_VALUES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM)
 
-    async def create_mapping_version(self, source_id: str, mappings: list[dict]):
-        await self.get_data_source(source_id)
-        return await self.dao.insert_mapping_version(source_id, mappings)
+    async def get_active_mappings(self, stream: str):
+        self._require_valid_stream(stream)
+        return await self.dao.get_active_mappings(stream)
+
+    async def create_mapping_version(self, stream: str, mappings: list[dict]):
+        self._require_valid_stream(stream)
+        return await self.dao.insert_mapping_version(stream, mappings)
 
     async def preview_mapping(
         self,
-        source_id: str,
+        stream: str,
         sample_rows: list[dict],
         mappings_override: list[dict] | None,
     ):
-        await self.get_data_source(source_id)
+        self._require_valid_stream(stream)
         mappings = (
             mappings_override
             if mappings_override is not None
-            else await self.dao.get_active_mappings(source_id)
+            else await self.dao.get_active_mappings(stream)
         )
         if not mappings:
             raise HTTPException(
@@ -96,6 +102,23 @@ class DataHubService:
             canonical, issues = transforms.apply_mapping(raw_row, mappings)
             results.append({"raw": raw_row, "canonical": canonical, "issues": issues})
         return results
+
+    async def resolve_headers(self, stream: str, columns: list[str]) -> list[dict]:
+        """For each raw column header, whether it (case/whitespace-insensitively)
+        matches an existing synonym in the stream's active mapping - the same
+        check `ingestion_worker.py` does to compute `unmapped_columns`, just
+        surfaced before upload instead of only after."""
+        self._require_valid_stream(stream)
+        mappings = await self.dao.get_active_mappings(stream)
+        mapped_headers = {transforms.normalize_header(m["source_field"]) for m in mappings}
+        return [
+            {"source_field": c, "matched": transforms.normalize_header(c) in mapped_headers}
+            for c in columns
+        ]
+
+    async def canonical_fields(self, stream: str) -> list[str]:
+        self._require_valid_stream(stream)
+        return sorted(KNOWN_FIELDS.get(stream, set()))
 
     # -- ingestion_jobs --------------------------------------------------------
     async def create_upload_job(
@@ -118,7 +141,12 @@ class DataHubService:
         dest_dir = os.path.join(UPLOAD_ROOT, job_id)
         dest_path = os.path.join(dest_dir, safe_filename)
 
-        await self._save_upload(file, dest_dir, dest_path)
+        content_hash = await self._save_upload(file, dest_dir, dest_path)
+
+        existing = await self.dao.find_job_by_content_hash(source_id=source_id, content_hash=content_hash)
+        if existing is not None:
+            await run_in_threadpool(_remove_quietly, dest_path)
+            raise HTTPException(status.HTTP_409_CONFLICT, DataHubErrors.DUPLICATE_UPLOAD)
 
         return await self.dao.insert_ingest_job(
             job_id=job_id,
@@ -127,14 +155,19 @@ class DataHubService:
             file_name=safe_filename,
             file_uri=dest_path,
             fmt=fmt,
+            content_hash=content_hash,
             started_by=started_by,
         )
 
     async def _save_upload(
         self, file: UploadFile, dest_dir: str, dest_path: str
-    ) -> None:
+    ) -> str:
+        """Streams the upload to disk and returns its SHA-256 hex digest,
+        computed in the same pass so re-reading the file isn't needed just
+        to fingerprint it for duplicate-upload detection."""
         await run_in_threadpool(os.makedirs, dest_dir, exist_ok=True)
         handle = await run_in_threadpool(open, dest_path, "wb")
+        hasher = hashlib.sha256()
         total = 0
         try:
             while True:
@@ -147,6 +180,7 @@ class DataHubService:
                         status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         DataHubErrors.FILE_TOO_LARGE,
                     )
+                hasher.update(chunk)
                 await run_in_threadpool(handle.write, chunk)
         except HTTPException:
             await run_in_threadpool(handle.close)
@@ -154,6 +188,7 @@ class DataHubService:
             raise
         else:
             await run_in_threadpool(handle.close)
+        return hasher.hexdigest()
 
     async def get_job(self, job_id: str):
         row = await self.dao.get_job(job_id)
@@ -242,6 +277,13 @@ class DataHubService:
         job = await self.get_job(job_id)
         table, pk_column = self._stream_table(job["stream"])
         fields = {k: v for k, v in fields.items() if v is not None}
+        allowed = EDITABLE_FIELDS.get(job["stream"], set())
+        not_editable = set(fields) - allowed
+        if not_editable:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Not editable for stream {job['stream']}: {', '.join(sorted(not_editable))}",
+            )
         row = await self.dao.update_record(
             table=table, pk_column=pk_column, record_id=record_id, fields=fields
         )

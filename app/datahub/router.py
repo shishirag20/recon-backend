@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from app.datahub.constants import ROUTER_TAGS
 from app.datahub.dao import DataHubDAO
 from app.datahub.schema import (
+    CanonicalFieldsResponse,
     DataSourceCreate,
     DataSourceOut,
     DataSourceUpdate,
@@ -25,6 +26,8 @@ from app.datahub.schema import (
     IngestionJobOut,
     MappingPreviewRequest,
     MappingPreviewResponse,
+    ResolveHeadersRequest,
+    ResolveHeadersResponse,
 )
 from app.datahub.service import DataHubService
 from app.db.pool import get_connection
@@ -45,8 +48,9 @@ def get_service(conn: asyncpg.Connection = Depends(get_connection)) -> DataHubSe
 )
 async def create_data_source(payload: DataSourceCreate, service: DataHubService = Depends(get_service)):
     """Registers a feed (bank connection, ERP export, gateway, or manual-upload
-    bucket) for an entity. A data source must exist - and have an active field
-    mapping (see `POST /data-sources/{source_id}/field-mappings/versions`) -
+    bucket) for an entity. A data source must exist - and its `stream` must
+    have an active field mapping (see `POST /field-mappings/{stream}/versions`,
+    shared globally across every source/entity/org ingesting that stream) -
     before any file can be uploaded against it."""
     return await service.create_data_source(
         entity_id=payload.entity_id, name=payload.name, kind=payload.kind, stream=payload.stream
@@ -71,55 +75,89 @@ async def update_data_source(source_id: UUID, payload: DataSourceUpdate, service
 
 
 # -- field_mappings --------------------------------------------------------
+# Mappings are scoped to a `stream` (BANK/INVOICE/CUSTOMER/...), not to an
+# individual data source - one shared mapping set is reused by every source/
+# entity/org ingesting that stream, rather than each source configuring its
+# own copy of what's usually an identical set of rules.
 @router.get(
-    "/data-sources/{source_id}/field-mappings",
+    "/field-mappings/{stream}",
     response_model=list[FieldMappingOut],
-    summary="Get the active field mapping",
+    summary="Get the active field mapping for a stream",
 )
-async def get_active_field_mappings(source_id: UUID, service: DataHubService = Depends(get_service)):
-    """Returns the currently-active (`is_active=true`) mapping set - i.e. the
-    one the ingestion worker will actually use on the next upload against this
-    source. Past versions aren't retrievable through this endpoint."""
-    return await service.get_active_mappings(source_id)
+async def get_active_field_mappings(stream: str, service: DataHubService = Depends(get_service)):
+    """Returns the currently-active (`is_active=true`) mapping set for this
+    stream - i.e. the one the ingestion worker will actually use on the next
+    upload of this stream, from any data source. Past versions aren't
+    retrievable through this endpoint."""
+    return await service.get_active_mappings(stream)
 
 
 @router.post(
-    "/data-sources/{source_id}/field-mappings/versions",
+    "/field-mappings/{stream}/versions",
     response_model=list[FieldMappingOut],
     status_code=status.HTTP_201_CREATED,
-    summary="Save a new field-mapping version",
+    summary="Save a new field-mapping version for a stream",
 )
 async def create_field_mapping_version(
-    source_id: UUID, payload: FieldMappingVersionCreate, service: DataHubService = Depends(get_service)
+    stream: str, payload: FieldMappingVersionCreate, service: DataHubService = Depends(get_service)
 ):
-    """Replaces the active mapping with a new version, atomically (the
-    previous version's rows are deactivated, not deleted). Submit the full
-    mapping set every time - this is not a partial update against the
-    previous version.
+    """Replaces the stream's active mapping with a new version, atomically
+    (the previous version's rows are deactivated, not deleted). Submit the
+    full mapping set every time - this is not a partial update against the
+    previous version. Affects every data source that ingests this stream.
 
     See the request schema's example for a realistic bank-statement mapping:
     it parses a date, trims two text fields, converts a decimal amount into
     integer minor units, and defaults a currency the source file doesn't
     provide."""
-    return await service.create_mapping_version(source_id, [m.model_dump() for m in payload.mappings])
+    return await service.create_mapping_version(stream, [m.model_dump() for m in payload.mappings])
 
 
 @router.post(
-    "/data-sources/{source_id}/field-mappings/preview",
+    "/field-mappings/{stream}/preview",
     response_model=MappingPreviewResponse,
     summary="Dry-run a mapping against sample rows",
 )
 async def preview_field_mapping(
-    source_id: UUID, payload: MappingPreviewRequest, service: DataHubService = Depends(get_service)
+    stream: str, payload: MappingPreviewRequest, service: DataHubService = Depends(get_service)
 ):
     """Runs sample rows through the mapping's transforms without writing
     anything to the database. Pass `mappings` to test an unsaved draft, or
-    omit it to preview the source's currently active mapping. This calls the
+    omit it to preview the stream's currently active mapping. This calls the
     exact same transform code the ingestion worker uses, so whatever this
     endpoint returns is exactly what a real upload would produce."""
     mappings_override = [m.model_dump() for m in payload.mappings] if payload.mappings is not None else None
-    rows = await service.preview_mapping(source_id, payload.sample_rows, mappings_override)
+    rows = await service.preview_mapping(stream, payload.sample_rows, mappings_override)
     return {"rows": rows}
+
+
+@router.post(
+    "/field-mappings/{stream}/resolve-headers",
+    response_model=ResolveHeadersResponse,
+    summary="Check raw column headers against the active mapping",
+)
+async def resolve_field_mapping_headers(
+    stream: str, payload: ResolveHeadersRequest, service: DataHubService = Depends(get_service)
+):
+    """For a file's actual column headers (read client-side before upload),
+    reports which ones already match a synonym in the stream's active
+    mapping and which are genuinely new - so a mapping UI can show exactly
+    what's different about this file instead of the full active mapping or
+    a hardcoded field list."""
+    results = await service.resolve_headers(stream, payload.columns)
+    return {"results": results}
+
+
+@router.get(
+    "/field-mappings/{stream}/canonical-fields",
+    response_model=CanonicalFieldsResponse,
+    summary="List valid mapping targets for a stream",
+)
+async def get_canonical_fields(stream: str, service: DataHubService = Depends(get_service)):
+    """The real per-stream target field list (`app/datahub/canonical.py`'s
+    `KNOWN_FIELDS`) - for populating a mapping UI's canonical-field choices
+    instead of a hardcoded, driftable list."""
+    return {"canonical_fields": await service.canonical_fields(stream)}
 
 
 # -- ingestion_jobs --------------------------------------------------------
