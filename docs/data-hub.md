@@ -94,14 +94,16 @@ These are the platform's real domain tables (designed independently of ingestion
 
 | Column | Type | Purpose |
 |---|---|---|
-| `raw` | `jsonb` | The original source row, verbatim — catches anything the mapping didn't cover |
+| `raw` | `jsonb`, nullable | **Only the source row's fields the mapping didn't capture** — not a full copy. A row whose mapping covers every column stores `NULL` here, not `{}`. See below for why this isn't the same dict `row_hash` is computed from. |
 | `valid` | `bool` NOT NULL DEFAULT `true` | `false` if any mapped field had a transform issue (row still inserted) |
 | `issues` | `text[]` | One entry per problem, human-readable |
 | `source_job_id` | `uuid` FK → `ingestion_jobs` | Which job produced this row |
 
+`raw` originally stored the entire source row verbatim (redundant with the typed columns for anything already mapped); changed to leftover-fields-only after review — the worker (`process_ingestion_job`) computes `extra_raw = {k: v for k, v in raw_row.items() if normalize_header(k) not in mapped_headers} or None` per row and passes that as `raw`, instead of `raw_row` itself.
+
 Stream-specific integrity columns added by the fixes in [§8](#8-data-integrity--security-fixes):
 
-- **`bank_statements.row_hash`** (`text`) + `UNIQUE (entity_id, row_hash) WHERE row_hash IS NOT NULL` — SHA-256 of the row's `raw` content; rejects a byte-identical row even from a different upload.
+- **`bank_statements.row_hash`** (`text`) + `UNIQUE (entity_id, row_hash) WHERE row_hash IS NOT NULL` — SHA-256 of the row's **full** original content (`row_hash(raw_row)`, computed by the worker before trimming down to `extra_raw`), not of the `raw` column's now-trimmed content. This has to stay based on the full row: if it hashed the trimmed `raw` instead, every row of a fully-mapped file would trim down to the same `{}`/`NULL` and hash identically, falsely flagging every row after the first as a duplicate. `insert_bank_row` receives this precomputed hash as `row_hash_value` rather than deriving it itself, since by the time it runs it only has the trimmed `raw`, not the original row.
 - **`customers`**: `UNIQUE (entity_id, upper(customer_code))` — case-insensitive backstop on top of application-level normalization.
 
 Pre-existing natural-key protection (not added for ingestion, but relevant to it): `invoices` has `UNIQUE (entity_id, invoice_number)`; `customers` has `UNIQUE (entity_id, customer_code)`. **`bank_statements` has no natural-key protection beyond `row_hash`** — its other unique constraint, `(entity_id, document_number, line_number)`, is never populated by the CSV ingestion path (those columns come from GL-style exports only), so it never engages for ingested rows.

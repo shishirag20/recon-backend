@@ -146,8 +146,8 @@ async def _insert(conn: asyncpg.Connection, table: str, pk_column: str, values: 
 
 
 async def insert_bank_row(
-    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict, issues: list[str],
-    home_currency: str,
+    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict | None, issues: list[str],
+    home_currency: str, row_hash_value: str,
 ) -> None:
     _apply_home_currency_default(
         canonical, native_field="amount_minor", home_field="amount_home_minor", home_currency=home_currency
@@ -176,15 +176,15 @@ async def insert_bank_row(
         "is_bank_charge": canonical.get("is_bank_charge") or False,
         "contra_reference": canonical.get("contra_reference"),
         "raw": raw,
-        "row_hash": row_hash(raw),
+        "row_hash": row_hash_value,
         "valid": len(issues) == 0,
         "issues": issues or None,
     })
 
 
 async def insert_customer_row(
-    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict, issues: list[str],
-    home_currency: str,  # unused here, accepted for a uniform STREAM_INSERTERS call signature
+    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict | None, issues: list[str],
+    home_currency: str, row_hash_value: str,  # both unused here, accepted for a uniform STREAM_INSERTERS call signature
 ) -> None:
     _require(canonical, ("customer_code", "company_name"))
     await _insert(conn, "customers", "customer_id", {
@@ -225,8 +225,8 @@ async def _resolve_customer_id(conn: asyncpg.Connection, *, entity_id, customer_
 
 
 async def insert_invoice_row(
-    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict, issues: list[str],
-    home_currency: str,
+    conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict | None, issues: list[str],
+    home_currency: str, row_hash_value: str,  # unused here, accepted for a uniform STREAM_INSERTERS call signature
 ) -> None:
     customer_code = canonical.get("customer_code")
     if not customer_code:

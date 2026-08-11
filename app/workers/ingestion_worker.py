@@ -27,7 +27,7 @@ from datetime import timedelta
 import asyncpg
 
 from app.datahub import ai_mapping
-from app.datahub.canonical import KNOWN_FIELDS, STREAM_INSERTERS, RowRejected, unknown_field_issues
+from app.datahub.canonical import KNOWN_FIELDS, STREAM_INSERTERS, RowRejected, row_hash, unknown_field_issues
 from app.datahub.dao import DataHubDAO
 from app.datahub.transforms import apply_mapping, normalize_header
 from app.db.pool import create_pool
@@ -198,6 +198,15 @@ async def process_ingestion_job(
                 row_count += 1
                 canonical, issues = apply_mapping(raw_row, mappings)
                 issues = issues + unknown_field_issues(job["stream"], canonical)
+                # `raw` on the canonical row stores only what the mapping
+                # *didn't* capture - fields already sitting in a typed column
+                # would just be a redundant copy otherwise. The duplicate-row
+                # fingerprint still hashes the full row, not this trimmed
+                # version - two rows with different mapped values but the
+                # same (or no) leftover fields must not hash identically.
+                extra_raw = {
+                    k: v for k, v in raw_row.items() if normalize_header(k) not in mapped_headers
+                } or None
                 try:
                     async with conn.transaction():  # nested -> savepoint, isolates this row only
                         await insert_fn(
@@ -205,9 +214,10 @@ async def process_ingestion_job(
                             entity_id=entity_id,
                             source_job_id=job["job_id"],
                             canonical=canonical,
-                            raw=raw_row,
+                            raw=extra_raw,
                             issues=issues,
                             home_currency=home_currency,
+                            row_hash_value=row_hash(raw_row),
                         )
                     if issues:
                         error_count += 1

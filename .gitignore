@@ -42,3 +42,5 @@ scratch/
 .pytest_cache/
 .mypy_cache/
 .coverage
+graphify-out
+CLAUDE.md
