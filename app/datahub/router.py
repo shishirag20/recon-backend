@@ -134,18 +134,17 @@ async def preview_field_mapping(
 @router.post(
     "/field-mappings/{stream}/resolve-headers",
     response_model=ResolveHeadersResponse,
-    summary="Check raw column headers against the active mapping",
+    summary="Resolve a file's headers against the active mapping",
 )
 async def resolve_field_mapping_headers(
     stream: str, payload: ResolveHeadersRequest, service: DataHubService = Depends(get_service)
 ):
     """For a file's actual column headers (read client-side before upload),
-    reports which ones already match a synonym in the stream's active
-    mapping and which are genuinely new - so a mapping UI can show exactly
-    what's different about this file instead of the full active mapping or
-    a hardcoded field list."""
-    results = await service.resolve_headers(stream, payload.columns)
-    return {"results": results}
+    returns the subset of the stream's active mapping that's actually
+    relevant to this file - plus whichever headers are genuinely new - so a
+    mapping UI can build its rows from one call instead of fetching the full
+    active mapping separately and filtering it client-side."""
+    return await service.resolve_headers(stream, payload.columns)
 
 
 @router.get(

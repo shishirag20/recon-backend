@@ -103,18 +103,26 @@ class DataHubService:
             results.append({"raw": raw_row, "canonical": canonical, "issues": issues})
         return results
 
-    async def resolve_headers(self, stream: str, columns: list[str]) -> list[dict]:
-        """For each raw column header, whether it (case/whitespace-insensitively)
-        matches an existing synonym in the stream's active mapping - the same
-        check `ingestion_worker.py` does to compute `unmapped_columns`, just
-        surfaced before upload instead of only after."""
+    async def resolve_headers(self, stream: str, columns: list[str]) -> dict:
+        """For a file's raw column headers, returns the subset of the stream's
+        active mapping actually relevant to this file - a row whose
+        source_field matches one of the given columns (case/whitespace-
+        insensitively, the same check `ingestion_worker.py` does to compute
+        `unmapped_columns`), or a CONST row (CONST ignores the raw value, so
+        its source_field never needs to appear in the file) - plus whichever
+        columns matched no synonym at all. One DAO call, one response, instead
+        of making the caller separately fetch the full active mapping and
+        filter it client-side."""
         self._require_valid_stream(stream)
         mappings = await self.dao.get_active_mappings(stream)
-        mapped_headers = {transforms.normalize_header(m["source_field"]) for m in mappings}
-        return [
-            {"source_field": c, "matched": transforms.normalize_header(c) in mapped_headers}
-            for c in columns
+        normalized_columns = {transforms.normalize_header(c) for c in columns}
+        matched_headers = {transforms.normalize_header(m["source_field"]) for m in mappings}
+        matched = [
+            m for m in mappings
+            if m["transform"] == "CONST" or transforms.normalize_header(m["source_field"]) in normalized_columns
         ]
+        unmatched_columns = [c for c in columns if transforms.normalize_header(c) not in matched_headers]
+        return {"matched": matched, "unmatched_columns": unmatched_columns}
 
     async def canonical_fields(self, stream: str) -> list[str]:
         self._require_valid_stream(stream)
