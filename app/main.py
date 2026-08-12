@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth.router import router as auth_router
 from app.datahub.router import router as datahub_router
+from app.reconciliation.router import router as reconciliation_router
 from app.db.pool import create_pool
 
 
@@ -36,6 +37,16 @@ OPENAPI_TAGS = [
             "results. Uploads are asynchronous - `POST /ingestion-jobs` returns immediately with "
             "`status=PENDING`; a background worker does the actual parsing and you poll "
             "`GET /ingestion-jobs/{job_id}` for the outcome."
+        ),
+    },
+    {
+        "name": "Reconciliation",
+        "description": (
+            "AR reconciliation: define a rule catalog for an entity, enqueue a run over bank "
+            "statements + sub-ledger invoices, and (once the engine milestones land) review "
+            "matches/exceptions and sign off. `POST .../runs` currently only enqueues "
+            "(`status=QUEUED`) - see app/reconciliation/router.py's milestone map for what's "
+            "implemented today vs. pending the reconciliation worker."
         ),
     },
 ]
@@ -70,6 +81,7 @@ def create_app() -> FastAPI:
     api_v1_router = APIRouter(prefix="/api/v1")
     api_v1_router.include_router(auth_router)
     api_v1_router.include_router(datahub_router)
+    api_v1_router.include_router(reconciliation_router)
 
     app.include_router(api_v1_router)
 

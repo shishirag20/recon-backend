@@ -14,7 +14,14 @@ import asyncpg
 from fastapi import Request
 
 
-async def _init_connection(conn: asyncpg.Connection) -> None:
+async def init_connection(conn: asyncpg.Connection) -> None:
+    """Registers the jsonb/json <-> dict codec every real connection needs.
+
+    Public (no leading underscore) because tests/conftest.py's `conn` fixture
+    also calls this directly on a bare `asyncpg.connect()` - a DAO call
+    passing a plain dict for a jsonb param is only valid once this codec is
+    registered, so any connection a DAO touches needs it, pool-backed or not.
+    """
     # Without this, jsonb columns round-trip as raw JSON text instead of
     # dict/list - every caller would otherwise need to json.dumps/loads by hand.
     for typename in ("jsonb", "json"):
@@ -28,7 +35,7 @@ async def create_pool(min_size: int = 1, max_size: int = 10) -> asyncpg.Pool:
         "DATABASE_URL", "postgresql://recon:recon@127.0.0.1:5432/recon"
     )
     return await asyncpg.create_pool(
-        database_url, min_size=min_size, max_size=max_size, init=_init_connection
+        database_url, min_size=min_size, max_size=max_size, init=init_connection
     )
 
 

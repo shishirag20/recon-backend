@@ -22,9 +22,16 @@ TRANSFORMS = (
     "NEGATE",
     "PARSE_DATE",
     "REGEX",
+    "PARSE_BOOL",
 )
 
 _DEFAULT_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y")
+
+# A boolean-typed canonical column (is_bank_charge is the only one today)
+# needs a real Python bool, not the string a source file spells it as -
+# asyncpg raises rather than coercing a str for a boolean column.
+_TRUE_VALUES = {"true", "1", "yes", "y"}
+_FALSE_VALUES = {"false", "0", "no", "n"}
 
 # staging_records' typed money columns are BIGINT minor units; any mapping
 # targeting these two fields must produce an int, not a string.
@@ -88,6 +95,14 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
             raise ValueError(f"pattern {transform_param!r} did not match {raw_value!r}")
         return match.group(1)
 
+    if transform == "PARSE_BOOL":
+        text = raw_value.strip().lower()
+        if text in _TRUE_VALUES:
+            return True
+        if text in _FALSE_VALUES:
+            return False
+        raise ValueError(f"not a recognized boolean: {raw_value!r}")
+
     raise AssertionError("unreachable")  # every TRANSFORMS value is handled above
 
 
@@ -114,12 +129,28 @@ def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
     for m in mappings:
         source_field = m["source_field"]
         canonical_field = m["canonical_field"]
-        raw_value = normalized_raw.get(normalize_header(source_field))
+        normalized_source = normalize_header(source_field)
+        if m["transform"] != "CONST" and normalized_source not in normalized_raw:
+            # This synonym's column isn't in this file at all - not the same
+            # as "present but blank". Skip rather than let a genuine miss
+            # overwrite a value a different synonym already found for this
+            # canonical_field - a real risk now that one canonical field can
+            # have many source_field synonyms (migration 0026). CONST is
+            # exempt: it never reads the raw row at all, so it must still
+            # fire even when its (unused) source_field placeholder is absent.
+            continue
+        raw_value = normalized_raw.get(normalized_source)
         try:
             value = apply_transform(raw_value, m["transform"], m["transform_param"])
             if canonical_field in _MONEY_CANONICAL_FIELDS and value is not None and not isinstance(value, int):
                 raise ValueError(f"{canonical_field} requires TO_MINOR_UNITS, got transform {m['transform']!r}")
-            canonical[canonical_field] = value
+            # First non-None value for this canonical_field wins. A later
+            # synonym that's blank *for this row* (column exists, cell is
+            # empty - e.g. Customers.csv's own `customer_code` column is
+            # blank for most rows, with `customer_id` as the real fallback)
+            # must not clobber a value an earlier synonym already found.
+            if canonical.get(canonical_field) is None:
+                canonical[canonical_field] = value
         except Exception as exc:  # noqa: BLE001 - a bad field is a data issue, not a worker crash
             issues.append(f"{source_field} -> {canonical_field}: {exc}")
     return canonical, issues

@@ -41,6 +41,16 @@ services:
       db:
         condition: service_healthy
 
+  reconciliation-worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.workers.reconciliation_worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-recon}:${POSTGRES_PASSWORD:-recon}@db:5432/${POSTGRES_DB:-recon}
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   uploads:
