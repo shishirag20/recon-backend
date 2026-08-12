@@ -172,17 +172,16 @@ class ResolveHeadersRequest(BaseModel):
     )
 
 
+class ResolvedHeader(BaseModel):
+    source_field: str
+    matched: bool = Field(
+        description="Whether this header matches an existing synonym (case/whitespace-insensitively) "
+        "in the stream's active mapping."
+    )
+
+
 class ResolveHeadersResponse(BaseModel):
-    matched: list[FieldMappingOut] = Field(
-        description="The subset of the stream's active mapping actually relevant to this file: a row "
-        "whose source_field matches one of the given columns (case/whitespace-insensitively), or a "
-        "CONST row (CONST ignores the raw value, so its source_field never needs to appear in the "
-        "file). Replaces a separate `GET /field-mappings/{stream}` call for building a per-file "
-        "mapping UI - this is already the filtered-down list, not the full dictionary."
-    )
-    unmatched_columns: list[str] = Field(
-        description="Columns from the request that matched no synonym in the active mapping at all."
-    )
+    results: list[ResolvedHeader]
 
 
 class CanonicalFieldsResponse(BaseModel):
