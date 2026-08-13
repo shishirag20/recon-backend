@@ -22,7 +22,7 @@ This expands the approved plan ("Production-Ready AR Reconciliation Engine", `/U
 | **M0** | Schema scaffold, `app/reconciliation/` skeleton, GL role seeding, pytest harness | ✅ Done |
 | **M1** | Phase 1a (customer lock) + 1b (candidate pool), `payments`, Suspense routing, `reconciliation_worker` | ✅ Done, verified against golden test data |
 | **M2** | Phase 2 scoped allocation (9 rules), `match_groups`/`invoice_allocations`, invoice balance/status updates | ✅ Done, verified against golden test data |
-| **M3** | GL posting, SL-vs-GL control proof, standalone bank-charge + double-collision handling, exception resolve API | ⬜ Not started |
+| **M3** | GL posting, SL-vs-GL control proof, standalone bank-charge + double-collision handling, exception resolve API | ✅ Done, verified against golden test data |
 | **M4** | Sign-off, hash-chained audit trail, Rules Studio read/update API completeness, golden test fully green | ⬜ Not started |
 
 ---
@@ -63,16 +63,22 @@ No matching logic at all. This milestone's job was purely to make M1-M4 possible
 
 **State at the end of M2**: `matched_count`/`matched_value_minor` on the run start meaning "fully allocated to an invoice," not just "customer identified." Invoice balances are live and decrementing. Every unresolved case has a specific, typed reason, not a generic miss.
 
-### M3 — GL posting, control proof, exceptions dashboard (not built)
+### M3 — GL posting, control proof, exceptions dashboard (done)
 
 **Goal**: turn resolved matches (and the bank-charge/Suspense rows set aside earlier) into real double-entry bookkeeping, and prove the sub-ledger and GL agree.
 
-1. `gl_posting.py` runs only after all identification/allocation is finished for the run — never speculatively mid-resolution. For every `invoice_allocations` row it builds a consolidated `gl_journal_entries` + `gl_journal_lines` pair: a normal settlement debits `CASH_CONTROL` and credits `AR_CONTROL` for the allocated amount; a fee/write-off posts to `BANK_CHARGES`/`WRITE_OFF` instead (or alongside); a TDS-net match posts the withheld portion to `TDS_RECEIVABLE`; an overpayment's excess posts to `ON_ACCOUNT_ADVANCE`; a still-open Suspense receipt posts its full amount to `SUSPENSE`. Every posting resolves its real `gl_account_id` through `gl_account_roles` — the module never hardcodes an `account_code`. The app enforces `sum(debits) = sum(credits)` per journal (no DB constraint does this).
-2. Standalone bank charges (`is_bank_charge=true` rows Phase 1 excluded entirely) get their own direct path here: no customer was ever identified for them, so they skip `match_groups`/`invoice_allocations` completely and post straight from `bank_statements` to a fee journal entry.
-3. `GET .../matches`, `GET .../exceptions`, and `PATCH /exceptions/{id}` land here — a human can now see every open exception (including M2's Double-Collision/Short-Pay/No-Payment and M1's Suspense/Duplicate) and resolve one: write it off, manually map it, mark it disputed. Each resolution is expected to feed M4's audit trail.
-4. After posting, the **SL-vs-GL control proof** runs: sum the AR movement from `invoices`/`invoice_allocations` for the entity/period and compare it against `gl_control_balances.control_balance_minor` for the `AR_CONTROL` account. A mismatch beyond tolerance raises a `GL_VARIANCE`/"GL Control Mismatch" exception instead of silently accepting books that don't balance.
+1. `gl_posting.post_run()` runs as the last step of `engine.run()`, inside the same transaction as Phase 1/2 — never speculatively mid-resolution, and never as a separate worker pass. It posts one journal entry **per bank_txn** (not per allocation), built from `run_phase_1`'s `suspense_records` and `run_phase_2`'s `payment_ledger_records` — both are plain in-memory handoffs, the same "pass the outcome forward" pattern Phase 1→Phase 2 already uses, since there's no `run_id` column on `payments`/`invoice_allocations` to re-query this by later. Four shapes, covering every outcome a payment can reach:
+   - **Normal settlement** — `Dr CASH_CONTROL` / `Cr AR_CONTROL` for the cash applied.
+   - **A gap** (TDS withheld, a decoupled bank fee, or a small write-off) — `AR_CONTROL` is credited for the invoice's *full* closed amount, `CASH_CONTROL` only for the cash actually received, and the difference debits whichever role the firing rule maps to (`GAP_ROLE_BY_RULE_KIND`: `tds-net-match → TDS_RECEIVABLE`, `fee-tolerance-match → BANK_CHARGES`, `dust-writeoff → WRITE_OFF`).
+   - **Unapplied/leftover cash** (overpayment excess, or a payment that never resolved at all) — `Dr CASH_CONTROL`, credited to `ON_ACCOUNT_ADVANCE` if a customer is known, `SUSPENSE` otherwise. A Phase-1 Suspense row (no customer, no candidates) and a Phase-2 Double-Collision (customer_id explicitly cleared) both land in `SUSPENSE`; a Phase-2 Ambiguous/Multiple-Invoice-Match (customer known, just not *which* invoice) lands in `ON_ACCOUNT_ADVANCE`.
+   - **Standalone bank charge** (`is_bank_charge=true`, never entered Phase 1/2 at all) — `Dr BANK_CHARGES` / `Cr CASH_CONTROL`, posted straight from `bank_statements` via `list_pending_bank_charges` (filtered on `recon_status='PENDING'` so a charge is never posted twice across runs), then flips that row's `recon_status → BANK_CHARGE`.
 
-**State at the end of M3**: every rupee that moved through the run has a real double-entry trail, standalone fees are booked without pretending to be a customer match, and any sub-ledger/GL disagreement is a visible, typed exception.
+   Every line resolves its real `gl_account_id` through `gl_account_roles` — the module never hardcodes an `account_code` — and raises before posting anything if the entity is missing a required role, rather than writing a partial/unbalanced journal. Each line pair is emitted together from the same source amount (never computed independently and reconciled after the fact), so `sum(DEBIT) == sum(CREDIT)` holds by construction; there's no DB constraint enforcing it.
+2. `invoice_allocations.gl_journal_id` is back-filled (`link_allocation_journal`) once a payment's journal posts, so a later query can trace any allocation straight to its journal entry without re-deriving it.
+3. `GET /runs/{id}/matches`, `GET /runs/{id}/exceptions` (optionally filtered by `status`), and `PATCH /exceptions/{id}` land here — a human can now see every open exception (M1's Suspense/Duplicate, M2's Short-Pay/Ambiguous/Double-Collision/No-Payment, and M3's own GL_VARIANCE below) and resolve one (`status`, `resolution_outcome`, `resolution_notes`). `resolved_at` is stamped automatically the moment `status` moves away from `OPEN`/`INVESTIGATING` — never settable directly by the caller. `resolver_id` stays `NULL` until real auth exists. Each resolution is expected to feed M4's audit trail.
+4. After every payment and standalone charge posts, the **SL-vs-GL control proof** (`_run_control_proof`) runs once, entity-wide (not run-scoped — it's a point-in-time snapshot of the whole sub-ledger, not just what this run touched): `sum_open_ar_balance` (every not-yet-`PAID` invoice's `balance_due_minor`) is compared against `gl_control_balances.control_balance_minor` for the entity's `AR_CONTROL` account, on the run's `period_end`. No row for that exact `period_date` means there's nothing to compare against yet — skipped, not treated as a mismatch. A real mismatch raises a `GL_VARIANCE` exception carrying `{sub_ledger_balance_minor, gl_control_balance_minor, variance_minor}` in `detail` — it does **not** fail the run; it's a finding to investigate, not a reason to leave everything else unposted.
+
+**State at the end of M3**: every rupee that moved through the run has a real double-entry trail, standalone fees are booked without pretending to be a customer match, and any sub-ledger/GL disagreement is a visible, typed, detail-bearing exception. Verified end-to-end against the golden dataset (`tests/reconciliation/test_golden_m3.py`, 12 tests): every journal this run posts balances; TDS-net/fee-tolerance/dust-adjacent gaps land on the correct role; an overpayment posts both its settlement and its on-account leftover in the same journal; the standalone bank charge (BANK-017) and the Suspense receipt (BANK-018) post through their own paths with no customer involved; a seeded ₹50,000 GL control balance against the golden dataset's real ₹62,500 open-AR position raises exactly one `GL_VARIANCE` with `variance_minor=1,250,000` (paise); the match/exception read+resolve API round-trips correctly, including rejecting an invalid `status`.
 
 ### M4 — Sign-off, audit, worker completeness, Rules Studio (not built)
 
@@ -311,20 +317,20 @@ No ingestion pipeline writes `customer_bank_accounts` or `expected_remittances` 
 | File | Status | What it does |
 |---|---|---|
 | `constants.py` | ✅ Done | Phase/exception/match/GL-role vocabularies, `GL_ROLE_DEFAULTS`, the 20-rule `DEFAULT_AR_RULE_CATALOG` |
-| `dao.py` | ✅ M0+M1+M2 scope done | Definitions/rules CRUD, GL-role seeding, run queue CRUD, Phase-1 working-set loaders, `payments`/`reconciliation_exceptions` writes, Phase-2 working-set loaders (open invoices/memos), `match_groups`/`invoice_allocations` writes, balance-mutating updates. `gl_journal_*` writes land in M3 |
-| `schema.py` | ✅ M0+M1 scope done | Pydantic models for definitions/rules/runs. No models yet for matches/exceptions/sign-off (M2-M4) |
-| `service.py` | ✅ M0+M1 scope done | `create_definition` (seeds catalog + GL roles), rule/run CRUD |
-| `router.py` | ✅ M0+M1 scope done | 9 endpoints, see §6. Carries an explicit milestone-map docstring |
+| `dao.py` | ✅ M0-M3 scope done | Definitions/rules CRUD, GL-role seeding, run queue CRUD, Phase-1 working-set loaders, `payments`/`reconciliation_exceptions` writes, Phase-2 working-set loaders (open invoices/memos), `match_groups`/`invoice_allocations` writes, balance-mutating updates, `gl_journal_*`/`gl_control_balances` reads+writes, match/exception review queries |
+| `schema.py` | ✅ M0-M3 scope done | Pydantic models for definitions/rules/runs, plus M3's `MatchGroupOut`/`AllocationOut`/`ExceptionOut`/`ExceptionUpdate`. No sign-off model yet (M4) |
+| `service.py` | ✅ M0-M3 scope done | `create_definition` (seeds catalog + GL roles), rule/run CRUD, `list_matches`/`list_exceptions`/`update_exception` with status/outcome validation |
+| `router.py` | ✅ M0-M3 scope done | 12 endpoints, see §6. Carries an explicit milestone-map docstring |
 | `extract.py` | ✅ Done | Pure regex: VPA, GSTIN, PAN, 4+ digit numeric blocks, account-suffix matching |
 | `fuzzy.py` | ✅ Done | `best_fuzzy_match` (pg_trgm SQL), `fuzzy_ratio` (pure-Python fallback), `significant_tokens`/`token_overlap_match` |
 | `rules/__init__.py` | ✅ Done | Shared `RuleContext` (the loaded working set) and `IdentificationResult` types |
 | `rules/identification.py` | ✅ Done | `dup_utr_check` + the 6 Phase 1a rules, `IDENTIFICATION_RULES` registry |
 | `rules/pooling.py` | ✅ Done | The 2 Phase 1b rules, `POOLING_RULES` registry |
 | `rules/allocation.py` | ✅ Done | Rules 2.1–2.9 (the two guardrail kinds, 2.0a/2.0b, are context-prep, not registry callables - see `GUARDRAIL_KINDS`) |
-| `engine.py` | ✅ Phase 1+2 done | `run()` calls `run_phase_1` then `run_phase_2` in one transaction; GL posting (M3) will extend `run()` further |
-| `gl_posting.py` | ⬜ M3 | Consolidated journal entries + SL-vs-GL control proof |
+| `engine.py` | ✅ Phase 1+2+GL posting done | `run()` calls `run_phase_1`, `run_phase_2`, then `gl_posting.post_run()`, all in one transaction |
+| `gl_posting.py` | ✅ Done | Per-bank_txn consolidated journal entries (settlement/gap/unapplied/standalone-charge) + SL-vs-GL control proof |
 | `audit.py` | ⬜ M4 | Hash-chained `immutable_audit_trail` writes, `run_hash` computation |
-| `app/workers/reconciliation_worker.py` | ✅ Done | Lease-based queue worker, structurally identical to `ingestion_worker.py`. Calls `engine.run()` (Phase 1+2); GL posting (M3) extends `engine.run()`, not this file |
+| `app/workers/reconciliation_worker.py` | ✅ Done | Lease-based queue worker, structurally identical to `ingestion_worker.py`. Calls `engine.run()` (Phase 1+2+GL posting) unchanged since M1 |
 
 ---
 
@@ -384,16 +390,16 @@ All under `/api/v1`, tag `Reconciliation`.
 | `GET` | `/reconciliations/{id}/runs` | ✅ | |
 | `GET` | `/runs/{run_id}` | ✅ | Counters are `NULL` until a worker completes the run |
 | `POST` | `/runs/{run_id}/retry` | ✅ | Only from `FAILED` |
-| `GET` | `/runs/{run_id}/matches` | ⬜ M3 | |
-| `GET` | `/runs/{run_id}/exceptions` | ⬜ M3 | |
-| `PATCH` | `/exceptions/{exception_id}` | ⬜ M3 | Resolve/manual-map/write-off |
+| `GET` | `/runs/{run_id}/matches` | ✅ | Each match group nests its `allocations` (invoice/payment/amount) |
+| `GET` | `/runs/{run_id}/exceptions` | ✅ | Filter: `status_filter` (any `EXCEPTION_STATUSES` value) |
+| `PATCH` | `/exceptions/{exception_id}` | ✅ | `status`/`resolution_outcome`/`resolution_notes`; `resolved_at` auto-stamped, `resolver_id` `NULL` until auth exists |
 | `POST` | `/runs/{run_id}/sign-off` | ⬜ M4 | Compute `run_hash`, `status → APPROVED` |
 
 Reserved permission slugs (auth module still stubbed, same as `app/datahub`): `recon.run.prepare`, `recon.run.approve`, `recon.exception.resolve`.
 
 ---
 
-## 8. Known gaps found during M0/M1/M2 build
+## 8. Known gaps found during M0-M3 build
 
 Carried forward honestly, not silently dropped — same convention as `docs/data-hub.md` §9.
 
@@ -405,4 +411,6 @@ Carried forward honestly, not silently dropped — same convention as `docs/data
 - **Fixed along the way in the ingestion layer, worth knowing about**: `apply_mapping`'s clobbering bug (a non-matching synonym could overwrite a value a matching one already found — now "first non-None wins"), the missing `PARSE_BOOL` transform (booleans previously stayed strings and asyncpg rejected them), and corrupted `CONST` `transform_param`s on the live `BANK` mapping (`currency`/`dr_cr` had silently lost their values at some point) — all fixed in `app/datahub/transforms.py` and the live mapping data.
 - **Fixed along the way in the reconciliation engine itself, worth knowing about**: (1) the `period-cutoff-guard` originally filtered on `due_date`, which would have excluded almost every invoice in the golden dataset from a same-month run (due dates routinely fall a month past issue dates under Net-30 terms) - changed to filter on `issue_date`. (2) Several places passed a raw `uuid.UUID` where a `str` was needed (JSON-encoding an exception's `detail`, comparing an invoice ID from one source against another) - the same bug class caught in M0/M1, now fixed by normalizing every `invoice_id`/`customer_id` to `str` once, at the point invoices are loaded in `engine.py`, rather than converting ad hoc at each use site. (3) A closed invoice was decremented to a zero balance but never removed from the in-memory working set, so a later payment in the same run could still match against it via `invoice-number-match`/`truncated-suffix-match` (neither checks balance > 0) and attempt a zero-amount allocation, which `invoice_allocations`' `CHECK(allocated_minor > 0)` correctly rejected - fixed by removing an invoice from the working set the moment its balance reaches zero.
 - **The golden test fixture (`truebalance/rule-test-data/`) has two real inconsistencies**: the README describes a `BANK-015`/`BANK-016` duplicate-reference case that doesn't exist in `Bank_Statement.csv` (only 18 rows, `BANK-015`/`016` are simply absent); and `BANK-001`/`BANK-019` unintentionally collide on the same `bank_reference`, which correctly triggers `dup-utr-check` but means `BANK-001` doesn't demonstrate "Expected UTR match" as the README describes (covered explicitly by `test_acme_flagged_duplicate_not_locked` and `test_acme_invoice_101_unpaid_due_to_duplicate_fixture_bug` in `tests/reconciliation/test_golden_m2.py`, rather than hidden). Neither is an engine bug — both are worth fixing at the fixture level before this is called a clean acceptance test.
-- **`tests/reconciliation/test_golden_m2.py` is the golden acceptance test, run entirely via direct SQL seeding inside a rolled-back transaction** - not through `app/datahub` ingestion or the HTTP API. An earlier verification pass (M1) uploaded the same dataset through the real Data Hub API against the shared dev database, which left visible "Golden *" data source cards and a test entity in the UI that had to be found and manually cleaned up afterward. The pytest version gives the same verification confidence with zero persisted footprint - prefer it for future milestone verification too.
+- **`tests/reconciliation/test_golden_m2.py` and `test_golden_m3.py` are the golden acceptance tests, run entirely via direct SQL seeding inside a rolled-back transaction** - not through `app/datahub` ingestion or the HTTP API. An earlier verification pass (M1) uploaded the same dataset through the real Data Hub API against the shared dev database, which left visible "Golden *" data source cards and a test entity in the UI that had to be found and manually cleaned up afterward. The pytest version gives the same verification confidence with zero persisted footprint - prefer it for future milestone verification too. `test_golden_m3.py` imports M2's `golden` fixture directly rather than duplicating the ~150-line dataset seed.
+- **`fee-tolerance-match` and `dust-writeoff` share the same default tolerance (500 minor units) with no other differentiator**, and `fee-tolerance-match` evaluates first (priority 60 vs 70). For a residual within tolerance on a bank row with no `explicit_fee_minor` set, `fee-tolerance-match`'s generic fallback always wins - `dust-writeoff` can only ever fire if `fee-tolerance-match` is disabled or its tolerance is tightened below the residual. Found via the golden dataset's BANK-014/INV-118 case (named "WRITE OFF TEST PAYMENT" in the fixture, but actually resolves via `fee-tolerance-match`, posting its gap to `BANK_CHARGES` rather than `WRITE_OFF` - see `test_golden_m3.py::test_small_residual_118_gap_posts_to_bank_charges_not_write_off`). Not fixed here since it's a rule-catalog tuning question (should `dust-writeoff`'s default threshold be smaller than `fee-tolerance-match`'s, or should priority order flip?), not a code bug.
+- **Fixed along the way in M3**: `sum_open_ar_balance`'s `SUM(balance_due_minor)` returned a Postgres `numeric` (decoded by asyncpg as `Decimal`), which broke `json.dumps` when the control proof embedded it in a `GL_VARIANCE` exception's `detail` jsonb - the query now casts `::bigint` so asyncpg decodes a plain `int`, consistent with the rest of the codebase's UUID-vs-str-style "fix at the source, not at each use site" convention (§ above).

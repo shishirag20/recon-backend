@@ -30,6 +30,9 @@ from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.schema import (
     DefinitionCreate,
     DefinitionOut,
+    ExceptionOut,
+    ExceptionUpdate,
+    MatchGroupOut,
     RuleOut,
     RuleUpdate,
     RunCreate,
@@ -134,3 +137,31 @@ async def retry_run(run_id: UUID, service: ReconciliationService = Depends(get_s
     """Only valid when `status=FAILED` (409 otherwise) - mirrors
     `POST /ingestion-jobs/{job_id}/retry`."""
     return await service.retry_run(str(run_id))
+
+
+# -- match_groups / reconciliation_exceptions (M3, run results) --------------------
+@router.get("/runs/{run_id}/matches", response_model=list[MatchGroupOut], summary="List a run's match groups")
+async def list_matches(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+    """Every match group Phase 2 committed for this run, each with its
+    nested `allocations` - the invoices it settled money against."""
+    return await service.list_matches(str(run_id))
+
+
+@router.get("/runs/{run_id}/exceptions", response_model=list[ExceptionOut], summary="List a run's exceptions")
+async def list_exceptions(run_id: UUID, status_filter: str | None = None, service: ReconciliationService = Depends(get_service)):
+    """Optionally filter by `status_filter` (one of `EXCEPTION_STATUSES`,
+    e.g. `OPEN`). Includes GL_VARIANCE exceptions raised by the M3 control
+    proof, not just Phase 1/2 exceptions."""
+    return await service.list_exceptions(str(run_id), status_=status_filter)
+
+
+@router.patch("/exceptions/{exception_id}", response_model=ExceptionOut, summary="Resolve or annotate an exception")
+async def update_exception(exception_id: UUID, payload: ExceptionUpdate, service: ReconciliationService = Depends(get_service)):
+    """`resolved_at` is stamped automatically the moment `status` moves away
+    from `OPEN`/`INVESTIGATING` - not settable directly. TODO(recon.exception.resolve):
+    gate behind that permission once app/auth/ is real; `resolver_id` is
+    `None` until then."""
+    return await service.update_exception(
+        str(exception_id), status_=payload.status, resolution_outcome=payload.resolution_outcome,
+        resolution_notes=payload.resolution_notes,
+    )
