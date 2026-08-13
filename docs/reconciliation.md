@@ -337,49 +337,49 @@ No ingestion pipeline writes `customer_bank_accounts` or `expected_remittances` 
 
 ## 6. The default AR rule catalog
 
-Seeded onto every new `AR` definition (`DEFAULT_AR_RULE_CATALOG`, 20 rows). ✅ = engine implementation exists. `kind`/`name` are reconciled verbatim against the `recon-frontend` prototype's `src/mocks/ar.ts` catalog (21 rows) - see the naming note below the tables.
+Seeded onto every new `AR` definition (`DEFAULT_AR_RULE_CATALOG`, 20 rows). ✅ = engine implementation exists. `kind`/`name` are reconciled verbatim against the `recon-frontend` prototype's canonical rule catalog - `src/reference/index copy.html`'s `AR_RULE_KINDS` object - **not** `src/mocks/ar.ts` (looser/older `name` text) and **not** `ARRuleCard.tsx`'s `RULE_METADATA` (missing labels for `subset-sum`/`bank-fee`/`write-off`); `index copy.html` is the only one of the three with a complete, consistent label for every kind, and it's what the Rules Studio UI's card titles (`rule.name`, verbatim) actually need to match. See the naming note below the tables.
 
 ### INTAKE_VALIDATION (Phase 0) — runs once per bank_txn, before identification starts
 
-| Priority | Kind | Confidence | Config | Status |
-|---|---|---|---|---|
-| 0 | `dup-utr` | 100 | `{}` | ✅ A reject here (duplicate `bank_reference`) means Phase 1a/1b never run for this row at all - see `engine.py::run_phase_1`'s intake pre-pass |
+| Priority | Kind | Name | Confidence | Config | Status |
+|---|---|---|---|---|---|
+| 0 | `dup-utr` | Duplicate UTR Check | 100 | `{}` | ✅ A reject here (duplicate `bank_reference`) means Phase 1a/1b never run for this row at all - see `engine.py::run_phase_1`'s intake pre-pass |
 
 ### CUSTOMER_LOCK (Phase 1a) — first match wins, locks a single customer
 
-| Priority | Kind | Confidence | Config | Status |
-|---|---|---|---|---|
-| 10 | `expected-utr` | 100 | `{source: expected_remittances, match_field: utr_number}` | ✅ |
-| 20 | `account-ifsc` | 100 | `{source: customer_bank_accounts, match_fields: [bank_account_no, ifsc_code]}` | ✅ |
-| 30 | `upi` | 100 | `{source: customers, match_field: vpa_handle, extract: vpa}` | ✅ |
-| 40 | `customer-code` | 100 | `{source: customer_reference_codes, extract: narration_substring}` | ✅ |
-| 50 | `gstin-pan` | 100 | `{source: customers, extract: [gstin, pan]}` | ✅ |
-| 60 | `fuzzy-name` | 85 | `{source: customers, match_field: company_name, min_similarity: 0.85}` | ✅ |
+| Priority | Kind | Name | Confidence | Config | Status |
+|---|---|---|---|---|---|
+| 10 | `expected-utr` | Pre-Advised UTR Match | 100 | `{source: expected_remittances, match_field: utr_number}` | ✅ |
+| 20 | `account-ifsc` | Payer Account & IFSC Match | 100 | `{source: customer_bank_accounts, match_fields: [bank_account_no, ifsc_code]}` | ✅ |
+| 30 | `upi` | UPI Handle Match | 100 | `{source: customers, match_field: vpa_handle, extract: vpa}` | ✅ |
+| 40 | `customer-code` | Customer Code in Narration Match | 100 | `{source: customer_reference_codes, extract: narration_substring}` | ✅ |
+| 50 | `gstin-pan` | Tax ID & PAN Match | 100 | `{source: customers, extract: [gstin, pan]}` | ✅ |
+| 60 | `fuzzy-name` | Company Name Match | 85 | `{source: customers, match_field: company_name, min_similarity: 0.85}` | ✅ |
 
 ### CANDIDATE_POOL (Phase 1b) — only if 1a found nothing; never locks, only pools
 
-| Priority | Kind | Confidence | Config | Status |
-|---|---|---|---|---|
-| 10 | `account-suffix` | 60 | `{source: customer_bank_accounts, match_field: bank_account_no, mode: suffix}` | ✅ |
-| 20 | `narration-tokens` | 55 | `{source: customers, match_field: company_name, mode: token_substring}` | ✅ |
+| Priority | Kind | Name | Confidence | Config | Status |
+|---|---|---|---|---|---|
+| 10 | `account-suffix` | Masked Account Suffix Match | 60 | `{source: customer_bank_accounts, match_field: bank_account_no, mode: suffix}` | ✅ |
+| 20 | `narration-tokens` | Token-Based Narration Match | 55 | `{source: customers, match_field: company_name, mode: token_substring}` | ✅ |
 
 ### ALLOCATION (Phase 2) — scoped to the locked customer or candidate pool
 
-| Priority | Kind | Confidence | Config | Status |
-|---|---|---|---|---|
-| 0 | `period-cutoff-guard` | — | `{date_field: issue_date, compare: lte_period_end}` | ✅ Context-prep (baked into `load_open_invoices`'s query), not a registry rule. No frontend-prototype counterpart. |
-| 5 | `memo-netoff-guard` | — | `{source: credit_debit_memos, filter: memo_date_lte_period_end}` | ✅ Best-effort - only invoice-linked memos are netted; customer-level memos with no `invoice_id` aren't (no golden-data case exercises this). No frontend-prototype counterpart. |
-| 10 | `exact-invoice-num` | 100 | `{match_field: invoice_number, location: narration}` | ✅ |
-| 20 | `invoice-suffix` | 90 | `{match_field: invoice_number, mode: suffix, min_length: 4}` | ✅ |
-| 30 | `exact-amount` | 100 | `{amount: {mode: exact, field: balance_due_minor}, tie_break: ambiguous_exception}` | ✅ Ties → `MULTIPLE_INVOICE_MATCH` exception |
-| 40 | `tds-match` | 95 | `{amount: {mode: net_of_tds, field: allowed_tds_minor}}` | ✅ Computes TDS from `tds_rate_pct × total_amount_minor` at match time (see §8 - no ingestion path derives `allowed_tds_minor` yet) |
-| 50 | `subset-sum` | 90 | `{amount: {mode: subset_sum}, order_by: due_date, max_invoices: 10}` | ✅ Only searches combinations of 2+ invoices - a single-invoice exact sum is `exact-amount`'s job at earlier priority |
-| 60 | `bank-fee` | 80 | `{amount: {mode: tolerance, value_minor: 500}, decouple_field: explicit_fee_minor}` | ✅ Prefers an exact match against the bank row's own `explicit_fee_minor`; falls back to the generic tolerance only if no exact-fee candidate exists |
-| 70 | `write-off` | 100 | `{amount: {mode: tolerance, value_minor: 500}, gl_role: WRITE_OFF}` | ✅ Threshold corrected from an initial 100 (₹1) to 500 (₹5) - the golden dataset's BANK-014/INV-118 case needs ₹5 headroom. Shares its tolerance/priority band with `bank-fee` - see §8, `bank-fee` wins in practice when both would fire. |
-| 80 | `overpayment` | 100 | `{gl_role: ON_ACCOUNT_ADVANCE}` | ✅ Targets whichever open invoice has the *smallest* excess (closest match), not an arbitrary one |
-| 90 | `partial-payment` | 60 | `{mode: partial, allow_short_pay: true}` | ✅ Applies to the customer's oldest open invoice (by due date) when nothing else identifies a target |
+| Priority | Kind | Name | Confidence | Config | Status |
+|---|---|---|---|---|---|
+| 0 | `period-cutoff-guard` | Invoice issue date <= period_end | — | `{date_field: issue_date, compare: lte_period_end}` | ✅ Context-prep (baked into `load_open_invoices`'s query), not a registry rule. No frontend-prototype counterpart. |
+| 5 | `memo-netoff-guard` | Net off open credit/debit memos first | — | `{source: credit_debit_memos, filter: memo_date_lte_period_end}` | ✅ Best-effort - only invoice-linked memos are netted; customer-level memos with no `invoice_id` aren't (no golden-data case exercises this). No frontend-prototype counterpart. |
+| 10 | `exact-invoice-num` | Exact Invoice Number Match | 100 | `{match_field: invoice_number, location: narration}` | ✅ |
+| 20 | `invoice-suffix` | Truncated Invoice Number Match | 90 | `{match_field: invoice_number, mode: suffix, min_length: 4}` | ✅ |
+| 30 | `exact-amount` | Exact Amount Match | 100 | `{amount: {mode: exact, field: balance_due_minor}, tie_break: ambiguous_exception}` | ✅ Ties → `MULTIPLE_INVOICE_MATCH` exception |
+| 40 | `tds-match` | TDS-Adjusted Amount Match | 95 | `{amount: {mode: net_of_tds, field: allowed_tds_minor}}` | ✅ Computes TDS from `tds_rate_pct × total_amount_minor` at match time (see §8 - no ingestion path derives `allowed_tds_minor` yet) |
+| 50 | `subset-sum` | Combined Invoice Match (Many-to-Many) | 90 | `{amount: {mode: subset_sum}, order_by: due_date, max_invoices: 10}` | ✅ Only searches combinations of 2+ invoices - a single-invoice exact sum is `exact-amount`'s job at earlier priority |
+| 60 | `bank-fee` | Bank Fee Variance Match | 80 | `{amount: {mode: tolerance, value_minor: 500}, decouple_field: explicit_fee_minor}` | ✅ Prefers an exact match against the bank row's own `explicit_fee_minor`; falls back to the generic tolerance only if no exact-fee candidate exists |
+| 70 | `write-off` | Small Balance Write-Off | 100 | `{amount: {mode: tolerance, value_minor: 500}, gl_role: WRITE_OFF}` | ✅ Threshold corrected from an initial 100 (₹1) to 500 (₹5) - the golden dataset's BANK-014/INV-118 case needs ₹5 headroom. Shares its tolerance/priority band with `bank-fee` - see §8, `bank-fee` wins in practice when both would fire. |
+| 80 | `overpayment` | Overpayment to On-Account Credit | 100 | `{gl_role: ON_ACCOUNT_ADVANCE}` | ✅ Targets whichever open invoice has the *smallest* excess (closest match), not an arbitrary one |
+| 90 | `partial-payment` | Partial Payment Allocation | 60 | `{mode: partial, allow_short_pay: true}` | ✅ Applies to the customer's oldest open invoice (by due date) when nothing else identifies a target |
 
-**On the 21-vs-20 count and the naming reconciliation**: the frontend prototype's 21 rows include 3 not listed above (`threshold` rules for its `short-pay`, `unapplied`, and `gl-check` phases) - those correspond to `RECON_PHASES`' reserved `SHORT_PAY`/`UNAPPLIED`/`GL_CHECK` phases, which exist in the schema but have no seeded/tunable catalog rows yet; today those checks are hardcoded logic (Short-Pay/No-Payment/Unapplied-Cash raised directly in `engine.py`, the GL control proof's exact-match comparison in `gl_posting.py` - no configurable tolerance exists for any of the three). Every other `kind`/`name` pair above was renamed to match the prototype's `src/mocks/ar.ts` verbatim, including the two backend-only guardrail rows' *config shape* being left alone (they have no prototype counterpart to reconcile against). `dup-utr` was also moved to its own `INTAKE_VALIDATION` phase (priority 0, the only row there today) to match the prototype's `intake` bucketing exactly - `engine.py::run_phase_1` now evaluates it in a dedicated pre-pass, ahead of and separate from the `CUSTOMER_LOCK` loop, rather than inline as the lock loop's priority-0 entry.
+**On the 21-vs-20 count and the naming reconciliation**: the frontend prototype's 21 rows include 3 not listed above (`threshold` rules for its `short-pay`, `unapplied`, and `gl-check` phases) - those correspond to `RECON_PHASES`' reserved `SHORT_PAY`/`UNAPPLIED`/`GL_CHECK` phases, which exist in the schema but have no seeded/tunable catalog rows yet; today those checks are hardcoded logic (Short-Pay/No-Payment/Unapplied-Cash raised directly in `engine.py`, the GL control proof's exact-match comparison in `gl_posting.py` - no configurable tolerance exists for any of the three). `src/reference/index copy.html`'s `AR_RULE_KINDS['short-pay'|'unapplied'|'gl-check']` already defines a `label`/`description`/`condLabel` for a single `kind: 'threshold'` rule in each of those three phases, so closing this gap (adding real tunable rows + wiring their tolerances into the currently-hardcoded checks) is scoped and ready to build whenever it's prioritized - not done in this pass, which was naming-only. Every other `kind`/`name` pair above was renamed to match `index copy.html`'s `AR_RULE_KINDS` labels verbatim (not `src/mocks/ar.ts`, whose `name` text is looser/older, and not `ARRuleCard.tsx`'s `RULE_METADATA`, which lacks a `label` for 3 of these kinds and falls back to rendering `rule.name` unstyled for them - see `ARRuleCard.tsx`'s card title, which renders `{rule.name}` directly, not `meta.label`). The two backend-only guardrail rows' *config shape* was left alone (they have no prototype counterpart to reconcile against). `dup-utr` was also moved to its own `INTAKE_VALIDATION` phase (priority 0, the only row there today) to match the prototype's `intake` bucketing exactly - `engine.py::run_phase_1` now evaluates it in a dedicated pre-pass, ahead of and separate from the `CUSTOMER_LOCK` loop, rather than inline as the lock loop's priority-0 entry. Also fixed as part of this: `recon-frontend/src/services/ar.service.ts`'s `normalizeRule()` phase-map had `INTAKE: 'intake'` instead of `INTAKE_VALIDATION: 'intake'`, which silently emptied the Rules Studio UI's "Intake Validation Rules" section against real API data - unrelated to the backend naming/phase work itself, found while verifying it end-to-end.
 
 ---
 

@@ -3,13 +3,13 @@ catalog (constants.py), evaluated per (payment, candidate customer) pair in
 `(phase, priority)` order, first-match-wins, same pattern as
 identification.py/pooling.py.
 
-The two ALLOCATION-phase "guardrail" entries in the catalog
-(`period-cutoff-guard`, `memo-netoff-guard`) are deliberately NOT rule
-callables here - they're context prep, not matching logic. The period cutoff
-is baked into `ReconciliationDAO.load_open_invoices`'s query; the memo
-net-off is applied once when `engine.py` builds the `AllocationContext`.
-`engine.py`'s rule loop skips those two kinds when it walks `ALLOCATION`-phase
-rules from the DB, since they're not registered here.
+The period-cutoff and memo-net-off checks the original plan called "Phase
+2.0a/2.0b guardrails" are NOT rule callables here, and no longer have a
+catalog row at all (see constants.py's `DEFAULT_AR_RULE_CATALOG` comment) -
+the period cutoff is baked into `ReconciliationDAO.load_open_invoices`'s
+query; the memo net-off is applied once when `engine.py` builds the
+`AllocationContext`. Both run unconditionally, same as before - only the
+inert, never-actually-read catalog rows were removed.
 
 Every rule receives the *candidate* customer_id explicitly, separate from
 `payment['customer_id']` - a pooled payment has no locked customer yet, so
@@ -213,8 +213,3 @@ ALLOCATION_RULES: dict[str, RuleFn] = {
     "overpayment": overpay_on_account,
     "partial-payment": partial_pay,
 }
-
-# Catalog kinds that are context-prep guardrails, not matching rules - the
-# engine's ALLOCATION-phase rule loop skips these rather than treating a
-# missing registry entry as a config error.
-GUARDRAIL_KINDS = frozenset({"period-cutoff-guard", "memo-netoff-guard"})

@@ -17,10 +17,11 @@ import asyncpg
 from app.reconciliation import gl_posting
 from app.reconciliation.constants import (
     GAP_ROLE_BY_RULE_KIND, PHASE_ALLOCATION, PHASE_CANDIDATE_POOL, PHASE_CUSTOMER_LOCK, PHASE_INTAKE_VALIDATION,
+    PHASE_SHORT_PAY, PHASE_UNAPPLIED,
 )
 from app.reconciliation.dao import ReconciliationDAO
-from app.reconciliation.rules import AllocationContext, RuleContext
-from app.reconciliation.rules.allocation import ALLOCATION_RULES, GUARDRAIL_KINDS
+from app.reconciliation.rules import AllocationContext, RuleContext, get_threshold_minor
+from app.reconciliation.rules.allocation import ALLOCATION_RULES
 from app.reconciliation.rules.identification import IDENTIFICATION_RULES
 from app.reconciliation.rules.pooling import POOLING_RULES
 
@@ -215,9 +216,11 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
 
     rules = await dao.list_rules(definition_id)
     allocation_rules = sorted(
-        (r for r in rules if r["phase"] == PHASE_ALLOCATION and r["enabled"] and r["kind"] not in GUARDRAIL_KINDS),
+        (r for r in rules if r["phase"] == PHASE_ALLOCATION and r["enabled"]),
         key=lambda r: r["priority"],
     )
+    short_pay_tolerance_minor = get_threshold_minor(rules, PHASE_SHORT_PAY)
+    unapplied_tolerance_minor = get_threshold_minor(rules, PHASE_UNAPPLIED)
 
     invoices = await dao.load_open_invoices(entity_id, period_end)
     invoices_by_customer: dict[str, list[dict]] = defaultdict(list)
@@ -341,14 +344,20 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         if resolved_customer_id is None:
             # Pool never resolved (0 candidates matched anything), or a
             # locked customer had literally no open invoice to apply to.
-            await dao.insert_exception(
-                run_id=run_id, exception_type="UNAPPLIED_CASH", bank_txn_id=bank_txn_id, customer_id=outcome["customer_id"],
-                reason_code="no open invoice matched for any candidate", detail=None,
-            )
+            # Below unapplied_tolerance_minor (config'd via the UNAPPLIED
+            # phase's threshold rule), this genuinely-unassigned amount is
+            # still tracked as unapplied but doesn't rise to a reviewable
+            # exception - the default tolerance is 0, so this is a no-op
+            # unless a definition explicitly configures a nonzero threshold.
+            if amount > unapplied_tolerance_minor:
+                await dao.insert_exception(
+                    run_id=run_id, exception_type="UNAPPLIED_CASH", bank_txn_id=bank_txn_id, customer_id=outcome["customer_id"],
+                    reason_code="no open invoice matched for any candidate", detail=None,
+                )
+                exception_minor += amount
+                counts["unresolved"] += 1
             await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
-            exception_minor += amount
             unapplied_minor += amount
-            counts["unresolved"] += 1
             # outcome["customer_id"] may itself be None (an unresolved pool)
             # or set (a locked customer with no open invoice at all) -
             # gl_posting.py's SUSPENSE-vs-ON_ACCOUNT_ADVANCE choice follows
@@ -372,6 +381,7 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
 
         cash_applied = 0
         still_open: list[str] = []
+        shortfall_total_minor = 0
         posted_allocations: list[dict] = []  # for gl_posting.py (M3) - see payment_ledger_records below
         gap_role = GAP_ROLE_BY_RULE_KIND.get(resolved_rule["kind"]) if resolved_rule else None
         for alloc in resolved_outcome.allocations:
@@ -403,20 +413,33 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
                 ]
             else:
                 still_open.append(alloc.invoice_id)  # recorded here, not re-looked-up below - it may since have been removed from the list above
+                shortfall_total_minor += invoice["balance_due_minor"]
 
         await dao.apply_payment_allocation(payment_id, cash_applied)
         leftover = amount - cash_applied
 
         # Short-Pay: an allocation left an invoice still open with a balance.
+        # A shortfall at or below short_pay_tolerance_minor (config'd via the
+        # SHORT_PAY phase's threshold rule, default 100 minor units = Rs 1.00)
+        # isn't worth flagging as a dispute - the invoice/bank row still
+        # accurately reflect the true open balance either way, only whether a
+        # reviewable exception exists (and which run-level bucket the amount
+        # counts toward) changes.
         if still_open:
-            await dao.insert_exception(
-                run_id=run_id, exception_type="SHORT_PAY", bank_txn_id=bank_txn_id, customer_id=resolved_customer_id,
-                reason_code=f"payment left {len(still_open)} invoice(s) with a remaining balance", detail={"invoice_ids": still_open},
-                match_group_id=match_group["match_group_id"],
-            )
+            if shortfall_total_minor > short_pay_tolerance_minor:
+                await dao.insert_exception(
+                    run_id=run_id, exception_type="SHORT_PAY", bank_txn_id=bank_txn_id, customer_id=resolved_customer_id,
+                    reason_code=f"payment left {len(still_open)} invoice(s) with a remaining balance", detail={
+                        "invoice_ids": still_open, "shortfall_minor": shortfall_total_minor, "tolerance_minor": short_pay_tolerance_minor,
+                    },
+                    match_group_id=match_group["match_group_id"],
+                )
+                exception_minor += amount
+                counts["short_pay"] += 1
+            else:
+                matched_minor += amount
+                counts["matched"] += 1
             await dao.mark_bank_statement_status(bank_txn_id, "PARTIAL")
-            exception_minor += amount
-            counts["short_pay"] += 1
         else:
             await dao.mark_bank_statement_status(bank_txn_id, "MATCHED")
             matched_minor += amount

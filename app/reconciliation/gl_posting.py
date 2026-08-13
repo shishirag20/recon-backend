@@ -24,8 +24,10 @@ from app.reconciliation.constants import (
     GL_ROLE_CASH_CONTROL,
     GL_ROLE_ON_ACCOUNT_ADVANCE,
     GL_ROLE_SUSPENSE,
+    PHASE_GL_CHECK,
 )
 from app.reconciliation.dao import ReconciliationDAO
+from app.reconciliation.rules import get_threshold_minor
 
 _REQUIRED_ROLES = (GL_ROLE_CASH_CONTROL, GL_ROLE_AR_CONTROL, GL_ROLE_SUSPENSE, GL_ROLE_ON_ACCOUNT_ADVANCE, GL_ROLE_BANK_CHARGES)
 
@@ -48,6 +50,9 @@ async def post_run(
     rather than posting an incomplete/unbalanced journal."""
     entity_id = str(run_context["entity_id"])
     period_end = run_context.get("period_end") or date.today()
+
+    rules = await dao.list_rules(str(run_context["definition_id"]))
+    gl_variance_tolerance_minor = get_threshold_minor(rules, PHASE_GL_CHECK)
 
     roles = await dao.get_gl_account_roles_map(entity_id)
     missing = [r for r in _REQUIRED_ROLES if r not in roles]
@@ -121,7 +126,7 @@ async def post_run(
         charge_count += 1
         journal_count += 1
 
-    gl_variance = await _run_control_proof(dao, entity_id, roles.get(GL_ROLE_AR_CONTROL), period_end, run_id)
+    gl_variance = await _run_control_proof(dao, entity_id, roles.get(GL_ROLE_AR_CONTROL), period_end, run_id, gl_variance_tolerance_minor)
 
     return {
         "journal_count": journal_count,
@@ -131,14 +136,19 @@ async def post_run(
     }
 
 
-async def _run_control_proof(dao: ReconciliationDAO, entity_id: str, ar_control_account_id: str | None, period_end, run_id: str) -> dict | None:
+async def _run_control_proof(
+    dao: ReconciliationDAO, entity_id: str, ar_control_account_id: str | None, period_end, run_id: str, tolerance_minor: int,
+) -> dict | None:
     """Compares the sub-ledger's live AR position (sum of every open
     invoice's balance, entity-wide - not scoped to just this run) against
     the GL's own stated control balance for the same period_date. A missing
     `gl_control_balances` row for that exact date means there's nothing to
-    compare against yet - skipped, not treated as a mismatch. Returns the
-    variance detail (and raises a GL_VARIANCE exception) on a real mismatch,
-    or None if it matches / can't be checked."""
+    compare against yet - skipped, not treated as a mismatch. A variance at
+    or below `tolerance_minor` (config'd via the GL_CHECK phase's threshold
+    rule, default 0 - exact match required) is also not treated as a
+    mismatch. Returns the variance detail (and raises a GL_VARIANCE
+    exception) on a real mismatch, or None if it matches / is within
+    tolerance / can't be checked."""
     if ar_control_account_id is None:
         return None
     control = await dao.get_gl_control_balance(ar_control_account_id, period_end)
@@ -146,11 +156,12 @@ async def _run_control_proof(dao: ReconciliationDAO, entity_id: str, ar_control_
         return None
     sl_balance = await dao.sum_open_ar_balance(entity_id)
     gl_balance = control["control_balance_minor"]
-    if sl_balance == gl_balance:
+    variance = sl_balance - gl_balance
+    if abs(variance) <= tolerance_minor:
         return None
     detail = {
         "sub_ledger_balance_minor": sl_balance, "gl_control_balance_minor": gl_balance,
-        "variance_minor": sl_balance - gl_balance,
+        "variance_minor": variance, "tolerance_minor": tolerance_minor,
     }
     await dao.insert_exception(
         run_id=run_id, exception_type="GL_VARIANCE", bank_txn_id=None, customer_id=None,

@@ -92,3 +92,16 @@ class AllocationOutcome:
     @property
     def matched(self) -> bool:
         return bool(self.allocations) or self.ambiguous
+
+
+def get_threshold_minor(rules: list[dict], phase: str) -> int:
+    """Reads the single enabled `kind='threshold'` rule's tolerance for a
+    SHORT_PAY/UNAPPLIED/GL_CHECK phase (each phase has exactly one - there's
+    no priority cascade to evaluate, unlike the other phases). Returns 0 -
+    the original, strictest behavior - if the row is missing or disabled,
+    so deleting/disabling it never silently loosens a check, only tightens
+    it back to unconditional."""
+    for rule in rules:
+        if rule["phase"] == phase and rule["enabled"] and rule["kind"] == "threshold":
+            return rule["config"].get("amount", {}).get("value_minor", 0)
+    return 0
