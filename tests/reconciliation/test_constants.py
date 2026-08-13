@@ -33,9 +33,18 @@ def test_confidence_in_range_when_set():
             assert 0 <= confidence <= 100, f"{kind!r} confidence {confidence!r} out of 0-100 range"
 
 
-def test_kinds_are_unique():
-    kinds = [kind for _, kind, *_ in DEFAULT_AR_RULE_CATALOG]
-    assert len(kinds) == len(set(kinds)), "duplicate rule kind in the default catalog"
+def test_kinds_are_unique_within_each_phase():
+    """`kind` only needs to be unique within a phase, not globally -
+    `threshold` is deliberately reused across SHORT_PAY/UNAPPLIED/GL_CHECK
+    (matching the recon-frontend prototype's own catalog exactly): each of
+    those phases has exactly one rule, read directly by phase via
+    `rules.get_threshold_minor` rather than dispatched through a per-kind
+    registry the way IDENTIFICATION_RULES/POOLING_RULES/ALLOCATION_RULES are."""
+    by_phase: dict[str, list[str]] = defaultdict(list)
+    for phase, kind, name, priority, confidence, config in DEFAULT_AR_RULE_CATALOG:
+        by_phase[phase].append(kind)
+    for phase, kinds in by_phase.items():
+        assert len(kinds) == len(set(kinds)), f"duplicate rule kind in phase {phase!r}"
 
 
 def test_every_rule_has_a_non_empty_config():

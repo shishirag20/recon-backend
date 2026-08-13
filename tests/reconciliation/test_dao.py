@@ -34,8 +34,10 @@ async def test_definition_and_rule_seeding_round_trip(conn):
 
     rules = await dao.list_rules(definition["definition_id"])
     assert len(rules) == len(DEFAULT_AR_RULE_CATALOG)
-    # Ordered by (phase, priority) - the first row must be priority 0 within its phase.
-    assert rules[0]["priority"] == 0
+    # Ordered by (phase, priority); alphabetically ALLOCATION sorts first,
+    # and every phase's priority numbering now starts at 1, matching the
+    # recon-frontend prototype's catalog verbatim (see constants.py).
+    assert rules[0]["priority"] == 1
 
     rule = rules[0]
     updated = await dao.update_rule(rule["rule_id"], enabled=False, config=None)

@@ -131,60 +131,85 @@ GL_ROLE_DEFAULTS: dict[str, tuple[str, str, str, str]] = {
 # app/reconciliation/rules/{identification,pooling,allocation}.py (M1/M2) -
 # this module only owns the data, not the rule implementations.
 DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...] = (
-    # kind/name below match the recon-frontend prototype's mocks/ar.ts catalog
-    # verbatim - the prototype is the naming source of truth this catalog
-    # was reconciled against (see docs/reconciliation.md §8).
-
+    # kind/name/priority/confidence below match the recon-frontend prototype's
+    # canonical rule catalog verbatim - src/reference/index copy.html's
+    # `AR_RULE_KINDS` + `arRuleC(...)` seed calls, NOT src/mocks/ar.ts (looser/
+    # older text) and NOT ARRuleCard.tsx's `RULE_METADATA` (missing labels for
+    # subset-sum/bank-fee/write-off) - `index copy.html` is the only one of
+    # the three with a complete, consistent definition for every kind. See
+    # docs/reconciliation.md §8.
+    #
+    # `period-cutoff-guard`/`memo-netoff-guard` (Phase 2.0a/2.0b in the
+    # original build plan) are deliberately NOT in this catalog, even though
+    # the engine still performs both checks unconditionally - they were
+    # represented as catalog rows through M2, but the plan's intent that
+    # their DB `config` actually drive the engine (see the plan's "the DB
+    # reconciliation_rules rows drive which fire and their tunables") was
+    # never implemented: the period cutoff is hardcoded into
+    # `ReconciliationDAO.load_open_invoices`'s SQL query, and the memo net-off
+    # is hardcoded into `engine.py::run_phase_2`. Neither row's `enabled`/
+    # `config` was ever actually read - they were inert placeholders a user
+    # could toggle in Rules Studio with zero effect, and the frontend
+    # prototype never modeled them as rules at all. Removed rather than
+    # finished, since nothing consumes their configurability today.
+    #
     # Phase 0 - INTAKE_VALIDATION (runs once per bank_txn, before customer
     # identification even starts; a reject here means Phase 1a/1b never run
     # for that row at all - see engine.py's run_phase_1)
-    (PHASE_INTAKE_VALIDATION, "dup-utr", "Duplicate transaction reference check", 0, 100,
+    (PHASE_INTAKE_VALIDATION, "dup-utr", "Duplicate UTR Check", 1, 100,
      {"description": "Reject a bank_reference already MATCHED in a prior run for this entity"}),
 
     # Phase 1a - CUSTOMER_LOCK (lock the paying customer; first match wins)
-    (PHASE_CUSTOMER_LOCK, "expected-utr", "Expected UTR match", 10, 100,
+    (PHASE_CUSTOMER_LOCK, "expected-utr", "Pre-Advised UTR Match", 1, 98,
      {"source": "expected_remittances", "match_field": "utr_number"}),
-    (PHASE_CUSTOMER_LOCK, "account-ifsc", "Payer account + IFSC match", 20, 100,
+    (PHASE_CUSTOMER_LOCK, "account-ifsc", "Payer Account & IFSC Match", 2, 97,
      {"source": "customer_bank_accounts", "match_fields": ["bank_account_no", "ifsc_code"]}),
-    (PHASE_CUSTOMER_LOCK, "upi", "UPI handle match", 30, 100,
+    (PHASE_CUSTOMER_LOCK, "upi", "UPI Handle Match", 3, 95,
      {"source": "customers", "match_field": "vpa_handle", "extract": "vpa"}),
-    (PHASE_CUSTOMER_LOCK, "customer-code", "Customer code in narration", 40, 100,
+    (PHASE_CUSTOMER_LOCK, "customer-code", "Customer Code in Narration Match", 4, 90,
      {"source": "customer_reference_codes", "extract": "narration_substring"}),
-    (PHASE_CUSTOMER_LOCK, "gstin-pan", "GSTIN / PAN extraction", 50, 100,
+    (PHASE_CUSTOMER_LOCK, "gstin-pan", "Tax ID & PAN Match", 5, 92,
      {"source": "customers", "extract": ["gstin", "pan"]}),
-    (PHASE_CUSTOMER_LOCK, "fuzzy-name", "Fuzzy company name match", 60, 85,
+    (PHASE_CUSTOMER_LOCK, "fuzzy-name", "Company Name Match", 6, 85,
      {"source": "customers", "match_field": "company_name", "min_similarity": 0.85}),
 
     # Phase 1b - CANDIDATE_POOL (only reached if Phase 1a locked nothing)
-    (PHASE_CANDIDATE_POOL, "account-suffix", "Masked account suffix match (last 4)", 10, 60,
+    (PHASE_CANDIDATE_POOL, "account-suffix", "Masked Account Suffix Match", 1, 60,
      {"source": "customer_bank_accounts", "match_field": "bank_account_no", "mode": "suffix"}),
-    (PHASE_CANDIDATE_POOL, "narration-tokens", "Token-based narration match", 20, 55,
+    (PHASE_CANDIDATE_POOL, "narration-tokens", "Token-Based Narration Match", 2, 50,
      {"source": "customers", "match_field": "company_name", "mode": "token_substring"}),
 
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool)
-    # period-cutoff-guard/memo-netoff-guard have no frontend-prototype
-    # counterpart (they're context-prep, not user-facing matching rules) -
-    # kind/name left as originally chosen.
-    (PHASE_ALLOCATION, "period-cutoff-guard", "Invoice issue date <= period_end", 0, None,
-     {"date_field": "issue_date", "compare": "lte_period_end"}),
-    (PHASE_ALLOCATION, "memo-netoff-guard", "Net off open credit/debit memos first", 5, None,
-     {"source": "credit_debit_memos", "filter": "memo_date_lte_period_end"}),
-    (PHASE_ALLOCATION, "exact-invoice-num", "Exact invoice number in narration", 10, 100,
+    (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
      {"match_field": "invoice_number", "location": "narration"}),
-    (PHASE_ALLOCATION, "invoice-suffix", "Invoice suffix / truncated number", 20, 90,
+    (PHASE_ALLOCATION, "invoice-suffix", "Truncated Invoice Number Match", 2, 90,
      {"match_field": "invoice_number", "mode": "suffix", "min_length": 4}),
-    (PHASE_ALLOCATION, "exact-amount", "Exact amount match", 30, 100,
+    (PHASE_ALLOCATION, "exact-amount", "Exact Amount Match", 3, 95,
      {"amount": {"mode": "exact", "field": "balance_due_minor"}, "tie_break": "ambiguous_exception"}),
-    (PHASE_ALLOCATION, "tds-match", "TDS match (invoice - allowed TDS = payment)", 40, 95,
+    (PHASE_ALLOCATION, "tds-match", "TDS-Adjusted Amount Match", 4, 93,
      {"amount": {"mode": "net_of_tds", "field": "allowed_tds_minor"}}),
-    (PHASE_ALLOCATION, "subset-sum", "Subset sum (many-to-many)", 50, 90,
+    (PHASE_ALLOCATION, "subset-sum", "Combined Invoice Match (Many-to-Many)", 5, 85,
      {"amount": {"mode": "subset_sum"}, "order_by": "due_date", "max_invoices": 10}),
-    (PHASE_ALLOCATION, "bank-fee", "Bank fee / minor variance", 60, 80,
+    (PHASE_ALLOCATION, "bank-fee", "Bank Fee Variance Match", 6, 80,
      {"amount": {"mode": "tolerance", "value_minor": 500}, "decouple_field": "explicit_fee_minor"}),
-    (PHASE_ALLOCATION, "write-off", "Small balance write-off", 70, 100,
+    (PHASE_ALLOCATION, "write-off", "Small Balance Write-Off", 7, 100,
      {"amount": {"mode": "tolerance", "value_minor": 500}, "gl_role": GL_ROLE_WRITE_OFF}),
-    (PHASE_ALLOCATION, "overpayment", "Overpayment -> On Account", 80, 100,
+    (PHASE_ALLOCATION, "overpayment", "Overpayment to On-Account Credit", 8, 100,
      {"gl_role": GL_ROLE_ON_ACCOUNT_ADVANCE}),
-    (PHASE_ALLOCATION, "partial-payment", "Universal partial payment", 90, 60,
+    (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 9, 100,
      {"mode": "partial", "allow_short_pay": True}),
+
+    # Phase 3.0/3.1/3.2 - SHORT_PAY / UNAPPLIED / GL_CHECK: one `threshold`
+    # rule per phase, actually read by the engine (engine.py::run_phase_2 for
+    # the first two, gl_posting.py::post_run for the third) via
+    # rules.get_threshold_minor - not placeholders, unlike the removed
+    # guardrail rows above. Disabling or deleting a row here reverts that
+    # phase's check to zero tolerance (today's original strict behavior),
+    # not to "no check at all".
+    (PHASE_SHORT_PAY, "threshold", "Shortfall Tolerance", 1, 100,
+     {"amount": {"mode": "abs", "value_minor": 100}}),
+    (PHASE_UNAPPLIED, "threshold", "Unapplied Cash Threshold", 1, 100,
+     {"amount": {"mode": "abs", "value_minor": 0}}),
+    (PHASE_GL_CHECK, "threshold", "GL Control Variance Tolerance", 1, 100,
+     {"amount": {"mode": "abs", "value_minor": 0}}),
 )
