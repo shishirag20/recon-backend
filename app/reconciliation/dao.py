@@ -28,6 +28,16 @@ import asyncpg
 from app.reconciliation.constants import GL_ROLE_DEFAULTS
 
 
+def _is_valid_uuid(val: str | None) -> bool:
+    if not val:
+        return False
+    try:
+        uuid.UUID(str(val))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def _row(record: asyncpg.Record | None) -> dict | None:
     return dict(record) if record is not None else None
 
@@ -42,7 +52,9 @@ class ReconciliationDAO:
 
     # -- entities (read-only sanity check, same pattern as DataHubDAO) ----------
     async def entity_exists(self, entity_id: str) -> bool:
-        row = await self.conn.fetchrow("SELECT 1 FROM entities WHERE entity_id = $1", entity_id)
+        if not _is_valid_uuid(entity_id):
+            return False
+        row = await self.conn.fetchrow("SELECT 1 FROM entities WHERE entity_id = $1::uuid", entity_id)
         return row is not None
 
     # -- reconciliation_definitions ----------------------------------------------
@@ -58,6 +70,8 @@ class ReconciliationDAO:
         return _row(row)
 
     async def get_definition(self, definition_id: str) -> dict | None:
+        if not _is_valid_uuid(definition_id):
+            return None
         row = await self.conn.fetchrow(
             "SELECT definition_id, entity_id, name, recon_type, cadence, owner_user_id "
             "FROM reconciliation_definitions WHERE definition_id = $1",
@@ -66,10 +80,11 @@ class ReconciliationDAO:
         return _row(row)
 
     async def list_definitions(self, *, entity_id: str | None) -> list[dict]:
+        valid_entity = entity_id if _is_valid_uuid(entity_id) else None
         rows = await self.conn.fetch(
             "SELECT definition_id, entity_id, name, recon_type, cadence, owner_user_id "
             "FROM reconciliation_definitions WHERE ($1::uuid IS NULL OR entity_id = $1) ORDER BY name",
-            entity_id,
+            valid_entity,
         )
         return _rows(rows)
 
@@ -90,6 +105,8 @@ class ReconciliationDAO:
         return out
 
     async def list_rules(self, definition_id: str) -> list[dict]:
+        if not _is_valid_uuid(definition_id):
+            return []
         rows = await self.conn.fetch(
             "SELECT rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config "
             "FROM reconciliation_rules WHERE definition_id = $1 ORDER BY phase, priority",
@@ -98,6 +115,8 @@ class ReconciliationDAO:
         return _rows(rows)
 
     async def get_rule(self, rule_id: str) -> dict | None:
+        if not _is_valid_uuid(rule_id):
+            return None
         row = await self.conn.fetchrow(
             "SELECT rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config "
             "FROM reconciliation_rules WHERE rule_id = $1",
@@ -106,6 +125,8 @@ class ReconciliationDAO:
         return _row(row)
 
     async def update_rule(self, rule_id: str, *, enabled: bool | None, config: dict | None) -> dict | None:
+        if not _is_valid_uuid(rule_id):
+            return None
         row = await self.conn.fetchrow(
             "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), config = COALESCE($3::jsonb, config) "
             "WHERE rule_id = $1 "
@@ -142,6 +163,8 @@ class ReconciliationDAO:
         return out
 
     async def list_gl_account_roles(self, entity_id: str) -> list[dict]:
+        if not _is_valid_uuid(entity_id):
+            return []
         rows = await self.conn.fetch(
             "SELECT r.role_id, r.entity_id, r.role_code, r.gl_account_id, a.account_code, a.account_name "
             "FROM gl_account_roles r JOIN gl_accounts a ON a.gl_account_id = r.gl_account_id "
@@ -169,21 +192,26 @@ class ReconciliationDAO:
         return _row(row)
 
     async def get_run(self, run_id: str) -> dict | None:
+        if not _is_valid_uuid(run_id):
+            return None
         row = await self.conn.fetchrow(
             f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs WHERE run_id = $1", run_id
         )
         return _row(row)
 
     async def list_runs(self, *, definition_id: str | None, status: str | None) -> list[dict]:
+        valid_def = definition_id if _is_valid_uuid(definition_id) else None
         rows = await self.conn.fetch(
             f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs "
             f"WHERE ($1::uuid IS NULL OR definition_id = $1) AND ($2::text IS NULL OR status = $2) "
             f"ORDER BY started_at DESC",
-            definition_id, status,
+            valid_def, status,
         )
         return _rows(rows)
 
     async def retry_run(self, run_id: str) -> dict | None:
+        if not _is_valid_uuid(run_id):
+            return None
         row = await self.conn.fetchrow(
             f"UPDATE reconciliation_runs SET status = 'QUEUED', attempt_count = 0, next_attempt_at = NULL, last_error = NULL "
             f"WHERE run_id = $1 AND status = 'FAILED' "
