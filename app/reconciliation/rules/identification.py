@@ -1,7 +1,12 @@
-"""Phase 1a (CUSTOMER_LOCK) rules - dup-utr-check + the 6 identification
-rules from the plan's default AR rule catalog (constants.py). First-match-
-wins: app/reconciliation/engine.py evaluates these in `(phase, priority)`
-order and stops at the first non-empty IdentificationResult.
+"""Phase 0 (INTAKE_VALIDATION) + Phase 1a (CUSTOMER_LOCK) rules - `dup-utr`
+plus the 6 identification rules from the plan's default AR rule catalog
+(constants.py). First-match-wins within each phase:
+app/reconciliation/engine.py's `run_phase_1` evaluates `dup-utr` in its own
+pre-pass, before the CUSTOMER_LOCK loop even starts - a reject there means
+Phase 1a/1b never run for that bank_txn at all. Both phases share this
+module and the `IDENTIFICATION_RULES` registry since `dup-utr` is, in every
+other respect, an identification-adjacent rule (same `RuleContext`, same
+`IdentificationResult` return type).
 """
 from __future__ import annotations
 
@@ -114,11 +119,11 @@ async def fuzzy_name_match(bank_txn: dict, ctx: RuleContext, config: dict) -> Id
 
 
 IDENTIFICATION_RULES: dict[str, RuleFn] = {
-    "dup-utr-check": dup_utr_check,
-    "utr-match": utr_match,
-    "bank-account-match": bank_account_match,
-    "vpa-match": vpa_match,
-    "reference-code-match": reference_code_match,
-    "gstin-pan-match": gstin_pan_match,
-    "fuzzy-name-match": fuzzy_name_match,
+    "dup-utr": dup_utr_check,
+    "expected-utr": utr_match,
+    "account-ifsc": bank_account_match,
+    "upi": vpa_match,
+    "customer-code": reference_code_match,
+    "gstin-pan": gstin_pan_match,
+    "fuzzy-name": fuzzy_name_match,
 }

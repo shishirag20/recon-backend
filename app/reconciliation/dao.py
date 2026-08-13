@@ -244,7 +244,7 @@ class ReconciliationDAO:
         attempts to identify a paying customer for. Excludes `is_bank_charge`
         rows entirely; the engine routes those straight to GL posting (M3),
         never through customer identification. Includes `explicit_fee_minor`
-        even though Phase 1 doesn't use it - Phase 2's fee-tolerance-match
+        even though Phase 1 doesn't use it - Phase 2's bank-fee
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
             "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
@@ -352,7 +352,7 @@ class ReconciliationDAO:
         `due_date` into the next month) - filtering on `due_date` would wrongly
         exclude every not-yet-due invoice from a run that's supposed to cover
         cash received *within* the period. Includes `tds_rate_pct` so
-        tds-net-match can compute the effective TDS amount itself
+        tds-match can compute the effective TDS amount itself
         (`total_amount_minor * tds_rate_pct / 100`) rather than depending on
         a pre-populated `allowed_tds_minor` - the ingestion mapping has no
         way to derive that product today (see docs/reconciliation.md §8)."""

@@ -33,9 +33,10 @@ class RuleContext:
 
 @dataclass
 class IdentificationResult:
-    """Result of one Phase 1a rule. `reject=True` (dup-utr-check only) means
-    stop evaluating this bank_txn entirely - it's a duplicate, not a miss -
-    rather than falling through to the next rule."""
+    """Result of one Phase 0 (INTAKE_VALIDATION) or Phase 1a (CUSTOMER_LOCK)
+    rule. `reject=True` (dup-utr only, Phase 0) means stop evaluating this
+    bank_txn entirely - it's a duplicate, not a miss - rather than falling
+    through to the next rule."""
     customer_id: str | None = None
     reject: bool = False
     reason: str = ""

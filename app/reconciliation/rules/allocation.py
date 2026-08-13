@@ -105,7 +105,7 @@ async def tds_net_match(payment: dict, bank_txn: dict, customer_id: str, ctx: Al
 async def subset_sum_fifo(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
     """2.5 - a combination of 2+ open invoices (oldest due date first, up to
     `config['max_invoices']`) whose balances sum exactly to the payment. A
-    single-invoice exact match is exact-balance-match's job (earlier
+    single-invoice exact match is exact-amount's job (earlier
     priority) - this only searches combinations of size >= 2."""
     amount = payment["total_received_minor"]
     max_invoices = config.get("max_invoices", 10)
@@ -203,15 +203,15 @@ async def partial_pay(payment: dict, bank_txn: dict, customer_id: str, ctx: Allo
 
 
 ALLOCATION_RULES: dict[str, RuleFn] = {
-    "invoice-number-match": invoice_number_match,
-    "truncated-suffix-match": truncated_suffix_match,
-    "exact-balance-match": exact_balance_match,
-    "tds-net-match": tds_net_match,
-    "subset-sum-fifo": subset_sum_fifo,
-    "fee-tolerance-match": fee_tolerance_match,
-    "dust-writeoff": dust_writeoff,
-    "overpay-on-account": overpay_on_account,
-    "partial-pay": partial_pay,
+    "exact-invoice-num": invoice_number_match,
+    "invoice-suffix": truncated_suffix_match,
+    "exact-amount": exact_balance_match,
+    "tds-match": tds_net_match,
+    "subset-sum": subset_sum_fifo,
+    "bank-fee": fee_tolerance_match,
+    "write-off": dust_writeoff,
+    "overpayment": overpay_on_account,
+    "partial-payment": partial_pay,
 }
 
 # Catalog kinds that are context-prep guardrails, not matching rules - the

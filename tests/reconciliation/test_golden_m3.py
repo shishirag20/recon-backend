@@ -103,10 +103,10 @@ class TestGLPostingScenarios:
         assert lines[("BANK_CHARGES", "DEBIT")] == 2_000
 
     async def test_small_residual_118_gap_posts_to_bank_charges_not_write_off(self, conn, golden):
-        """INV-118's 200-minor-unit residual is within both fee-tolerance-match's
-        and dust-writeoff's tolerance (both default 500, no differentiator here
-        since BANK-014 has no explicit_fee_minor) - fee-tolerance-match wins on
-        priority (60 vs dust-writeoff's 70), so the gap posts to BANK_CHARGES,
+        """INV-118's 200-minor-unit residual is within both bank-fee's
+        and write-off's tolerance (both default 500, no differentiator here
+        since BANK-014 has no explicit_fee_minor) - bank-fee wins on
+        priority (60 vs write-off's 70), so the gap posts to BANK_CHARGES,
         not WRITE_OFF. Documented, not treated as a bug: see docs/reconciliation.md."""
         await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
         journal_id = await _journal_for_invoice(conn, golden["invoices"]["118"])

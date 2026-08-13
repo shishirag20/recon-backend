@@ -49,6 +49,6 @@ async def token_pool(bank_txn: dict, ctx: RuleContext, config: dict) -> list[str
 
 
 POOLING_RULES: dict[str, RuleFn] = {
-    "masked-account-pool": masked_account_pool,
-    "token-pool": token_pool,
+    "account-suffix": masked_account_pool,
+    "narration-tokens": token_pool,
 }
