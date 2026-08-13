@@ -217,7 +217,7 @@ class TestPhase1Identification:
 
     async def test_acme_flagged_duplicate_not_locked(self, conn, golden):
         """Known fixture issue (docs/reconciliation.md §8): BANK-001 and
-        BANK-019 share a bank_reference, so dup-utr-check correctly rejects
+        BANK-019 share a bank_reference, so dup-utr correctly rejects
         both rather than locking BANK-001 to Acme as the README describes."""
         await _run_full_reconciliation(conn, golden["entity_id"])
         for key in ("001", "019"):
@@ -304,7 +304,7 @@ class TestPhase2Allocation:
         assert inv["status"] == "PARTIALLY_SETTLED" and inv["balance_due_minor"] == 150000
 
     async def test_short_pay_exceptions_107_and_117(self, conn, golden):
-        """INV-107 is identified via invoice-number-match (BANK-008's
+        """INV-107 is identified via exact-invoice-num (BANK-008's
         narration) but the payment (5000) falls 2000 short of its 7000
         balance; INV-117 is the universal-fallback partial payment. Both
         leave their invoice open with a remaining balance, so both raise
@@ -331,7 +331,7 @@ class TestPhase2Allocation:
     async def test_scoped_ambiguous_exception_coral(self, conn, golden):
         """BANK-020 pays exactly 4500, and Coral Living has two open
         invoices (INV-120, INV-121) that both have a 4500 balance - must not
-        guess which one, per exact-balance-match's tie_break config."""
+        guess which one, per exact-amount's tie_break config."""
         await _run_full_reconciliation(conn, golden["entity_id"])
         exceptions = await _exceptions_for(conn, golden["bank"]["020"])
         assert any(e["exception_type"] == "MULTIPLE_INVOICE_MATCH" for e in exceptions)

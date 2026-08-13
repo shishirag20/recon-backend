@@ -15,7 +15,9 @@ from collections import Counter, defaultdict
 import asyncpg
 
 from app.reconciliation import gl_posting
-from app.reconciliation.constants import GAP_ROLE_BY_RULE_KIND, PHASE_ALLOCATION, PHASE_CANDIDATE_POOL, PHASE_CUSTOMER_LOCK
+from app.reconciliation.constants import (
+    GAP_ROLE_BY_RULE_KIND, PHASE_ALLOCATION, PHASE_CANDIDATE_POOL, PHASE_CUSTOMER_LOCK, PHASE_INTAKE_VALIDATION,
+)
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext
 from app.reconciliation.rules.allocation import ALLOCATION_RULES, GUARDRAIL_KINDS
@@ -50,7 +52,8 @@ async def run(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: str, run
 
 async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: str, run_context: dict) -> dict:
     """Loads the Phase-1 working set, evaluates every candidate bank inflow
-    against Phase 1a (lock) then Phase 1b (pool), writes `payments` and
+    against Phase 0 (intake validation - `dup-utr`'s reject-before-anything-else
+    pre-check) then Phase 1a (lock) then Phase 1b (pool), writes `payments` and
     `reconciliation_exceptions`.
 
     Returns `outcomes` (one dict per locked/pooled payment, for `run_phase_2`
@@ -66,6 +69,9 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     definition_id = str(run_context["definition_id"])
 
     rules = await dao.list_rules(definition_id)
+    intake_rules = sorted(
+        (r for r in rules if r["phase"] == PHASE_INTAKE_VALIDATION and r["enabled"]), key=lambda r: r["priority"]
+    )
     identification_rules = sorted(
         (r for r in rules if r["phase"] == PHASE_CUSTOMER_LOCK and r["enabled"]), key=lambda r: r["priority"]
     )
@@ -97,6 +103,28 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         bank_txn_id = bank_txn["bank_txn_id"]
         amount_minor = bank_txn["amount_minor"]
 
+        # Phase 0 (INTAKE_VALIDATION) - runs before customer identification
+        # even starts; a reject here (dup-utr) means Phase 1a/1b never see
+        # this row at all.
+        intake_result = None
+        for rule in intake_rules:
+            rule_fn = IDENTIFICATION_RULES.get(rule["kind"])
+            if rule_fn is None:
+                continue  # an unregistered kind - config error, not a crash
+            intake_result = await rule_fn(bank_txn, ctx, rule["config"])
+            if intake_result.matched:
+                break
+
+        if intake_result is not None and intake_result.reject:
+            await dao.insert_exception(
+                run_id=run_id, exception_type="DUPLICATE", bank_txn_id=bank_txn_id,
+                customer_id=None, reason_code=intake_result.reason, detail=None,
+            )
+            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
+            exception_minor += amount_minor
+            counts["duplicate"] += 1
+            continue
+
         fired_rule = None
         result = None
         for rule in identification_rules:
@@ -107,16 +135,6 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             if result.matched:
                 fired_rule = rule
                 break
-
-        if result is not None and result.reject:
-            await dao.insert_exception(
-                run_id=run_id, exception_type="DUPLICATE", bank_txn_id=bank_txn_id,
-                customer_id=None, reason_code=result.reason, detail=None,
-            )
-            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
-            exception_minor += amount_minor
-            counts["duplicate"] += 1
-            continue
 
         if result is not None and result.customer_id:
             payment = await dao.insert_payment(

@@ -201,7 +201,7 @@ UNIQUE `(entity_id, account_code)`. Migrations: `0008`.
 | `customer_id` | `uuid` PK | Primary key |
 | `entity_id` | `uuid` FK → `entities` | Owning entity |
 | `customer_code` | `text` NOT NULL | Case-insensitively unique per entity — see `uniq_customers_code_ci` below |
-| `company_name` | `text` NOT NULL | Legal/trading name; matched by the fuzzy-name-match and token-pool customer-identification rules and full-text indexed via `idx_customers_name` |
+| `company_name` | `text` NOT NULL | Legal/trading name; matched by the fuzzy-name and narration-tokens customer-identification rules and full-text indexed via `idx_customers_name` |
 | `pan` / `gstin` | `text` | Indian tax identifiers, used by customer-identification matching rules |
 | `vpa_handle` | `text` | UPI virtual payment address |
 | `payment_terms` | `text` | Free-text payment terms, e.g. "Net 30" — descriptive only |
@@ -269,7 +269,7 @@ Migrations: `0009`, `0019`.
 | `invoice_id` | `uuid` PK | Primary key |
 | `entity_id` | `uuid` FK → `entities` | Owning entity |
 | `customer_id` | `uuid` FK → `customers` | Customer being invoiced |
-| `invoice_number` | `text` NOT NULL | As printed on the invoice; unique per entity, matched against bank narration by the invoice-number-match rule |
+| `invoice_number` | `text` NOT NULL | As printed on the invoice; unique per entity, matched against bank narration by the exact-invoice-num rule |
 | `issue_date` / `due_date` | `date` NOT NULL | Invoice date and payment due date; `due_date` drives `idx_invoices_open` and the period-cutoff-guard allocation rule |
 | `currency` | `char(3)` FK → `currencies` | Invoice's original currency; converted to entity home currency in `total_home_minor` |
 | `total_amount_minor` | `bigint` NOT NULL | Original invoice currency |
@@ -433,7 +433,7 @@ Index: `idx_runs_status` on `(status, period_end)`. This is the "one snapshot of
 | `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | Transaction amount in the statement's own currency and converted to entity home currency |
 | `fx_rate` | `numeric(18,8)` | Rate used for the `amount_minor` → `amount_home_minor` conversion |
 | `dr_cr` | `text` NOT NULL | `DEBIT` or `CREDIT` — a customer remittance is always a `CREDIT` row |
-| `explicit_fee_minor` | `bigint` NOT NULL DEFAULT `0` | Fee the bank already deducted before crediting this row, as reported by the source — decoupled from the settlement amount by the fee-tolerance-match allocation rule |
+| `explicit_fee_minor` | `bigint` NOT NULL DEFAULT `0` | Fee the bank already deducted before crediting this row, as reported by the source — decoupled from the settlement amount by the bank-fee allocation rule |
 | `is_bank_charge` | `boolean` NOT NULL DEFAULT `false` | A pure bank fee, not a customer remittance — bypasses customer identification entirely |
 | `contra_reference` | `text` | Cross-reference to a related/offsetting bank line, when the source supplies one |
 | `recon_status` | `text` NOT NULL DEFAULT `'PENDING'` | e.g. `PENDING` / `MATCHED` — drives `idx_bank_status` and `uniq_reconciled_ref` |
