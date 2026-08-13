@@ -22,6 +22,9 @@ class ReconciliationErrors:
     RUN_NOT_FOUND = "Reconciliation run not found"
     INVALID_RECON_TYPE = "Invalid recon_type"
     RUN_NOT_RETRYABLE = "Only a FAILED run can be retried"
+    EXCEPTION_NOT_FOUND = "Reconciliation exception not found"
+    INVALID_EXCEPTION_STATUS = "Invalid exception status"
+    INVALID_RESOLUTION_OUTCOME = "Invalid resolution_outcome"
 
 
 # -- reconciliation_definitions ----------------------------------------------
@@ -89,6 +92,21 @@ GL_ROLE_CODES = (
     GL_ROLE_AR_CONTROL, GL_ROLE_CASH_CONTROL, GL_ROLE_BANK_CHARGES, GL_ROLE_TDS_RECEIVABLE,
     GL_ROLE_WRITE_OFF, GL_ROLE_ON_ACCOUNT_ADVANCE, GL_ROLE_SUSPENSE, GL_ROLE_FX_GAIN_LOSS,
 )
+
+# Which GL role absorbs the gap when an allocation rule closes an invoice for
+# less cash than its full balance (app/reconciliation/rules/__init__.py's
+# InvoiceAllocation.close_full=True) - e.g. tds-net-match's withheld TDS, or
+# fee-tolerance-match's decoupled bank fee. Rules not listed here never
+# produce a gap (exact-balance-match, subset-sum-fifo, invoice-number-match,
+# truncated-suffix-match, partial-pay all either match exactly or leave the
+# invoice genuinely still open - no gap to explain). Used by both
+# engine.py (to tag each allocation with its gap's destination while it's
+# still in memory) and gl_posting.py (M3, to actually post it).
+GAP_ROLE_BY_RULE_KIND: dict[str, str] = {
+    "tds-net-match": GL_ROLE_TDS_RECEIVABLE,
+    "fee-tolerance-match": GL_ROLE_BANK_CHARGES,
+    "dust-writeoff": GL_ROLE_WRITE_OFF,
+}
 
 # Baseline chart-of-accounts entry created per role when seeding a new entity
 # (account_code, account_name, account_type, normal_balance) - see

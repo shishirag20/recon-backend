@@ -5,8 +5,8 @@ Phase 2 (allocation), inside the same DB transaction the worker already
 wraps both in. `run_phase_1` and `run_phase_2` are also exported separately
 for focused testing.
 
-GL posting and sign-off are M3/M4 - see the milestone map in
-app/reconciliation/router.py.
+GL posting (M3) runs after Phase 2, in the same transaction; sign-off is
+M4 - see the milestone map in app/reconciliation/router.py.
 """
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ from collections import Counter, defaultdict
 
 import asyncpg
 
-from app.reconciliation.constants import PHASE_ALLOCATION, PHASE_CANDIDATE_POOL, PHASE_CUSTOMER_LOCK
+from app.reconciliation import gl_posting
+from app.reconciliation.constants import GAP_ROLE_BY_RULE_KIND, PHASE_ALLOCATION, PHASE_CANDIDATE_POOL, PHASE_CUSTOMER_LOCK
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext
 from app.reconciliation.rules.allocation import ALLOCATION_RULES, GUARDRAIL_KINDS
@@ -23,18 +24,27 @@ from app.reconciliation.rules.pooling import POOLING_RULES
 
 
 async def run(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: str, run_context: dict) -> dict:
-    """Runs Phase 1 then Phase 2 for this run and returns the combined
-    counters `reconciliation_worker` writes onto `reconciliation_runs`."""
+    """Runs Phase 1, Phase 2, then GL posting (M3) for this run and returns
+    the combined counters `reconciliation_worker` writes onto
+    `reconciliation_runs`. A `GL_VARIANCE` raised by the control proof is
+    reflected in `exception_count` but does not fail the run - it's a
+    finding to investigate, not a reason to leave the run unposted."""
     phase1 = await run_phase_1(conn, dao, run_id, run_context)
     phase2 = await run_phase_2(conn, dao, run_id, run_context, phase1["outcomes"])
+    gl = await gl_posting.post_run(conn, dao, run_id, run_context, phase1["suspense_records"], phase2["payment_ledger_records"])
     return {
         "volume": phase1["volume"],
         "matched_count": phase2["matched_count"],
-        "exception_count": phase1["duplicate_count"] + phase1["suspense_count"] + phase2["exception_count"],
+        "exception_count": (
+            phase1["duplicate_count"] + phase1["suspense_count"] + phase2["exception_count"]
+            + (1 if gl["gl_variance"] else 0)
+        ),
         "matched_value_minor": phase2["matched_value_minor"],
         "exception_value_minor": phase1["exception_value_minor"] + phase2["exception_value_minor"],
         "unapplied_minor": phase2["unapplied_minor"],
         "pooled_count": phase2["unresolved_pool_count"],  # not persisted on reconciliation_runs - log line only
+        "journal_count": gl["journal_count"],  # not persisted either - log line only, same as pooled_count
+        "gl_variance": gl["gl_variance"],
     }
 
 
@@ -49,7 +59,8 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     rule runs and never gets a `payments` row - excluded from `outcomes`
     entirely, not just left unidentified. Suspense rows get a `payments` row
     (so the money is tracked) but aren't in `outcomes` either - Phase 2 has
-    nothing to do for a row with no customer and no candidates.
+    nothing to do for a row with no customer and no candidates. They're in
+    `suspense_records` instead, for `gl_posting.py` (M3) to post directly.
     """
     entity_id = str(run_context["entity_id"])
     definition_id = str(run_context["definition_id"])
@@ -78,6 +89,7 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     )
 
     outcomes: list[dict] = []
+    suspense_records: list[dict] = []
     exception_minor = 0
     counts = Counter()
 
@@ -135,7 +147,7 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
 
         # Neither phase found anything at all - Suspense. Still gets a
         # payments row (money tracked), but nothing for Phase 2 to do.
-        await dao.insert_payment(
+        payment = await dao.insert_payment(
             bank_txn_id=bank_txn_id, customer_id=None, total_received_minor=amount_minor,
             locked_by_rule_id=None, candidate_pool=None,
         )
@@ -146,6 +158,10 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
         exception_minor += amount_minor
         counts["suspense"] += 1
+        suspense_records.append({
+            "payment_id": payment["payment_id"], "bank_txn_id": bank_txn_id,
+            "currency": bank_txn["currency"], "unapplied_minor": amount_minor,
+        })
 
     return {
         "volume": len(bank_inflows),
@@ -153,6 +169,8 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         "duplicate_count": counts["duplicate"],
         "suspense_count": counts["suspense"],
         "exception_value_minor": exception_minor,
+        # M3: gl_posting.py posts these straight to SUSPENSE (no customer_id at all).
+        "suspense_records": suspense_records,
     }
 
 
@@ -165,6 +183,13 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     candidate and only commits if exactly one produces an unambiguous match
     (2+ -> Double-Collision, 0 -> left unresolved). Finishes with a sweep for
     invoices that received no allocation at all this run (No-Payment).
+
+    Returns `payment_ledger_records` (one entry per payment processed here,
+    every outcome type - committed, ambiguous, double-collision, unresolved)
+    for `gl_posting.py` (M3) to post from directly, same "pass the outcome
+    forward in memory" pattern `run_phase_1` uses to hand off to this
+    function - no run_id column exists on payments/invoice_allocations to
+    re-query this by later.
     """
     entity_id = str(run_context["entity_id"])
     definition_id = str(run_context["definition_id"])
@@ -216,6 +241,11 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     counts = Counter()
     touched_invoice_ids: set[str] = set()
     flagged_invoice_ids: set[str] = set()  # already covered by their own exception - skip in the No-Payment sweep
+    # One entry per payment processed this phase, regardless of outcome -
+    # gl_posting.py (M3) needs a uniform view to post every payment's cash
+    # correctly, not just the cleanly-committed ones. See its `allocations`/
+    # `unapplied_minor` fields' meaning per branch below.
+    payment_ledger_records: list[dict] = []
 
     for outcome in outcomes:
         payment_id = outcome["payment_id"]
@@ -260,6 +290,12 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             exception_minor += amount
             unapplied_minor += amount
             counts["double_collision"] += 1
+            # customer_id=None: gl_posting.py can't credit any one customer's
+            # on-account - this goes to SUSPENSE, not ON_ACCOUNT_ADVANCE.
+            payment_ledger_records.append({
+                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": None,
+                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+            })
             continue
 
         if per_candidate_results:
@@ -275,6 +311,13 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             exception_minor += amount
             unapplied_minor += amount
             counts["ambiguous"] += 1
+            # customer_id IS known here (the tie is over which invoice, not
+            # which customer) - gl_posting.py credits this customer's
+            # ON_ACCOUNT_ADVANCE, not SUSPENSE.
+            payment_ledger_records.append({
+                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": candidate_id,
+                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+            })
             continue
 
         if resolved_customer_id is None:
@@ -288,6 +331,14 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             exception_minor += amount
             unapplied_minor += amount
             counts["unresolved"] += 1
+            # outcome["customer_id"] may itself be None (an unresolved pool)
+            # or set (a locked customer with no open invoice at all) -
+            # gl_posting.py's SUSPENSE-vs-ON_ACCOUNT_ADVANCE choice follows
+            # the same "is there a known customer_id" rule as every branch.
+            payment_ledger_records.append({
+                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": outcome["customer_id"],
+                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+            })
             continue
 
         # Committed: retroactively lock a resolved pool, write the match, apply allocations.
@@ -303,6 +354,8 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
 
         cash_applied = 0
         still_open: list[str] = []
+        posted_allocations: list[dict] = []  # for gl_posting.py (M3) - see payment_ledger_records below
+        gap_role = GAP_ROLE_BY_RULE_KIND.get(resolved_rule["kind"]) if resolved_rule else None
         for alloc in resolved_outcome.allocations:
             if alloc.cash_minor <= 0:
                 continue  # invoice_allocations.allocated_minor has CHECK(> 0) - nothing real moved, nothing to record
@@ -313,6 +366,11 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
                 match_group_id=match_group["match_group_id"], invoice_id=alloc.invoice_id,
                 payment_id=payment_id, bank_txn_id=bank_txn_id, allocated_minor=alloc.cash_minor,
             )
+            gap_minor = close_amount - alloc.cash_minor  # >0 only for close_full rules that absorbed a shortfall (TDS/fee/write-off)
+            posted_allocations.append({
+                "invoice_id": alloc.invoice_id, "cash_minor": alloc.cash_minor,
+                "gap_minor": gap_minor, "gap_role": gap_role if gap_minor > 0 else None,
+            })
             invoice["balance_due_minor"] = max(0, invoice["balance_due_minor"] - close_amount)
             touched_invoice_ids.add(alloc.invoice_id)
             cash_applied += alloc.cash_minor
@@ -347,6 +405,10 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             counts["matched"] += 1
 
         unapplied_minor += max(0, leftover)
+        payment_ledger_records.append({
+            "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": resolved_customer_id,
+            "currency": bank_txn["currency"], "unapplied_minor": max(0, leftover), "allocations": posted_allocations,
+        })
 
     # No-Payment sweep: open invoices nothing in this run touched or flagged at all.
     no_payment_count = 0
@@ -367,4 +429,7 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         "exception_value_minor": exception_minor,
         "unapplied_minor": unapplied_minor,
         "unresolved_pool_count": counts["ambiguous"] + counts["double_collision"] + counts["unresolved"],
+        # M3: gl_posting.py's single source of truth for what to post - one
+        # entry per payment processed this phase, every outcome type included.
+        "payment_ledger_records": payment_ledger_records,
     }

@@ -1,9 +1,9 @@
 """Pydantic request/response models for the reconciliation module.
 
-Scoped to what M0 actually implements - definition/rule CRUD and run
-enqueue/status. Endpoints that read engine output (matches, exceptions,
-sign-off) land in M1-M4 alongside the code that produces that data; see
-app/reconciliation/router.py's module docstring for the milestone map.
+M0: definition/rule CRUD and run enqueue/status. M3 adds: reading engine
+output (`MatchGroupOut`, `ExceptionOut`) and resolving an exception
+(`ExceptionUpdate`). Sign-off lands in M4; see app/reconciliation/router.py's
+module docstring for the milestone map.
 """
 from __future__ import annotations
 
@@ -84,3 +84,58 @@ class RunOut(BaseModel):
     started_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# -- match_groups / invoice_allocations (M3, read-only) --------------------------
+class AllocationOut(BaseModel):
+    allocation_id: UUID
+    invoice_id: UUID
+    payment_id: UUID
+    bank_txn_id: UUID | None
+    allocated_minor: int
+
+
+class MatchGroupOut(BaseModel):
+    match_group_id: UUID
+    run_id: UUID
+    match_type: str = Field(description="EXACT | TOLERANCE | PARTIAL | SUBSET_SUM | MANY_TO_ONE | ONE_TO_MANY | MANUAL")
+    rule_id: UUID | None
+    confidence: int | None
+    status: str = Field(description="AUTO_MATCHED | SUGGESTED | CONFIRMED | REJECTED")
+    reason: str | None
+    created_at: datetime
+    allocations: list[AllocationOut] = Field(description="Every invoice this match group settled money against.")
+
+    model_config = {"from_attributes": True}
+
+
+# -- reconciliation_exceptions (M3) -----------------------------------------------
+class ExceptionOut(BaseModel):
+    exception_id: UUID
+    run_id: UUID
+    exception_no: str | None
+    exception_type: str = Field(
+        description="SHORT_PAY | OVERPAYMENT | UNAPPLIED_CASH | TIMING_DIFFERENCE | GL_VARIANCE | DUPLICATE | "
+        "MULTIPLE_INVOICE_MATCH | DOUBLE_COLLISION | SUSPENSE | BANK_CHARGE | GATEWAY_VARIANCE | NO_PAYMENT"
+    )
+    bank_txn_id: UUID | None
+    invoice_id: UUID | None
+    customer_id: UUID | None
+    discrepancy_minor: int | None
+    reason_code: str | None
+    status: str = Field(description="OPEN | INVESTIGATING | RESOLVED | AUTO_RESOLVED | DEFERRED | WRITTEN_OFF | ADJUSTED | CARRIED_FORWARD")
+    resolution_outcome: str | None = Field(description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
+    resolver_id: UUID | None
+    resolution_notes: str | None
+    resolved_at: datetime | None
+    created_at: datetime
+    detail: dict | None = Field(description="Candidate lists for MULTIPLE_INVOICE_MATCH/DOUBLE_COLLISION; variance breakdown for GL_VARIANCE.")
+    match_group_id: UUID | None
+
+    model_config = {"from_attributes": True}
+
+
+class ExceptionUpdate(BaseModel):
+    status: str | None = Field(default=None, description="Moving away from OPEN/INVESTIGATING stamps resolved_at automatically.")
+    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
+    resolution_notes: str | None = None

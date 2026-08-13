@@ -11,6 +11,8 @@ from fastapi import HTTPException, status
 
 from app.reconciliation.constants import (
     DEFAULT_AR_RULE_CATALOG,
+    EXCEPTION_RESOLUTION_OUTCOMES,
+    EXCEPTION_STATUSES,
     ReconciliationErrors,
     RECON_TYPES,
 )
@@ -91,3 +93,30 @@ class ReconciliationService:
         if row is None:
             raise HTTPException(status.HTTP_409_CONFLICT, ReconciliationErrors.RUN_NOT_RETRYABLE)
         return row
+
+    # -- match_groups / reconciliation_exceptions (M3, run results) ------------------
+    async def list_matches(self, run_id: str):
+        await self.get_run(run_id)  # 404s if missing
+        return await self.dao.list_match_groups_for_run(run_id)
+
+    async def list_exceptions(self, run_id: str, *, status_: str | None):
+        await self.get_run(run_id)  # 404s if missing
+        if status_ is not None and status_ not in EXCEPTION_STATUSES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_EXCEPTION_STATUS)
+        return await self.dao.list_exceptions_for_run(run_id, status_)
+
+    async def update_exception(
+        self, exception_id: str, *, status_: str | None, resolution_outcome: str | None, resolution_notes: str | None
+    ):
+        existing = await self.dao.get_exception(exception_id)
+        if existing is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.EXCEPTION_NOT_FOUND)
+        if status_ is not None and status_ not in EXCEPTION_STATUSES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_EXCEPTION_STATUS)
+        if resolution_outcome is not None and resolution_outcome not in EXCEPTION_RESOLUTION_OUTCOMES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RESOLUTION_OUTCOME)
+        # resolver_id is None until real auth provides the caller's user id
+        return await self.dao.update_exception(
+            exception_id, status=status_, resolution_outcome=resolution_outcome,
+            resolution_notes=resolution_notes, resolver_id=None,
+        )
