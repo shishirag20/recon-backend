@@ -32,7 +32,9 @@ from app.reconciliation.schema import (
     DefinitionOut,
     ExceptionOut,
     ExceptionUpdate,
+    MatcherCatalogResponse,
     MatchGroupOut,
+    RuleCreate,
     RuleOut,
     RuleUpdate,
     RunCreate,
@@ -73,6 +75,21 @@ async def list_definitions(entity_id: UUID | None = None, service: Reconciliatio
     return await service.list_definitions(entity_id=str(entity_id) if entity_id else None)
 
 
+# Registered before /reconciliations/{definition_id} deliberately - a static
+# path must come first, or Starlette tries to parse "matchers" as that
+# route's UUID definition_id and 422s before this handler ever runs.
+@router.get(
+    "/reconciliations/matchers",
+    response_model=MatcherCatalogResponse,
+    summary="List available matchers/sources/bank_fields for kind='field-match' rules",
+)
+async def list_matchers(service: ReconciliationService = Depends(get_service)):
+    """Static reference data - not scoped to any definition. The frontend's
+    source of truth for the MATCHER/source/field pickers when creating a
+    `POST /reconciliations/{id}/rules` request with `kind="field-match"`."""
+    return service.list_matcher_catalog()
+
+
 @router.get("/reconciliations/{definition_id}", response_model=DefinitionOut, summary="Get a reconciliation definition")
 async def get_definition(definition_id: UUID, service: ReconciliationService = Depends(get_service)):
     return await service.get_definition(str(definition_id))
@@ -101,6 +118,26 @@ async def update_rule(
     """`config` is a full replacement, not a merge - submit the rule's
     complete config, not just the keys you're changing."""
     return await service.update_rule(str(definition_id), str(rule_id), enabled=payload.enabled, config=payload.config)
+
+
+@router.post(
+    "/reconciliations/{definition_id}/rules",
+    response_model=RuleOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a new rule to a definition's catalog",
+)
+async def create_rule(definition_id: UUID, payload: RuleCreate, service: ReconciliationService = Depends(get_service)):
+    """`kind="field-match"` composes a new CUSTOMER_LOCK/CANDIDATE_POOL rule
+    from an existing matcher (`config.matcher`) and field pair
+    (`config.bank_field`/`config.source`/`config.source_field`) - no code
+    change needed. Every other `kind` must already be registered for
+    `phase` (see `GET .../rules` for what's seeded); an unregistered kind
+    404s here rather than silently being skipped at run time. Rules are
+    never deleted, only disabled via `PATCH .../rules/{rule_id}`."""
+    return await service.create_rule(
+        str(definition_id), phase=payload.phase, kind=payload.kind, name=payload.name,
+        priority=payload.priority, confidence=payload.confidence, config=payload.config,
+    )
 
 
 # -- reconciliation_runs --------------------------------------------------------

@@ -94,6 +94,25 @@ class ReconciliationDAO:
             out.append(_row(row))
         return out
 
+    async def insert_rule(
+        self, definition_id: str, *, phase: str, kind: str, name: str, priority: int,
+        confidence: int | None, config: dict,
+    ) -> dict:
+        """Adds one rule to an existing definition's catalog, post-creation
+        - unlike insert_rules_bulk, which only ever runs once, at
+        create_definition time. `(definition_id, phase, priority)` is
+        UNIQUE at the DB level; a collision raises
+        asyncpg.exceptions.UniqueViolationError, which the caller (service.py)
+        turns into a 409."""
+        row = await self.conn.fetchrow(
+            "INSERT INTO reconciliation_rules "
+            "(rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true, $6, $7::jsonb) "
+            "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
+            definition_id, phase, kind, name, priority, confidence, config,
+        )
+        return _row(row)
+
     async def list_rules(self, definition_id: str) -> list[dict]:
         rows = await self.conn.fetch(
             "SELECT rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config "

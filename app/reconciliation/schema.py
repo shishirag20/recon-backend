@@ -52,6 +52,41 @@ class RuleUpdate(BaseModel):
     config: dict | None = Field(default=None, description="Full replacement of the rule's config, not a merge.")
 
 
+class MatcherInfo(BaseModel):
+    kind: str
+    label: str
+    description: str
+    config_keys: list[str] = Field(description="Optional config keys this matcher reads, beyond bank_field/source/source_field.")
+
+
+class SourceInfo(BaseModel):
+    source: str
+    fields: list[str] = Field(description="Valid config.source_field values for this source - the only columns find_matches can actually read.")
+
+
+class MatcherCatalogResponse(BaseModel):
+    matchers: list[MatcherInfo]
+    sources: list[SourceInfo]
+    bank_fields: list[str] = Field(description="Valid config.bank_field values - direct bank_statements columns, plus extract:vpa/gstin/pan sentinels.")
+
+
+class RuleCreate(BaseModel):
+    phase: str = Field(description="One of RECON_PHASES, e.g. 'CUSTOMER_LOCK'.")
+    kind: str = Field(description="Must already be registered for `phase` - GET .../rules to see what's seeded. 'field-match' composes a new identification/pooling rule from an existing matcher, no code change needed - see the config fields below.")
+    name: str = Field(min_length=1, max_length=200)
+    priority: int = Field(description="Evaluation order within phase, ascending. Must be unused for this (definition_id, phase) - a collision 409s.")
+    confidence: int | None = Field(default=None, ge=0, le=100)
+    config: dict = Field(
+        default_factory=dict,
+        description="For kind='field-match': {matcher, bank_field, source, source_field, ...}. "
+        "matcher: one of 'exact'|'substring'|'numeric_suffix'|'token_overlap'|'trigram_similarity'. "
+        "bank_field: a bank_statements column name, or 'extract:vpa'|'extract:gstin'|'extract:pan' to "
+        "regex-extract it from narration first. source: one of 'customers'|'customer_bank_accounts'|"
+        "'customer_reference_codes'|'expected_remittances'. source_field: the column on `source` to compare "
+        "against. Every other kind's config shape matches its existing seeded rows - see docs/reconciliation.md §6.",
+    )
+
+
 # -- reconciliation_runs --------------------------------------------------------
 class RunCreate(BaseModel):
     period_start: date | None = None

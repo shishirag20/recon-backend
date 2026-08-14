@@ -25,6 +25,13 @@ class ReconciliationErrors:
     EXCEPTION_NOT_FOUND = "Reconciliation exception not found"
     INVALID_EXCEPTION_STATUS = "Invalid exception status"
     INVALID_RESOLUTION_OUTCOME = "Invalid resolution_outcome"
+    INVALID_PHASE = "Invalid phase"
+    INVALID_RULE_KIND = "kind is not a registered rule for this phase"
+    INVALID_FIELD_MATCH_CONFIG = (
+        "kind='field-match' requires config.matcher (one of MATCHER_KINDS), config.bank_field, "
+        "config.source (one of SOURCE_KINDS), and config.source_field"
+    )
+    DUPLICATE_PRIORITY = "A rule already exists at this phase+priority"
 
 
 # -- reconciliation_definitions ----------------------------------------------

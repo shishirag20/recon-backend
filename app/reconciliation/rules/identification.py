@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Awaitable, Callable
 
 from app.reconciliation import extract, fuzzy
+from app.reconciliation.rules import matchers
 from app.reconciliation.rules import IdentificationResult, RuleContext
 
 RuleFn = Callable[[dict, RuleContext, dict], Awaitable[IdentificationResult]]
@@ -118,6 +119,22 @@ async def fuzzy_name_match(bank_txn: dict, ctx: RuleContext, config: dict) -> Id
     return IdentificationResult()
 
 
+async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+    """Config-driven Phase 0/1a rule (`kind="field-match"`) - see
+    matchers.find_matches for what `config` needs. Stops at the first
+    match, same "first-match-wins, no ambiguity check" behavior the
+    existing simple rules (utr_match, vpa_match, ...) already have - it's
+    not a new policy, just generalized."""
+    found = await matchers.find_matches(bank_txn, ctx, config)
+    if not found:
+        return IdentificationResult()
+    match = found[0]
+    return IdentificationResult(
+        customer_id=str(match["customer_id"]),
+        reason=f"field-match ({config.get('matcher')}): {config.get('bank_field')} ~ {config.get('source')}.{config.get('source_field')}",
+    )
+
+
 IDENTIFICATION_RULES: dict[str, RuleFn] = {
     "dup-utr": dup_utr_check,
     "expected-utr": utr_match,
@@ -126,4 +143,5 @@ IDENTIFICATION_RULES: dict[str, RuleFn] = {
     "customer-code": reference_code_match,
     "gstin-pan": gstin_pan_match,
     "fuzzy-name": fuzzy_name_match,
+    "field-match": generic_field_match,
 }
