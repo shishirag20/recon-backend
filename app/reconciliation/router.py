@@ -29,6 +29,7 @@ from fastapi import APIRouter, Depends, status
 from app.reconciliation.constants import ROUTER_TAGS
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.schema import (
+    AlgorithmCatalogResponse,
     DefinitionCreate,
     DefinitionOut,
     ExceptionOut,
@@ -104,6 +105,21 @@ async def list_matchers(service: ReconciliationService = Depends(get_service)):
     source of truth for the MATCHER/source/field pickers when creating a
     `POST /reconciliations/{id}/rules` request with `kind="field-match"`."""
     return service.list_matcher_catalog()
+
+
+# Same static-route-before-dynamic-route reasoning as /reconciliations/matchers.
+@router.get(
+    "/reconciliations/algorithms",
+    response_model=AlgorithmCatalogResponse,
+    summary="List every comparison/extraction algorithm in the reconciliation module",
+)
+async def list_algorithms(service: ReconciliationService = Depends(get_service)):
+    """The full catalog in one place: rules.matchers.MATCHER_CATALOG
+    (`category="matcher"`, `wired=true` - usable today via
+    `kind="field-match"`) plus rules.generic_functions.GENERIC_FUNCTION_CATALOG
+    (`category="generic_function"`, `wired=false` - not called by any rule
+    or dispatcher yet). Static reference data, not scoped to any definition."""
+    return service.list_algorithm_catalog()
 
 
 @router.get(
@@ -226,3 +242,31 @@ async def retry_run(
     """Only valid when `status=FAILED` (409 otherwise) - mirrors
     `POST /ingestion-jobs/{job_id}/retry`."""
     return await service.retry_run(str(run_id))
+
+
+# -- match_groups / reconciliation_exceptions (M3, run results) --------------------
+@router.get("/runs/{run_id}/matches", response_model=list[MatchGroupOut], summary="List a run's match groups")
+async def list_matches(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+    """Every match group Phase 2 committed for this run, each with its
+    nested `allocations` - the invoices it settled money against."""
+    return await service.list_matches(str(run_id))
+
+
+@router.get("/runs/{run_id}/exceptions", response_model=list[ExceptionOut], summary="List a run's exceptions")
+async def list_exceptions(run_id: UUID, status_filter: str | None = None, service: ReconciliationService = Depends(get_service)):
+    """Optionally filter by `status_filter` (one of `EXCEPTION_STATUSES`,
+    e.g. `OPEN`). Includes GL_VARIANCE exceptions raised by the M3 control
+    proof, not just Phase 1/2 exceptions."""
+    return await service.list_exceptions(str(run_id), status_=status_filter)
+
+
+@router.patch("/exceptions/{exception_id}", response_model=ExceptionOut, summary="Resolve or annotate an exception")
+async def update_exception(exception_id: UUID, payload: ExceptionUpdate, service: ReconciliationService = Depends(get_service)):
+    """`resolved_at` is stamped automatically the moment `status` moves away
+    from `OPEN`/`INVESTIGATING` - not settable directly. TODO(recon.exception.resolve):
+    gate behind that permission once app/auth/ is real; `resolver_id` is
+    `None` until then."""
+    return await service.update_exception(
+        str(exception_id), status_=payload.status, resolution_outcome=payload.resolution_outcome,
+        resolution_notes=payload.resolution_notes,
+    )

@@ -29,7 +29,7 @@ from app.reconciliation.constants import (
 from app.reconciliation.dao import ReconciliationDAO, new_run_no
 from app.reconciliation.rules.allocation import ALLOCATION_RULES
 from app.reconciliation.rules.identification import IDENTIFICATION_RULES
-from app.reconciliation.rules import matchers
+from app.reconciliation.rules import generic_functions, matchers
 from app.reconciliation.rules.matchers import MATCHER_KINDS, SOURCE_KINDS
 from app.reconciliation.rules.pooling import POOLING_RULES
 
@@ -143,6 +143,27 @@ class ReconciliationService:
             "bank_fields": matchers.BANK_FIELDS,
         }
 
+    def list_algorithm_catalog(self) -> dict:
+        """Every comparison/extraction algorithm in the reconciliation
+        module, in one place - rules.matchers.MATCHER_CATALOG (wired, usable
+        today via kind='field-match') plus
+        rules.generic_functions.GENERIC_FUNCTION_CATALOG (standalone, not
+        called by any rule/dispatcher yet)."""
+        algorithms = [
+            {
+                "name": entry["kind"], "category": "matcher", "label": entry["label"],
+                "description": entry["description"], "action_verb": None, "wired": True,
+            }
+            for entry in matchers.MATCHER_CATALOG
+        ] + [
+            {
+                "name": entry["technical_name"], "category": "generic_function", "label": entry["ui_display_name"],
+                "description": entry["description"], "action_verb": entry["ui_action_verb"], "wired": False,
+            }
+            for entry in generic_functions.GENERIC_FUNCTION_CATALOG
+        ]
+        return {"algorithms": algorithms}
+
     async def create_rule(
         self, definition_id: str, *, phase: str, kind: str, name: str, priority: int,
         confidence: int | None, config: dict,
@@ -199,3 +220,30 @@ class ReconciliationService:
                 status.HTTP_409_CONFLICT, ReconciliationErrors.RUN_NOT_RETRYABLE
             )
         return row
+
+    # -- match_groups / reconciliation_exceptions (M3, run results) ------------------
+    async def list_matches(self, run_id: str):
+        await self.get_run(run_id)  # 404s if missing
+        return await self.dao.list_match_groups_for_run(run_id)
+
+    async def list_exceptions(self, run_id: str, *, status_: str | None):
+        await self.get_run(run_id)  # 404s if missing
+        if status_ is not None and status_ not in EXCEPTION_STATUSES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_EXCEPTION_STATUS)
+        return await self.dao.list_exceptions_for_run(run_id, status_)
+
+    async def update_exception(
+        self, exception_id: str, *, status_: str | None, resolution_outcome: str | None, resolution_notes: str | None
+    ):
+        existing = await self.dao.get_exception(exception_id)
+        if existing is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.EXCEPTION_NOT_FOUND)
+        if status_ is not None and status_ not in EXCEPTION_STATUSES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_EXCEPTION_STATUS)
+        if resolution_outcome is not None and resolution_outcome not in EXCEPTION_RESOLUTION_OUTCOMES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RESOLUTION_OUTCOME)
+        # resolver_id is None until real auth provides the caller's user id
+        return await self.dao.update_exception(
+            exception_id, status=status_, resolution_outcome=resolution_outcome,
+            resolution_notes=resolution_notes, resolver_id=None,
+        )

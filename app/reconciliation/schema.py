@@ -70,6 +70,19 @@ class MatcherCatalogResponse(BaseModel):
     bank_fields: list[str] = Field(description="Valid config.bank_field values - direct bank_statements columns, plus extract:vpa/gstin/pan sentinels.")
 
 
+class AlgorithmInfo(BaseModel):
+    name: str = Field(description="Technical/callable name - a MATCHER_REGISTRY key for category='matcher', a function name in generic_functions.py for category='generic_function'.")
+    category: str = Field(description="'matcher' (usable today via kind='field-match') or 'generic_function' (standalone, not wired into any rule yet).")
+    label: str
+    description: str
+    action_verb: str | None = Field(default=None, description="UI action verb, only set for generic_function entries.")
+    wired: bool = Field(description="True if this algorithm is actually reachable from a real reconciliation run today.")
+
+
+class AlgorithmCatalogResponse(BaseModel):
+    algorithms: list[AlgorithmInfo]
+
+
 class RuleCreate(BaseModel):
     phase: str = Field(description="One of RECON_PHASES, e.g. 'CUSTOMER_LOCK'.")
     kind: str = Field(description="Must already be registered for `phase` - GET .../rules to see what's seeded. 'field-match' composes a new identification/pooling rule from an existing matcher, no code change needed - see the config fields below.")

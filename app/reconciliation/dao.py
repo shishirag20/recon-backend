@@ -205,6 +205,12 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
+    async def get_gl_account_roles_map(self, entity_id: str) -> dict[str, str]:
+        """`{role_code: gl_account_id}` for this entity - gl_posting.py never
+        hardcodes an account_code, it always resolves through this map."""
+        rows = await self.list_gl_account_roles(entity_id)
+        return {r["role_code"]: str(r["gl_account_id"]) for r in rows}
+
     # -- reconciliation_runs (queue) ------------------------------------------------
     _RUN_COLUMNS = (
         "run_id, definition_id, run_no, period_start, period_end, status, volume, matched_count, "
@@ -529,6 +535,128 @@ class ReconciliationDAO:
             customer_id,
             rule_id,
         )
+
+    # -- M3: gl_journal_entries/gl_journal_lines/gl_control_balances -----------------
+    async def insert_journal(
+        self, *, entity_id: str, run_id: str | None, posting_date, source_type: str, memo: str | None,
+        lines: list[dict],
+    ) -> str:
+        """Inserts one gl_journal_entries header plus every line in `lines`
+        (each `{gl_account_id, dr_cr, currency, amount_minor, amount_home_minor, business_partner_id}`)
+        in one transaction - a journal is never left with a header and no
+        lines, or vice versa. Caller is responsible for `lines` actually
+        balancing (sum(DEBIT) == sum(CREDIT)) - this does not check that."""
+        async with self.conn.transaction():
+            journal = await self.conn.fetchrow(
+                "INSERT INTO gl_journal_entries (journal_id, entity_id, run_id, posting_date, source_type, memo) "
+                "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) RETURNING journal_id",
+                entity_id, run_id, posting_date, source_type, memo,
+            )
+            journal_id = journal["journal_id"]
+            for i, line in enumerate(lines, start=1):
+                await self.conn.execute(
+                    "INSERT INTO gl_journal_lines "
+                    "(line_id, journal_id, line_number, gl_account_id, dr_cr, currency, amount_minor, amount_home_minor, business_partner_id) "
+                    "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $6, $7)",
+                    journal_id, i, line["gl_account_id"], line["dr_cr"], line["currency"],
+                    line["amount_minor"], line.get("business_partner_id"),
+                )
+        return str(journal_id)
+
+    async def link_allocation_journal(self, invoice_id: str, payment_id: str, journal_id: str) -> None:
+        """Back-fills invoice_allocations.gl_journal_id once the JE that
+        covers it has posted - lets a later query trace an allocation to its
+        journal entry without re-deriving it."""
+        await self.conn.execute(
+            "UPDATE invoice_allocations SET gl_journal_id = $3 WHERE invoice_id = $1 AND payment_id = $2",
+            invoice_id, payment_id, journal_id,
+        )
+
+    async def list_pending_bank_charges(self, entity_id: str) -> list[dict]:
+        """`is_bank_charge=true` rows Phase 1 excluded entirely - M1/M2 never
+        touch these; they get a direct-to-GL posting path instead of
+        customer identification."""
+        rows = await self.conn.fetch(
+            "SELECT bank_txn_id, transaction_date, narration, amount_minor, currency "
+            "FROM bank_statements WHERE entity_id = $1 AND is_bank_charge = true AND recon_status = 'PENDING'",
+            entity_id,
+        )
+        return _rows(rows)
+
+    async def sum_open_ar_balance(self, entity_id: str) -> int:
+        """Current sub-ledger AR position - every not-yet-PAID invoice's
+        balance, for the SL-vs-GL control proof. Not run-scoped: this is a
+        point-in-time snapshot of the whole sub-ledger, not just what this
+        run touched."""
+        row = await self.conn.fetchrow(
+            "SELECT COALESCE(SUM(balance_due_minor), 0)::bigint AS total FROM invoices WHERE entity_id = $1 AND status != 'PAID'",
+            entity_id,
+        )
+        return row["total"]
+
+    async def get_gl_control_balance(self, gl_account_id: str, period_date) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT balance_id, gl_account_id, period_date, control_balance_minor "
+            "FROM gl_control_balances WHERE gl_account_id = $1 AND period_date = $2",
+            gl_account_id, period_date,
+        )
+        return _row(row)
+
+    # -- M3: match/exception review ---------------------------------------------------
+    async def list_match_groups_for_run(self, run_id: str) -> list[dict]:
+        rows = await self.conn.fetch(
+            "SELECT m.match_group_id, m.run_id, m.match_type, m.rule_id, m.confidence, m.status, m.reason, m.created_at, "
+            "COALESCE(json_agg(json_build_object("
+            "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'payment_id', a.payment_id, "
+            "  'bank_txn_id', a.bank_txn_id, 'allocated_minor', a.allocated_minor"
+            ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
+            "FROM match_groups m LEFT JOIN invoice_allocations a ON a.match_group_id = m.match_group_id "
+            "WHERE m.run_id = $1 GROUP BY m.match_group_id ORDER BY m.created_at",
+            run_id,
+        )
+        return _rows(rows)
+
+    async def list_exceptions_for_run(self, run_id: str, status: str | None) -> list[dict]:
+        rows = await self.conn.fetch(
+            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
+            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
+            "resolved_at, created_at, detail, match_group_id "
+            "FROM reconciliation_exceptions WHERE run_id = $1 AND ($2::text IS NULL OR status = $2) "
+            "ORDER BY created_at",
+            run_id, status,
+        )
+        return _rows(rows)
+
+    async def get_exception(self, exception_id: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
+            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
+            "resolved_at, created_at, detail, match_group_id "
+            "FROM reconciliation_exceptions WHERE exception_id = $1",
+            exception_id,
+        )
+        return _row(row)
+
+    async def update_exception(
+        self, exception_id: str, *, status: str | None, resolution_outcome: str | None,
+        resolution_notes: str | None, resolver_id: str | None,
+    ) -> dict | None:
+        """`resolved_at` is stamped automatically the moment `status` moves
+        away from `OPEN`/`INVESTIGATING` - the caller doesn't set it directly."""
+        row = await self.conn.fetchrow(
+            "UPDATE reconciliation_exceptions SET "
+            "status = COALESCE($2, status), "
+            "resolution_outcome = COALESCE($3, resolution_outcome), "
+            "resolution_notes = COALESCE($4, resolution_notes), "
+            "resolver_id = COALESCE($5, resolver_id), "
+            "resolved_at = CASE WHEN $2 IS NOT NULL AND $2 NOT IN ('OPEN', 'INVESTIGATING') THEN now() ELSE resolved_at END "
+            "WHERE exception_id = $1 "
+            "RETURNING exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
+            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
+            "resolved_at, created_at, detail, match_group_id",
+            exception_id, status, resolution_outcome, resolution_notes, resolver_id,
+        )
+        return _row(row)
 
 
 def new_id() -> str:
