@@ -147,7 +147,8 @@ class MatchGroupOut(BaseModel):
     match_group_id: UUID
     run_id: UUID
     match_type: str = Field(description="EXACT | TOLERANCE | PARTIAL | SUBSET_SUM | MANY_TO_ONE | ONE_TO_MANY | MANUAL")
-    rule_id: UUID | None
+    rule_id: UUID | None = Field(description="The ALLOCATION-phase rule that committed this match group.")
+    locked_by_rule_id: UUID | None = Field(description="The CUSTOMER_LOCK-phase rule that identified the payment's customer.")
     confidence: int | None
     status: str = Field(description="AUTO_MATCHED | SUGGESTED | CONFIRMED | REJECTED")
     reason: str | None

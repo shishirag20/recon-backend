@@ -604,8 +604,19 @@ class ReconciliationDAO:
 
     # -- M3: match/exception review ---------------------------------------------------
     async def list_match_groups_for_run(self, run_id: str) -> list[dict]:
+        """`m.rule_id` is the Phase-2 (ALLOCATION) rule that committed this
+        match group. `locked_by_rule_id` is the separate Phase-1a
+        (CUSTOMER_LOCK) rule that identified the payment's customer in the
+        first place - pulled from `payments` via the group's first
+        allocation, since every allocation in one match group shares the
+        same payment. Both are surfaced together so the UI can show the
+        full "how did this get matched" story (identification + allocation),
+        not just the allocation half."""
         rows = await self.conn.fetch(
             "SELECT m.match_group_id, m.run_id, m.match_type, m.rule_id, m.confidence, m.status, m.reason, m.created_at, "
+            "(SELECT p.locked_by_rule_id FROM payments p "
+            "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
+            "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS locked_by_rule_id, "
             "COALESCE(json_agg(json_build_object("
             "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'payment_id', a.payment_id, "
             "  'bank_txn_id', a.bank_txn_id, 'allocated_minor', a.allocated_minor"
