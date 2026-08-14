@@ -18,6 +18,7 @@ and app/datahub/router.py's identical note). Reserved slugs, once
 `require_permission` exists: recon.run.prepare -> run/definition writes,
 recon.run.approve -> sign-off (M4), recon.exception.resolve -> PATCH /exceptions (M3).
 """
+
 from __future__ import annotations
 
 from uuid import UUID
@@ -46,7 +47,9 @@ from app.db.pool import get_connection
 router = APIRouter(tags=ROUTER_TAGS)
 
 
-def get_service(conn: asyncpg.Connection = Depends(get_connection)) -> ReconciliationService:
+def get_service(
+    conn: asyncpg.Connection = Depends(get_connection),
+) -> ReconciliationService:
     return ReconciliationService(ReconciliationDAO(conn))
 
 
@@ -57,7 +60,9 @@ def get_service(conn: asyncpg.Connection = Depends(get_connection)) -> Reconcili
     status_code=status.HTTP_201_CREATED,
     summary="Create a reconciliation definition (and seed its rule catalog)",
 )
-async def create_definition(payload: DefinitionCreate, service: ReconciliationService = Depends(get_service)):
+async def create_definition(
+    payload: DefinitionCreate, service: ReconciliationService = Depends(get_service)
+):
     """For `recon_type=AR` this also seeds the default AR rule catalog
     (`constants.DEFAULT_AR_RULE_CATALOG`) onto the new definition and the
     entity's `gl_account_roles` (idempotent - safe even if this entity already
@@ -65,14 +70,25 @@ async def create_definition(payload: DefinitionCreate, service: ReconciliationSe
     rule catalog or engine yet."""
     # owner_user_id is None until real auth provides the caller's user id
     return await service.create_definition(
-        entity_id=str(payload.entity_id), name=payload.name, recon_type=payload.recon_type,
-        cadence=payload.cadence, owner_user_id=None,
+        entity_id=str(payload.entity_id),
+        name=payload.name,
+        recon_type=payload.recon_type,
+        cadence=payload.cadence,
+        owner_user_id=None,
     )
 
 
-@router.get("/reconciliations", response_model=list[DefinitionOut], summary="List reconciliation definitions")
-async def list_definitions(entity_id: UUID | None = None, service: ReconciliationService = Depends(get_service)):
-    return await service.list_definitions(entity_id=str(entity_id) if entity_id else None)
+@router.get(
+    "/reconciliations",
+    response_model=list[DefinitionOut],
+    summary="List reconciliation definitions",
+)
+async def list_definitions(
+    entity_id: UUID | None = None, service: ReconciliationService = Depends(get_service)
+):
+    return await service.list_definitions(
+        entity_id=str(entity_id) if entity_id else None
+    )
 
 
 # Registered before /reconciliations/{definition_id} deliberately - a static
@@ -90,8 +106,14 @@ async def list_matchers(service: ReconciliationService = Depends(get_service)):
     return service.list_matcher_catalog()
 
 
-@router.get("/reconciliations/{definition_id}", response_model=DefinitionOut, summary="Get a reconciliation definition")
-async def get_definition(definition_id: UUID, service: ReconciliationService = Depends(get_service)):
+@router.get(
+    "/reconciliations/{definition_id}",
+    response_model=DefinitionOut,
+    summary="Get a reconciliation definition",
+)
+async def get_definition(
+    definition_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     return await service.get_definition(str(definition_id))
 
 
@@ -101,7 +123,9 @@ async def get_definition(definition_id: UUID, service: ReconciliationService = D
     response_model=list[RuleOut],
     summary="List a definition's rules",
 )
-async def list_rules(definition_id: UUID, service: ReconciliationService = Depends(get_service)):
+async def list_rules(
+    definition_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     """Ordered by `(phase, priority)` - the same order the engine evaluates
     them in (first-match-wins within a phase, once M1/M2 land)."""
     return await service.list_rules(str(definition_id))
@@ -113,11 +137,17 @@ async def list_rules(definition_id: UUID, service: ReconciliationService = Depen
     summary="Enable/disable or retune a rule",
 )
 async def update_rule(
-    definition_id: UUID, rule_id: UUID, payload: RuleUpdate, service: ReconciliationService = Depends(get_service)
+    definition_id: UUID,
+    rule_id: UUID,
+    payload: RuleUpdate,
+    service: ReconciliationService = Depends(get_service),
 ):
     """`config` is a full replacement, not a merge - submit the rule's
     complete config, not just the keys you're changing."""
-    return await service.update_rule(str(definition_id), str(rule_id), enabled=payload.enabled, config=payload.config)
+    return await service.update_rule(
+        str(definition_id), str(rule_id), enabled=payload.enabled, config=payload.config
+    )
+
 
 
 @router.post(
@@ -147,18 +177,34 @@ async def create_rule(definition_id: UUID, payload: RuleCreate, service: Reconci
     status_code=status.HTTP_202_ACCEPTED,
     summary="Enqueue a reconciliation run",
 )
-async def create_run(definition_id: UUID, payload: RunCreate, service: ReconciliationService = Depends(get_service)):
+async def create_run(
+    definition_id: UUID,
+    payload: RunCreate,
+    service: ReconciliationService = Depends(get_service),
+):
     """Creates a run with `status=QUEUED` and returns immediately - it does
     **not** execute the engine. Until the M1 `reconciliation_worker` exists,
     nothing claims a queued run yet. Poll `GET /runs/{run_id}` for status."""
-    return await service.create_run(str(definition_id), period_start=payload.period_start, period_end=payload.period_end)
+    return await service.create_run(
+        str(definition_id),
+        period_start=payload.period_start,
+        period_end=payload.period_end,
+    )
 
 
-@router.get("/reconciliations/{definition_id}/runs", response_model=list[RunOut], summary="List a definition's runs")
+@router.get(
+    "/reconciliations/{definition_id}/runs",
+    response_model=list[RunOut],
+    summary="List a definition's runs",
+)
 async def list_runs(
-    definition_id: UUID, status_filter: str | None = None, service: ReconciliationService = Depends(get_service)
+    definition_id: UUID,
+    status_filter: str | None = None,
+    service: ReconciliationService = Depends(get_service),
 ):
-    return await service.list_runs(definition_id=str(definition_id), status_=status_filter)
+    return await service.list_runs(
+        definition_id=str(definition_id), status_=status_filter
+    )
 
 
 @router.get("/runs/{run_id}", response_model=RunOut, summary="Get a reconciliation run")
@@ -169,36 +215,14 @@ async def get_run(run_id: UUID, service: ReconciliationService = Depends(get_ser
     return await service.get_run(str(run_id))
 
 
-@router.post("/runs/{run_id}/retry", response_model=RunOut, summary="Retry a failed reconciliation run")
-async def retry_run(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+@router.post(
+    "/runs/{run_id}/retry",
+    response_model=RunOut,
+    summary="Retry a failed reconciliation run",
+)
+async def retry_run(
+    run_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     """Only valid when `status=FAILED` (409 otherwise) - mirrors
     `POST /ingestion-jobs/{job_id}/retry`."""
     return await service.retry_run(str(run_id))
-
-
-# -- match_groups / reconciliation_exceptions (M3, run results) --------------------
-@router.get("/runs/{run_id}/matches", response_model=list[MatchGroupOut], summary="List a run's match groups")
-async def list_matches(run_id: UUID, service: ReconciliationService = Depends(get_service)):
-    """Every match group Phase 2 committed for this run, each with its
-    nested `allocations` - the invoices it settled money against."""
-    return await service.list_matches(str(run_id))
-
-
-@router.get("/runs/{run_id}/exceptions", response_model=list[ExceptionOut], summary="List a run's exceptions")
-async def list_exceptions(run_id: UUID, status_filter: str | None = None, service: ReconciliationService = Depends(get_service)):
-    """Optionally filter by `status_filter` (one of `EXCEPTION_STATUSES`,
-    e.g. `OPEN`). Includes GL_VARIANCE exceptions raised by the M3 control
-    proof, not just Phase 1/2 exceptions."""
-    return await service.list_exceptions(str(run_id), status_=status_filter)
-
-
-@router.patch("/exceptions/{exception_id}", response_model=ExceptionOut, summary="Resolve or annotate an exception")
-async def update_exception(exception_id: UUID, payload: ExceptionUpdate, service: ReconciliationService = Depends(get_service)):
-    """`resolved_at` is stamped automatically the moment `status` moves away
-    from `OPEN`/`INVESTIGATING` - not settable directly. TODO(recon.exception.resolve):
-    gate behind that permission once app/auth/ is real; `resolver_id` is
-    `None` until then."""
-    return await service.update_exception(
-        str(exception_id), status_=payload.status, resolution_outcome=payload.resolution_outcome,
-        resolution_notes=payload.resolution_notes,
-    )

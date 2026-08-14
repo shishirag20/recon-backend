@@ -176,7 +176,11 @@ async def process_ingestion_job(
         # candidate for the AI-suggestion stub (currently a no-op - see
         # app/datahub/ai_mapping.py); anything still unresolved after that is
         # recorded on the job instead of silently failing every row.
-        mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+        mapped_headers = {
+            normalize_header(m["source_field"])
+            for m in mappings
+            if m.get("canonical_field") and str(m["canonical_field"]).strip() not in ("", "-")
+        }
         unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
         if unmapped_columns:
             suggestions = ai_mapping.suggest_canonical_fields(
@@ -186,7 +190,11 @@ async def process_ingestion_job(
                 mappings = await dao.insert_mapping_version(
                     job["stream"], [dict(m) for m in mappings] + suggestions
                 )
-                mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+                mapped_headers = {
+                    normalize_header(m["source_field"])
+                    for m in mappings
+                    if m.get("canonical_field") and str(m["canonical_field"]).strip() not in ("", "-")
+                }
                 unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
 
         row_count = 0

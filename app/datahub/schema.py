@@ -67,7 +67,8 @@ class DataSourceOut(BaseModel):
 class FieldMappingIn(BaseModel):
     source_field: str = Field(min_length=1, description="Column name as it appears in the raw uploaded file.")
     canonical_field: str = Field(
-        min_length=1,
+        default="",
+        min_length=0,
         description=(
             "Target column on the stream's canonical table. BANK: transaction_date, currency, "
             "amount_minor, amount_home_minor, dr_cr, bank_reference, narration, payer_name, ... "
@@ -83,6 +84,7 @@ class FieldMappingIn(BaseModel):
 
 
 class FieldMappingOut(FieldMappingIn):
+    canonical_field: str = Field(default="", min_length=0)
     mapping_id: UUID
     stream: str = Field(description="BANK, INVOICE, CUSTOMER, ... - mappings are shared globally per stream, not per data source.")
     version: int = Field(description="Mapping sets are versioned; only one version per stream is is_active at a time.")

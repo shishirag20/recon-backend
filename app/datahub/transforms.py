@@ -128,7 +128,9 @@ def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
     normalized_raw = {normalize_header(k): v for k, v in raw_row.items()}
     for m in mappings:
         source_field = m["source_field"]
-        canonical_field = m["canonical_field"]
+        canonical_field = m.get("canonical_field")
+        if not canonical_field or str(canonical_field).strip() in ("", "-"):
+            continue
         normalized_source = normalize_header(source_field)
         if m["transform"] != "CONST" and normalized_source not in normalized_raw:
             # This synonym's column isn't in this file at all - not the same
