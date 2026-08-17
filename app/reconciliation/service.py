@@ -247,3 +247,73 @@ class ReconciliationService:
             exception_id, status=status_, resolution_outcome=resolution_outcome,
             resolution_notes=resolution_notes, resolver_id=None,
         )
+
+    async def list_open_payments(self, run_id: str):
+        """The candidate pool for the No-Payment-Received resolution panel -
+        every payment in this run's entity that still has real leftover cash
+        (unapplied_minor > 0), regardless of which run originally processed
+        it (see dao.list_open_payments_for_entity)."""
+        run_context = await self.dao.get_run_context(run_id)
+        if run_context is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.RUN_NOT_FOUND)
+        return await self.dao.list_open_payments_for_entity(str(run_context["entity_id"]))
+
+    async def resolve_no_payment(self, exception_id: str, *, payment_ids: list[str], note: str | None):
+        """Matches the prototype's `arNoPaymentPanel` "Match selected
+        payment(s)" action exactly: fills this exception's invoice from the
+        selected payments in the order given (each capped at its own
+        unapplied_minor), writes one MANUAL match_group + one
+        invoice_allocations row per payment that contributed cash, and
+        cross-resolves any of those payments' own open Suspense exceptions -
+        a reviewer picking payments here already answered "who is this
+        money from," so a separate Suspense review for the same payment
+        would be redundant."""
+        exc = await self.dao.get_exception(exception_id)
+        if exc is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.EXCEPTION_NOT_FOUND)
+        if exc["exception_type"] != "NO_PAYMENT" or exc["invoice_id"] is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.NOT_A_NO_PAYMENT_EXCEPTION)
+        if not payment_ids:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.NO_PAYMENT_IDS_SELECTED)
+
+        invoice = await self.dao.get_invoice(str(exc["invoice_id"]))
+        if invoice is None or invoice["balance_due_minor"] <= 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVOICE_NOT_OPEN)
+
+        payments = []
+        for payment_id in payment_ids:
+            payment = await self.dao.get_payment(payment_id)
+            if payment is None or payment["unapplied_minor"] <= 0:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.PAYMENT_NOT_FOUND_OR_NOT_OPEN)
+            payments.append(payment)
+
+        match_group = await self.dao.insert_match_group(
+            run_id=str(exc["run_id"]), match_type="MANUAL", rule_id=None, confidence=None,
+            status="CONFIRMED", reason=note or "Manually matched from No Payment Received",
+        )
+
+        remaining = invoice["balance_due_minor"]
+        cash_applied = 0
+        for payment in payments:
+            if remaining <= 0:
+                break
+            take = min(payment["unapplied_minor"], remaining)
+            if take <= 0:
+                continue
+            await self.dao.insert_invoice_allocation(
+                match_group_id=match_group["match_group_id"], invoice_id=invoice["invoice_id"],
+                payment_id=payment["payment_id"], bank_txn_id=payment["bank_txn_id"], allocated_minor=take,
+            )
+            await self.dao.apply_payment_allocation(payment["payment_id"], take)
+            await self.dao.auto_resolve_suspense_for_payment(payment["payment_id"], note)
+            remaining -= take
+            cash_applied += take
+
+        if cash_applied > 0:
+            await self.dao.apply_invoice_allocation(invoice["invoice_id"], cash_applied)
+
+        await self.dao.update_exception(
+            exception_id, status="RESOLVED", resolution_outcome="MANUAL_MATCH",
+            resolution_notes=note, resolver_id=None, match_group_id=match_group["match_group_id"],
+        )
+        return await self.dao.get_exception(exception_id)

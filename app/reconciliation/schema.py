@@ -195,5 +195,23 @@ class ExceptionOut(BaseModel):
 
 class ExceptionUpdate(BaseModel):
     status: str | None = Field(default=None, description="Moving away from OPEN/INVESTIGATING stamps resolved_at automatically.")
-    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
+    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT | MANUAL_MATCH")
     resolution_notes: str | None = None
+
+
+class PaymentOut(BaseModel):
+    payment_id: UUID
+    bank_txn_id: UUID
+    bank_reference: str | None = None
+    customer_id: UUID | None = Field(default=None, description="None means this payment never locked/resolved to a customer.")
+    customer_name: str | None = None
+    total_received_minor: int
+    unapplied_minor: int = Field(description="Cash from this payment not yet applied to any invoice - what's actually available to manually match.")
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ResolveNoPaymentRequest(BaseModel):
+    payment_ids: list[UUID] = Field(min_length=1, description="Open/unapplied payments to apply against this exception's invoice, in the order to fill it.")
+    note: str | None = Field(default=None, description="Optional reviewer note - stored as the match's reason and the exception's resolution_notes.")

@@ -36,6 +36,8 @@ from app.reconciliation.schema import (
     ExceptionUpdate,
     MatcherCatalogResponse,
     MatchGroupOut,
+    PaymentOut,
+    ResolveNoPaymentRequest,
     RuleCreate,
     RuleOut,
     RuleUpdate,
@@ -269,4 +271,28 @@ async def update_exception(exception_id: UUID, payload: ExceptionUpdate, service
     return await service.update_exception(
         str(exception_id), status_=payload.status, resolution_outcome=payload.resolution_outcome,
         resolution_notes=payload.resolution_notes,
+    )
+
+
+@router.get("/runs/{run_id}/payments", response_model=list[PaymentOut], summary="List a run's open/unapplied payments")
+async def list_open_payments(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+    """Payments with real leftover cash (`unapplied_minor > 0`) for this
+    run's entity - the candidate pool the No-Payment-Received resolution
+    panel offers a reviewer to manually match against an open invoice."""
+    return await service.list_open_payments(str(run_id))
+
+
+@router.post(
+    "/exceptions/{exception_id}/resolve-no-payment", response_model=ExceptionOut,
+    summary="Manually match a NO_PAYMENT exception's invoice to one or more open payments",
+)
+async def resolve_no_payment(exception_id: UUID, payload: ResolveNoPaymentRequest, service: ReconciliationService = Depends(get_service)):
+    """Only valid for a `NO_PAYMENT` exception. Applies the selected
+    payments' unapplied cash to the exception's invoice (in the order
+    given), writes a real `MANUAL` match_group + allocations, and
+    cross-resolves any of those payments' own open Suspense exceptions.
+    TODO(recon.exception.resolve): gate behind that permission once
+    app/auth/ is real, same as PATCH /exceptions/{id}."""
+    return await service.resolve_no_payment(
+        str(exception_id), payment_ids=[str(pid) for pid in payload.payment_ids], note=payload.note,
     )

@@ -32,6 +32,10 @@ class ReconciliationErrors:
         "config.source (one of SOURCE_KINDS), and config.source_field"
     )
     DUPLICATE_PRIORITY = "A rule already exists at this phase+priority"
+    NOT_A_NO_PAYMENT_EXCEPTION = "Only a NO_PAYMENT exception (with an invoice_id) can be resolved this way"
+    NO_PAYMENT_IDS_SELECTED = "payment_ids must include at least one payment"
+    INVOICE_NOT_OPEN = "This invoice has no remaining balance to apply a payment against"
+    PAYMENT_NOT_FOUND_OR_NOT_OPEN = "One or more payment_ids were not found or have no unapplied balance left"
 
 
 # -- reconciliation_definitions ----------------------------------------------
@@ -81,7 +85,7 @@ EXCEPTION_STATUSES = (
     "OPEN", "INVESTIGATING", "RESOLVED", "AUTO_RESOLVED", "DEFERRED",
     "WRITTEN_OFF", "ADJUSTED", "CARRIED_FORWARD",
 )
-EXCEPTION_RESOLUTION_OUTCOMES = ("WRITEOFF", "KEEPOPEN", "DISPUTE", "JOURNAL", "ON_ACCOUNT")
+EXCEPTION_RESOLUTION_OUTCOMES = ("WRITEOFF", "KEEPOPEN", "DISPUTE", "JOURNAL", "ON_ACCOUNT", "MANUAL_MATCH")
 
 # -- gl_account_roles.role_code -----------------------------------------------
 # The fixed set of semantic accounts gl_posting.py resolves per entity - see

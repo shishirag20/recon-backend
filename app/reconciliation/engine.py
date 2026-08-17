@@ -664,14 +664,14 @@ async def run_phase_2(
                 else ""
             )
             candidate_names = [
-                cust_name_map.get(cid, cid[:8]) for cid in per_candidate_matches
+                cust_name_map.get(cid, cid[:8]) for cid, _, _ in per_candidate_matches
             ]
             names_str = ", ".join(candidate_names)
             reason = f"{amt_fmt} payment{ref_str} produced valid matches for {len(per_candidate_matches)} candidates ({names_str})"
             detail = {
                 "candidates": [
                     {"customer_id": cid, "customer_name": cust_name_map.get(cid)}
-                    for cid in per_candidate_matches
+                    for cid, _, _ in per_candidate_matches
                 ],
                 "amount_minor": amount,
             }

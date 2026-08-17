@@ -19,6 +19,7 @@ from app.reconciliation.constants import DEFAULT_AR_RULE_CATALOG, GL_ROLE_AR_CON
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.service import ReconciliationService
 from tests.reconciliation.test_golden_m2 import golden  # noqa: F401 - reused fixture
+from tests.reconciliation.test_golden_m2 import _exceptions_for, _invoice, _payment_for
 
 pytestmark = pytest.mark.asyncio
 
@@ -217,3 +218,52 @@ class TestExceptionResolutionAPI:
         exceptions = await service.list_exceptions(run_id, status_="OPEN")
         with pytest.raises(Exception):
             await service.update_exception(str(exceptions[0]["exception_id"]), status_="NOT_A_REAL_STATUS", resolution_outcome=None, resolution_notes=None)
+
+    async def test_resolve_no_payment_matches_payment_and_cross_resolves_suspense(self, conn, golden):
+        """INV-112 (Halcyon) never gets touched by the engine - BANK-011 only
+        ever reaches a candidate pool (weak narration-token hint), so per
+        test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched it's
+        Suspense on the bank side and NO_PAYMENT on the invoice side, with
+        BANK-011's payment sitting fully unapplied (600000 minor). Manually
+        matching that payment from the No-Payment-Received panel should
+        close the invoice AND auto-resolve the sibling Suspense exception -
+        one reviewer decision, two exceptions cleared."""
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+
+        no_payment_exc = next(
+            e for e in await service.list_exceptions(run_id, status_="OPEN")
+            if e["exception_type"] == "NO_PAYMENT" and str(e["invoice_id"]) == golden["invoices"]["112"]
+        )
+        halcyon_payment = await _payment_for(conn, golden["bank"]["011"])
+        assert halcyon_payment["unapplied_minor"] == 600_000
+
+        open_payments = await service.list_open_payments(run_id)
+        assert any(p["payment_id"] == halcyon_payment["payment_id"] for p in open_payments)
+
+        resolved = await service.resolve_no_payment(
+            str(no_payment_exc["exception_id"]), payment_ids=[str(halcyon_payment["payment_id"])], note="pytest manual match",
+        )
+        assert resolved["status"] == "RESOLVED"
+        assert resolved["resolution_outcome"] == "MANUAL_MATCH"
+        assert resolved["match_group_id"] is not None
+
+        inv112 = await _invoice(conn, golden["invoices"]["112"])
+        assert inv112["status"] == "PAID" and inv112["balance_due_minor"] == 0
+
+        payment_after = await _payment_for(conn, golden["bank"]["011"])
+        assert payment_after["unapplied_minor"] == 0
+
+        halcyon_suspense = next(
+            e for e in await _exceptions_for(conn, golden["bank"]["011"]) if e["exception_type"] == "SUSPENSE"
+        )
+        assert halcyon_suspense["status"] == "AUTO_RESOLVED"
+        assert halcyon_suspense["resolution_outcome"] == "MANUAL_MATCH"
+
+    async def test_resolve_no_payment_rejects_wrong_exception_type(self, conn, golden):
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+        exceptions = await service.list_exceptions(run_id, status_="OPEN")
+        not_no_payment = next(e for e in exceptions if e["exception_type"] != "NO_PAYMENT")
+        with pytest.raises(Exception):
+            await service.resolve_no_payment(str(not_no_payment["exception_id"]), payment_ids=["00000000-0000-0000-0000-000000000000"], note=None)

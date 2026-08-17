@@ -525,6 +525,56 @@ class ReconciliationDAO:
         )
         return _row(row)
 
+    async def get_invoice(self, invoice_id: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT invoice_id, entity_id, customer_id, invoice_number, balance_due_minor, total_amount_minor, status "
+            "FROM invoices WHERE invoice_id = $1",
+            invoice_id,
+        )
+        return _row(row)
+
+    async def get_payment(self, payment_id: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor FROM payments WHERE payment_id = $1",
+            payment_id,
+        )
+        return _row(row)
+
+    async def list_open_payments_for_entity(self, entity_id: str) -> list[dict]:
+        """Payments with real leftover cash (unapplied_minor > 0) for this
+        entity - the candidate pool a reviewer can manually match against an
+        invoice from the No-Payment-Received resolution panel. Not scoped to
+        one run - `payments` carries no run_id (see engine.py's
+        payment_ledger_records docstring) - so a payment an earlier run left
+        unapplied is still fair game today, same as the prototype's
+        `availablePayments` (which isn't run-scoped either)."""
+        rows = await self.conn.fetch(
+            "SELECT p.payment_id, p.bank_txn_id, p.customer_id, p.total_received_minor, p.unapplied_minor, p.created_at, "
+            "bs.bank_reference, COALESCE(c.company_name, bs.payer_name) AS customer_name "
+            "FROM payments p "
+            "JOIN bank_statements bs ON bs.bank_txn_id = p.bank_txn_id "
+            "LEFT JOIN customers c ON c.customer_id = p.customer_id "
+            "WHERE bs.entity_id = $1 AND p.unapplied_minor > 0 "
+            "ORDER BY p.created_at",
+            entity_id,
+        )
+        return _rows(rows)
+
+    async def auto_resolve_suspense_for_payment(self, payment_id: str, note: str | None) -> None:
+        """Cross-resolves a payment's own open Suspense exception once it
+        gets manually matched from the invoice side - matches the
+        prototype's "Automatically resolved via matched No Payment Received"
+        behavior, so a reviewer doesn't have to separately dismiss both
+        exceptions for what was really one decision."""
+        await self.conn.execute(
+            "UPDATE reconciliation_exceptions SET status = 'AUTO_RESOLVED', "
+            "resolution_outcome = 'MANUAL_MATCH', "
+            "resolution_notes = COALESCE(resolution_notes, $2), resolved_at = now() "
+            "WHERE bank_txn_id = (SELECT bank_txn_id FROM payments WHERE payment_id = $1) "
+            "AND exception_type = 'SUSPENSE' AND status = 'OPEN'",
+            payment_id, note or "Automatically resolved via matched No Payment Received",
+        )
+
     async def lock_payment_customer(
         self, payment_id: str, customer_id: str, rule_id: str | None
     ) -> None:
@@ -711,22 +761,26 @@ class ReconciliationDAO:
 
     async def update_exception(
         self, exception_id: str, *, status: str | None, resolution_outcome: str | None,
-        resolution_notes: str | None, resolver_id: str | None,
+        resolution_notes: str | None, resolver_id: str | None, match_group_id: str | None = None,
     ) -> dict | None:
         """`resolved_at` is stamped automatically the moment `status` moves
-        away from `OPEN`/`INVESTIGATING` - the caller doesn't set it directly."""
+        away from `OPEN`/`INVESTIGATING` - the caller doesn't set it directly.
+        `match_group_id` links the exception to the match that resolved it
+        (e.g. a manual No-Payment-Received match) - optional, COALESCE'd like
+        every other field here."""
         row = await self.conn.fetchrow(
             "UPDATE reconciliation_exceptions SET "
             "status = COALESCE($2, status), "
             "resolution_outcome = COALESCE($3, resolution_outcome), "
             "resolution_notes = COALESCE($4, resolution_notes), "
             "resolver_id = COALESCE($5, resolver_id), "
+            "match_group_id = COALESCE($6, match_group_id), "
             "resolved_at = CASE WHEN $2 IS NOT NULL AND $2 NOT IN ('OPEN', 'INVESTIGATING') THEN now() ELSE resolved_at END "
             "WHERE exception_id = $1 "
             "RETURNING exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
             "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
             "resolved_at, created_at, detail, match_group_id",
-            exception_id, status, resolution_outcome, resolution_notes, resolver_id,
+            exception_id, status, resolution_outcome, resolution_notes, resolver_id, match_group_id,
         )
         return _row(row)
 
