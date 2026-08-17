@@ -34,10 +34,12 @@ from app.reconciliation.schema import (
     DefinitionOut,
     ExceptionOut,
     ExceptionUpdate,
+    InvoiceSummaryOut,
     MatcherCatalogResponse,
     MatchGroupOut,
     PaymentOut,
     ResolveNoPaymentRequest,
+    ResolveSuspenseRequest,
     RuleCreate,
     RuleOut,
     RuleUpdate,
@@ -282,6 +284,17 @@ async def list_open_payments(run_id: UUID, service: ReconciliationService = Depe
     return await service.list_open_payments(str(run_id))
 
 
+@router.get("/runs/{run_id}/open-invoices", response_model=list[InvoiceSummaryOut], summary="List a run's open invoices, optionally searched")
+async def list_open_invoices(
+    run_id: UUID, search: str | None = None, limit: int = 50, service: ReconciliationService = Depends(get_service)
+):
+    """Every open invoice for this run's entity, across every customer -
+    the Suspense resolution panel's "match to a different invoice" fallback
+    for when the suggestion/candidate pool is wrong or empty. `search`
+    matches invoice_number or customer name."""
+    return await service.list_open_invoices(str(run_id), search=search, limit=limit)
+
+
 @router.post(
     "/exceptions/{exception_id}/resolve-no-payment", response_model=ExceptionOut,
     summary="Manually match a NO_PAYMENT exception's invoice to one or more open payments",
@@ -295,4 +308,32 @@ async def resolve_no_payment(exception_id: UUID, payload: ResolveNoPaymentReques
     app/auth/ is real, same as PATCH /exceptions/{id}."""
     return await service.resolve_no_payment(
         str(exception_id), payment_ids=[str(pid) for pid in payload.payment_ids], note=payload.note,
+    )
+
+
+@router.get(
+    "/customers/{customer_id}/open-invoices", response_model=list[InvoiceSummaryOut],
+    summary="List a customer's open invoices",
+)
+async def list_open_invoices_for_customer(customer_id: UUID, service: ReconciliationService = Depends(get_service)):
+    """The Suspense resolution panel's invoice picker, once a candidate
+    customer is selected (from the exception's own suggestion, its
+    candidate pool, or picked manually)."""
+    return await service.list_open_invoices_for_customer(str(customer_id))
+
+
+@router.post(
+    "/exceptions/{exception_id}/resolve-suspense", response_model=ExceptionOut,
+    summary="Manually match a SUSPENSE exception's payment to a customer and (optionally) invoices",
+)
+async def resolve_suspense(exception_id: UUID, payload: ResolveSuspenseRequest, service: ReconciliationService = Depends(get_service)):
+    """Only valid for a `SUSPENSE` exception. Confirms `customer_id` as the
+    payment's identity (locking it if not already), applies its cash across
+    `invoice_ids` in the order given (empty leaves it fully unapplied/
+    on-account for that customer), and resolves the exception.
+    TODO(recon.exception.resolve): gate behind that permission once
+    app/auth/ is real, same as PATCH /exceptions/{id}."""
+    return await service.resolve_suspense(
+        str(exception_id), customer_id=str(payload.customer_id),
+        invoice_ids=[str(iid) for iid in payload.invoice_ids], note=payload.note,
     )

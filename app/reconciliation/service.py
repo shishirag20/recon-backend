@@ -248,6 +248,15 @@ class ReconciliationService:
             resolution_notes=resolution_notes, resolver_id=None,
         )
 
+    async def list_open_invoices(self, run_id: str, *, search: str | None, limit: int = 50):
+        """The Suspense resolution panel's "match to a different invoice"
+        fallback - every open invoice for this run's entity, optionally
+        filtered by `search` (invoice_number or customer name)."""
+        run_context = await self.dao.get_run_context(run_id)
+        if run_context is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.RUN_NOT_FOUND)
+        return await self.dao.list_open_invoices_for_entity(str(run_context["entity_id"]), search, limit)
+
     async def list_open_payments(self, run_id: str):
         """The candidate pool for the No-Payment-Received resolution panel -
         every payment in this run's entity that still has real leftover cash
@@ -315,5 +324,85 @@ class ReconciliationService:
         await self.dao.update_exception(
             exception_id, status="RESOLVED", resolution_outcome="MANUAL_MATCH",
             resolution_notes=note, resolver_id=None, match_group_id=match_group["match_group_id"],
+        )
+        return await self.dao.get_exception(exception_id)
+
+    async def list_open_invoices_for_customer(self, customer_id: str):
+        """The Suspense resolution panel's invoice picker, once a candidate
+        customer is selected - see dao.list_open_invoices_for_customer."""
+        customer = await self.dao.get_customer(customer_id)
+        if customer is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.CUSTOMER_NOT_FOUND)
+        return await self.dao.list_open_invoices_for_customer(customer_id)
+
+    async def resolve_suspense(self, exception_id: str, *, customer_id: str, invoice_ids: list[str], note: str | None):
+        """Matches the prototype's `arSuspensePanel` resolution actions -
+        "Likely Match (Exact Amount)", a candidate-pool pick, and the manual
+        invoice picker are all the same underlying decision here: confirm
+        which customer this unidentified payment belongs to, and optionally
+        which of their open invoices it settles. Locks the payment to
+        `customer_id` (if not already), applies its cash across
+        `invoice_ids` in order, and resolves the exception. Empty
+        `invoice_ids` matches the prototype's "found a candidate but no
+        exact invoice match - apply to their account as unapplied cash"
+        case - the payment is confirmed to belong to this customer but
+        stays fully unapplied."""
+        exc = await self.dao.get_exception(exception_id)
+        if exc is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.EXCEPTION_NOT_FOUND)
+        if exc["exception_type"] != "SUSPENSE" or exc["bank_txn_id"] is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.NOT_A_SUSPENSE_EXCEPTION)
+
+        customer = await self.dao.get_customer(customer_id)
+        if customer is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, ReconciliationErrors.CUSTOMER_NOT_FOUND)
+
+        payment = await self.dao.get_payment_by_bank_txn(str(exc["bank_txn_id"]))
+        if payment is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.SUSPENSE_PAYMENT_NOT_FOUND)
+
+        if payment["customer_id"] is None or str(payment["customer_id"]) != str(customer_id):
+            await self.dao.lock_payment_customer(payment["payment_id"], customer_id, None)
+
+        match_group_id = None
+        cash_applied = 0
+        if invoice_ids:
+            invoices = []
+            for invoice_id in invoice_ids:
+                invoice = await self.dao.get_invoice(invoice_id)
+                if invoice is None or invoice["balance_due_minor"] <= 0 or str(invoice["customer_id"]) != str(customer_id):
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVOICE_NOT_FOUND_FOR_CUSTOMER)
+                invoices.append(invoice)
+
+            match_group = await self.dao.insert_match_group(
+                run_id=str(exc["run_id"]), match_type="MANUAL", rule_id=None, confidence=None,
+                status="CONFIRMED", reason=note or "Manually matched from Suspense",
+            )
+            match_group_id = match_group["match_group_id"]
+
+            remaining = payment["unapplied_minor"]
+            for invoice in invoices:
+                if remaining <= 0:
+                    break
+                take = min(invoice["balance_due_minor"], remaining)
+                if take <= 0:
+                    continue
+                await self.dao.insert_invoice_allocation(
+                    match_group_id=match_group_id, invoice_id=invoice["invoice_id"],
+                    payment_id=payment["payment_id"], bank_txn_id=payment["bank_txn_id"], allocated_minor=take,
+                )
+                await self.dao.apply_invoice_allocation(invoice["invoice_id"], take)
+                remaining -= take
+                cash_applied += take
+
+            if cash_applied > 0:
+                await self.dao.apply_payment_allocation(payment["payment_id"], cash_applied)
+                if remaining <= 0 and cash_applied >= payment["unapplied_minor"]:
+                    await self.dao.mark_bank_statement_status(payment["bank_txn_id"], "MATCHED")
+
+        await self.dao.update_exception(
+            exception_id, status="RESOLVED",
+            resolution_outcome="MANUAL_MATCH" if cash_applied > 0 else "ON_ACCOUNT",
+            resolution_notes=note, resolver_id=None, match_group_id=match_group_id,
         )
         return await self.dao.get_exception(exception_id)

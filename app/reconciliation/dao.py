@@ -540,6 +540,54 @@ class ReconciliationDAO:
         )
         return _row(row)
 
+    async def get_payment_by_bank_txn(self, bank_txn_id: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor FROM payments WHERE bank_txn_id = $1",
+            bank_txn_id,
+        )
+        return _row(row)
+
+    async def get_customer(self, customer_id: str) -> dict | None:
+        row = await self.conn.fetchrow(
+            "SELECT customer_id, entity_id, company_name FROM customers WHERE customer_id = $1",
+            customer_id,
+        )
+        return _row(row)
+
+    async def list_open_invoices_for_customer(self, customer_id: str) -> list[dict]:
+        """The Suspense resolution panel's invoice picker, once a candidate
+        customer is chosen (from the exception's own suggestion, its
+        candidate pool, or picked manually) - every real balance still owed,
+        for the reviewer to pick which one(s) this payment actually
+        settles."""
+        rows = await self.conn.fetch(
+            "SELECT i.invoice_id, i.invoice_number, i.balance_due_minor, i.due_date, "
+            "c.customer_id, c.company_name AS customer_name "
+            "FROM invoices i JOIN customers c ON c.customer_id = i.customer_id "
+            "WHERE i.customer_id = $1 AND i.balance_due_minor > 0 "
+            "ORDER BY i.due_date",
+            customer_id,
+        )
+        return _rows(rows)
+
+    async def list_open_invoices_for_entity(self, entity_id: str, search: str | None, limit: int) -> list[dict]:
+        """The Suspense resolution panel's "match to a different invoice"
+        fallback - every open invoice across every customer, not scoped to
+        one candidate (unlike list_open_invoices_for_customer above), so a
+        reviewer can override a wrong/missing suggestion entirely. `search`
+        matches invoice_number or company_name (mirrors the Data Explorer's
+        own natural-key search - app/datahub/service.py's list_records)."""
+        rows = await self.conn.fetch(
+            "SELECT i.invoice_id, i.invoice_number, i.balance_due_minor, i.due_date, "
+            "c.customer_id, c.company_name AS customer_name "
+            "FROM invoices i JOIN customers c ON c.customer_id = i.customer_id "
+            "WHERE i.entity_id = $1 AND i.balance_due_minor > 0 "
+            "AND ($2::text IS NULL OR i.invoice_number ILIKE '%' || $2 || '%' OR c.company_name ILIKE '%' || $2 || '%') "
+            "ORDER BY i.due_date LIMIT $3",
+            entity_id, search, limit,
+        )
+        return _rows(rows)
+
     async def list_open_payments_for_entity(self, entity_id: str) -> list[dict]:
         """Payments with real leftover cash (unapplied_minor > 0) for this
         entity - the candidate pool a reviewer can manually match against an
@@ -704,6 +752,8 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.payer_name, "
+            "bs.narration, "
             "COALESCE("
             "  e.discrepancy_minor, "
             "  (e.detail->>'shortfall_minor')::bigint, "
@@ -741,6 +791,8 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.payer_name, "
+            "bs.narration, "
             "COALESCE("
             "  e.discrepancy_minor, "
             "  (e.detail->>'shortfall_minor')::bigint, "

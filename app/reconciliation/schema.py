@@ -178,6 +178,8 @@ class ExceptionOut(BaseModel):
     customer_code: str | None = None
     invoice_number: str | None = None
     bank_reference: str | None = None
+    payer_name: str | None = Field(default=None, description="Raw payer name from the bank row, for a SUSPENSE exception's payment-details block.")
+    narration: str | None = Field(default=None, description="Raw bank narration, same use as payer_name.")
     discrepancy_minor: int | None = None
     amount_minor: int | None = None
     reason_code: str | None = None
@@ -215,3 +217,20 @@ class PaymentOut(BaseModel):
 class ResolveNoPaymentRequest(BaseModel):
     payment_ids: list[UUID] = Field(min_length=1, description="Open/unapplied payments to apply against this exception's invoice, in the order to fill it.")
     note: str | None = Field(default=None, description="Optional reviewer note - stored as the match's reason and the exception's resolution_notes.")
+
+
+class InvoiceSummaryOut(BaseModel):
+    invoice_id: UUID
+    invoice_number: str
+    balance_due_minor: int
+    due_date: date
+    customer_id: UUID
+    customer_name: str
+
+    model_config = {"from_attributes": True}
+
+
+class ResolveSuspenseRequest(BaseModel):
+    customer_id: UUID = Field(description="The confirmed identity for this payment - from the exception's own suggestion, its candidate pool, or picked manually.")
+    invoice_ids: list[UUID] = Field(default_factory=list, description="This customer's open invoices to apply the payment's cash against, in the order to fill them. Empty means leave it fully unapplied/on-account for this customer.")
+    note: str | None = Field(default=None, description="Optional reviewer note - stored as the match's reason (if any) and the exception's resolution_notes.")

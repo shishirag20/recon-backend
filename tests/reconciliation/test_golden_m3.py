@@ -267,3 +267,81 @@ class TestExceptionResolutionAPI:
         not_no_payment = next(e for e in exceptions if e["exception_type"] != "NO_PAYMENT")
         with pytest.raises(Exception):
             await service.resolve_no_payment(str(not_no_payment["exception_id"]), payment_ids=["00000000-0000-0000-0000-000000000000"], note=None)
+
+    async def test_resolve_suspense_matches_suggested_customer_and_invoice(self, conn, golden):
+        """Halcyon's BANK-011 Suspense exception carries a suggestion
+        (suggested_customer_id=Halcyon, suggested_invoice_ids=[INV-112]) -
+        confirming exactly that suggestion should lock the payment, close
+        the invoice, and resolve the exception as a real MANUAL_MATCH."""
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+
+        suspense_exc = next(
+            e for e in await service.list_exceptions(run_id, status_="OPEN")
+            if e["exception_type"] == "SUSPENSE" and str(e["bank_txn_id"]) == golden["bank"]["011"]
+        )
+        assert suspense_exc["detail"]["suggested_customer_id"] == golden["customers"]["halcyon"]
+
+        invoices = await service.list_open_invoices_for_customer(golden["customers"]["halcyon"])
+        assert any(str(i["invoice_id"]) == golden["invoices"]["112"] for i in invoices)
+
+        resolved = await service.resolve_suspense(
+            str(suspense_exc["exception_id"]), customer_id=golden["customers"]["halcyon"],
+            invoice_ids=[golden["invoices"]["112"]], note="pytest confirmed suggestion",
+        )
+        assert resolved["status"] == "RESOLVED"
+        assert resolved["resolution_outcome"] == "MANUAL_MATCH"
+        assert resolved["match_group_id"] is not None
+
+        inv112 = await _invoice(conn, golden["invoices"]["112"])
+        assert inv112["status"] == "PAID" and inv112["balance_due_minor"] == 0
+        payment = await _payment_for(conn, golden["bank"]["011"])
+        assert str(payment["customer_id"]) == golden["customers"]["halcyon"]
+        assert payment["unapplied_minor"] == 0
+
+    async def test_resolve_suspense_on_account_leaves_payment_unapplied(self, conn, golden):
+        """Confirming a customer with no invoice_ids (the "candidate pool,
+        no exact match - apply as unapplied cash" case) should lock the
+        payment to that customer but leave its cash untouched."""
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+
+        suspense_exc = next(
+            e for e in await service.list_exceptions(run_id, status_="OPEN")
+            if e["exception_type"] == "SUSPENSE" and str(e["bank_txn_id"]) == golden["bank"]["012"]
+        )
+        resolved = await service.resolve_suspense(
+            str(suspense_exc["exception_id"]), customer_id=golden["customers"]["meridian"], invoice_ids=[], note=None,
+        )
+        assert resolved["status"] == "RESOLVED"
+        assert resolved["resolution_outcome"] == "ON_ACCOUNT"
+        assert resolved["match_group_id"] is None
+
+        payment = await _payment_for(conn, golden["bank"]["012"])
+        assert str(payment["customer_id"]) == golden["customers"]["meridian"]
+        assert payment["unapplied_minor"] == 1_100_000  # untouched
+
+    async def test_list_open_invoices_searches_across_customers(self, conn, golden):
+        """The Suspense panel's "match to a different invoice" fallback -
+        unscoped by customer, unlike list_open_invoices_for_customer."""
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+
+        all_open = await service.list_open_invoices(run_id, search=None)
+        assert any(str(i["invoice_id"]) == golden["invoices"]["112"] for i in all_open)
+        assert any(str(i["invoice_id"]) == golden["invoices"]["108"] for i in all_open)
+
+        by_number = await service.list_open_invoices(run_id, search="INV-2026-112")
+        assert len(by_number) == 1 and str(by_number[0]["invoice_id"]) == golden["invoices"]["112"]
+
+        by_customer_name = await service.list_open_invoices(run_id, search="Halcyon")
+        assert any(str(i["invoice_id"]) == golden["invoices"]["112"] for i in by_customer_name)
+        assert not any(str(i["invoice_id"]) == golden["invoices"]["108"] for i in by_customer_name)
+
+    async def test_resolve_suspense_rejects_wrong_exception_type(self, conn, golden):
+        run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
+        service = ReconciliationService(ReconciliationDAO(conn))
+        exceptions = await service.list_exceptions(run_id, status_="OPEN")
+        not_suspense = next(e for e in exceptions if e["exception_type"] != "SUSPENSE")
+        with pytest.raises(Exception):
+            await service.resolve_suspense(str(not_suspense["exception_id"]), customer_id=golden["customers"]["halcyon"], invoice_ids=[], note=None)

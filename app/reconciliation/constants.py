@@ -36,6 +36,10 @@ class ReconciliationErrors:
     NO_PAYMENT_IDS_SELECTED = "payment_ids must include at least one payment"
     INVOICE_NOT_OPEN = "This invoice has no remaining balance to apply a payment against"
     PAYMENT_NOT_FOUND_OR_NOT_OPEN = "One or more payment_ids were not found or have no unapplied balance left"
+    NOT_A_SUSPENSE_EXCEPTION = "Only a SUSPENSE exception (with a bank_txn_id) can be resolved this way"
+    SUSPENSE_PAYMENT_NOT_FOUND = "No payment found for this exception's bank transaction"
+    CUSTOMER_NOT_FOUND = "Customer not found"
+    INVOICE_NOT_FOUND_FOR_CUSTOMER = "One or more invoice_ids were not found, not open, or don't belong to customer_id"
 
 
 # -- reconciliation_definitions ----------------------------------------------
