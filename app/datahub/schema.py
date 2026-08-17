@@ -188,6 +188,29 @@ class ResolveHeadersResponse(BaseModel):
     results: list[ResolvedHeader]
 
 
+class ResolveSchemaRequest(BaseModel):
+    headers: list[str] = Field(
+        min_length=1,
+        description="Raw column headers from an actual file - read client-side before upload.",
+    )
+
+
+class ResolvedFieldMapping(BaseModel):
+    source_field: str
+    canonical_field: str | None = None
+    transform: str = "NONE"
+    transform_param: str | None = None
+    is_matched: bool = Field(
+        description="Whether this source field was matched to an existing synonym in the active mapping."
+    )
+
+
+class ResolveSchemaResponse(BaseModel):
+    stream: str
+    canonical_fields: list[str]
+    mappings: list[ResolvedFieldMapping]
+
+
 class CanonicalFieldsResponse(BaseModel):
     canonical_fields: list[str] = Field(
         description="Valid mapping targets for this stream - see app/datahub/canonical.py's KNOWN_FIELDS."
