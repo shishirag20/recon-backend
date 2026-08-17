@@ -166,24 +166,29 @@ class MatchGroupOut(BaseModel):
 class ExceptionOut(BaseModel):
     exception_id: UUID
     run_id: UUID
-    exception_no: str | None
+    exception_no: str | None = None
     exception_type: str = Field(
         description="SHORT_PAY | OVERPAYMENT | UNAPPLIED_CASH | TIMING_DIFFERENCE | GL_VARIANCE | DUPLICATE | "
         "MULTIPLE_INVOICE_MATCH | DOUBLE_COLLISION | SUSPENSE | BANK_CHARGE | GATEWAY_VARIANCE | NO_PAYMENT"
     )
-    bank_txn_id: UUID | None
-    invoice_id: UUID | None
-    customer_id: UUID | None
-    discrepancy_minor: int | None
-    reason_code: str | None
+    bank_txn_id: UUID | None = None
+    invoice_id: UUID | None = None
+    customer_id: UUID | None = None
+    customer_name: str | None = Field(default=None, description="Human-readable customer/remitter name.")
+    customer_code: str | None = None
+    invoice_number: str | None = None
+    bank_reference: str | None = None
+    discrepancy_minor: int | None = None
+    amount_minor: int | None = None
+    reason_code: str | None = None
     status: str = Field(description="OPEN | INVESTIGATING | RESOLVED | AUTO_RESOLVED | DEFERRED | WRITTEN_OFF | ADJUSTED | CARRIED_FORWARD")
-    resolution_outcome: str | None = Field(description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
-    resolver_id: UUID | None
-    resolution_notes: str | None
-    resolved_at: datetime | None
+    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
+    resolver_id: UUID | None = None
+    resolution_notes: str | None = None
+    resolved_at: datetime | None = None
     created_at: datetime
-    detail: dict | None = Field(description="Candidate lists for MULTIPLE_INVOICE_MATCH/DOUBLE_COLLISION; variance breakdown for GL_VARIANCE.")
-    match_group_id: UUID | None
+    detail: dict | None = Field(default=None, description="Candidate lists for MULTIPLE_INVOICE_MATCH/DOUBLE_COLLISION; variance breakdown for GL_VARIANCE.")
+    match_group_id: UUID | None = None
 
     model_config = {"from_attributes": True}
 

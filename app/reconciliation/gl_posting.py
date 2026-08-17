@@ -163,8 +163,12 @@ async def _run_control_proof(
         "sub_ledger_balance_minor": sl_balance, "gl_control_balance_minor": gl_balance,
         "variance_minor": variance, "tolerance_minor": tolerance_minor,
     }
+    sl_fmt = f"₹{sl_balance / 100:,.2f}"
+    gl_fmt = f"₹{gl_balance / 100:,.2f}"
+    var_fmt = f"₹{abs(variance) / 100:,.2f}"
+    reason = f"Sub-ledger {sl_fmt} vs GL {gl_fmt} — unposted variance of {var_fmt}"
     await dao.insert_exception(
         run_id=run_id, exception_type="GL_VARIANCE", bank_txn_id=None, customer_id=None,
-        reason_code=f"sub-ledger AR ({sl_balance}) does not match GL control balance ({gl_balance})", detail=detail,
+        discrepancy_minor=abs(variance), reason_code=reason, detail=detail,
     )
     return detail

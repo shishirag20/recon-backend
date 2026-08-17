@@ -387,17 +387,19 @@ class ReconciliationDAO:
         detail: dict | None,
         match_group_id: str | None = None,
         invoice_id: str | None = None,
+        discrepancy_minor: int | None = None,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO reconciliation_exceptions "
-            "(exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, reason_code, status, detail, match_group_id) "
-            "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'OPEN', $7::jsonb, $8) "
-            "RETURNING exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, reason_code, status, detail, match_group_id",
+            "(exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, discrepancy_minor, reason_code, status, detail, match_group_id) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'OPEN', $8::jsonb, $9) "
+            "RETURNING exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, discrepancy_minor, reason_code, status, detail, match_group_id",
             run_id,
             exception_type,
             bank_txn_id,
             customer_id,
             invoice_id,
+            discrepancy_minor,
             reason_code,
             detail,
             match_group_id,
@@ -636,21 +638,73 @@ class ReconciliationDAO:
 
     async def list_exceptions_for_run(self, run_id: str, status: str | None) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
-            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
-            "resolved_at, created_at, detail, match_group_id "
-            "FROM reconciliation_exceptions WHERE run_id = $1 AND ($2::text IS NULL OR status = $2) "
-            "ORDER BY created_at",
+            "SELECT e.exception_id, e.run_id, e.exception_no, e.exception_type, e.bank_txn_id, e.invoice_id, e.customer_id, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS discrepancy_minor, "
+            "e.reason_code, e.status, e.resolution_outcome, e.resolver_id, e.resolution_notes, "
+            "e.resolved_at, e.created_at, e.detail, e.match_group_id, "
+            "COALESCE(c.company_name, bs.payer_name) AS customer_name, "
+            "c.customer_code, "
+            "inv.invoice_number, "
+            "bs.bank_reference, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS amount_minor "
+            "FROM reconciliation_exceptions e "
+            "LEFT JOIN customers c ON c.customer_id = e.customer_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = e.invoice_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = e.bank_txn_id "
+            "WHERE e.run_id = $1 AND ($2::text IS NULL OR e.status = $2) "
+            "ORDER BY e.created_at",
             run_id, status,
         )
         return _rows(rows)
 
     async def get_exception(self, exception_id: str) -> dict | None:
         row = await self.conn.fetchrow(
-            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
-            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
-            "resolved_at, created_at, detail, match_group_id "
-            "FROM reconciliation_exceptions WHERE exception_id = $1",
+            "SELECT e.exception_id, e.run_id, e.exception_no, e.exception_type, e.bank_txn_id, e.invoice_id, e.customer_id, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS discrepancy_minor, "
+            "e.reason_code, e.status, e.resolution_outcome, e.resolver_id, e.resolution_notes, "
+            "e.resolved_at, e.created_at, e.detail, e.match_group_id, "
+            "COALESCE(c.company_name, bs.payer_name) AS customer_name, "
+            "c.customer_code, "
+            "inv.invoice_number, "
+            "bs.bank_reference, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS amount_minor "
+            "FROM reconciliation_exceptions e "
+            "LEFT JOIN customers c ON c.customer_id = e.customer_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = e.invoice_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = e.bank_txn_id "
+            "WHERE e.exception_id = $1",
             exception_id,
         )
         return _row(row)
