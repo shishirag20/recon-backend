@@ -195,13 +195,35 @@ async def run_phase_1(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
 
 async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: str, run_context: dict, outcomes: list[dict]) -> dict:
     """Processes every Phase-1 outcome (locked or pooled payment): scopes to
-    the candidate customer's(s') open invoices, tries the 9 allocation rules
-    first-match-wins, writes `match_groups`/`invoice_allocations`, decrements
-    invoice/payment balances, and sets each bank row's final `recon_status`.
-    A locked payment tries exactly one customer; a pooled payment tries every
-    candidate and only commits if exactly one produces an unambiguous match
-    (2+ -> Double-Collision, 0 -> left unresolved). Finishes with a sweep for
-    invoices that received no allocation at all this run (No-Payment).
+    the candidate customer's(s') open invoices, tries the 9 allocation rules,
+    writes `match_groups`/`invoice_allocations`, decrements invoice/payment
+    balances, and sets each bank row's final `recon_status`. Finishes with a
+    sweep for invoices that received no allocation at all this run (No-Payment).
+
+    Two passes, matching the prototype's own two-stage design
+    (index copy.html's arReconcile: pool resolution happens once, before its
+    per-customer `allocRules.forEach(rule => payments.forEach(...))` loop):
+
+    Pass A resolves WHICH CUSTOMER a pooled (multi-candidate) payment belongs
+    to - unchanged from the original single-pass design: try every candidate
+    through all 9 rules, first-match-wins per candidate, then compare across
+    candidates (2+ clean matches -> Double-Collision, exactly 1 -> resolved,
+    0 -> left unresolved). This is a "which identity" question, orthogonal to
+    invoice selection, so it keeps its own logic rather than being folded
+    into Pass B.
+
+    Pass B resolves WHICH INVOICE for every payment that now has a definite
+    customer (locked outright by Phase 1a, or resolved by Pass A just above).
+    Grouped by customer, it runs **rule-outer / payment-inner**: rule 1
+    (exact-invoice-num) gets a complete pass over every one of that
+    customer's still-unresolved payments before rule 2 is tried on anyone,
+    and so on down the priority list. This is the actual fix - the previous
+    single-pass, payment-outer design let an *earlier* payment's low-priority
+    catch-all (rule 8, overpayment) permanently consume an invoice that a
+    *later* payment's higher-priority, more specific rule (rule 6, bank-fee)
+    needed, simply because it happened to be evaluated first. Every payment
+    now gets first crack at the specific/exact rules across the whole batch
+    before anyone is allowed to fall through to a generic one.
 
     Returns `payment_ledger_records` (one entry per payment processed here,
     every outcome type - committed, ambiguous, double-collision, unresolved)
@@ -256,9 +278,7 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         invoices_by_customer=invoices_by_customer, memos_by_customer=memos_by_customer,
     )
 
-    matched_minor = 0
-    exception_minor = 0
-    unapplied_minor = 0
+    money = {"matched": 0, "exception": 0, "unapplied": 0}
     counts = Counter()
     touched_invoice_ids: set[str] = set()
     flagged_invoice_ids: set[str] = set()  # already covered by their own exception - skip in the No-Payment sweep
@@ -268,126 +288,40 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     # `unapplied_minor` fields' meaning per branch below.
     payment_ledger_records: list[dict] = []
 
-    for outcome in outcomes:
-        payment_id = outcome["payment_id"]
-        bank_txn = outcome["bank_txn"]
+    async def _commit(item: dict, customer_id: str, rule: dict | None, alloc_result) -> None:
+        """Writes one committed match: match_group, invoice_allocations,
+        balance decrements, Short-Pay check, and the payment_ledger_records
+        entry. Shared by both passes (a pool that resolves to a single
+        candidate never separately commits in Pass A - it flows into Pass B
+        as an already-resolved customer, same as a payment locked outright).
+        Mutates the enclosing function's `money`/`counts`/`touched_invoice_ids`/
+        `payment_ledger_records` in place - all mutable containers, so this
+        closure needs no `nonlocal`."""
+        payment_id = item["payment_id"]
+        bank_txn = item["bank_txn"]
         bank_txn_id = bank_txn["bank_txn_id"]
         amount = bank_txn["amount_minor"]
-        candidates = [outcome["customer_id"]] if outcome["customer_id"] else outcome["candidate_pool"]
 
-        per_candidate_results = []
-        ambiguous_same_customer = None
-        for candidate_id in candidates:
-            alloc_result = None
-            fired_rule = None
-            for rule in allocation_rules:
-                rule_fn = ALLOCATION_RULES.get(rule["kind"])
-                if rule_fn is None:
-                    continue
-                alloc_result = await rule_fn({"total_received_minor": amount}, bank_txn, candidate_id, ctx, rule["config"])
-                if alloc_result.matched:
-                    fired_rule = rule
-                    break
-            if alloc_result is not None and alloc_result.ambiguous:
-                ambiguous_same_customer = (candidate_id, alloc_result)
-            elif alloc_result is not None and alloc_result.allocations:
-                per_candidate_results.append((candidate_id, fired_rule, alloc_result))
-
-        resolved_customer_id = None
-        resolved_rule = None
-        resolved_outcome = None
-
-        if len(candidates) > 1 and len(per_candidate_results) >= 2:
-            # Double-Collision: 2+ different candidates each produced a clean match.
-            detail = {"candidates": [
-                {"customer_id": cid, "invoice_ids": [a.invoice_id for a in res.allocations], "reason": res.reason}
-                for cid, _, res in per_candidate_results
-            ]}
-            await dao.insert_exception(
-                run_id=run_id, exception_type="DOUBLE_COLLISION", bank_txn_id=bank_txn_id, customer_id=None,
-                reason_code=f"{len(per_candidate_results)} candidates each produced a valid match", detail=detail,
-            )
-            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
-            exception_minor += amount
-            unapplied_minor += amount
-            counts["double_collision"] += 1
-            # customer_id=None: gl_posting.py can't credit any one customer's
-            # on-account - this goes to SUSPENSE, not ON_ACCOUNT_ADVANCE.
-            payment_ledger_records.append({
-                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": None,
-                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
-            })
-            continue
-
-        if per_candidate_results:
-            resolved_customer_id, resolved_rule, resolved_outcome = per_candidate_results[0]
-        elif ambiguous_same_customer is not None:
-            candidate_id, alloc_result = ambiguous_same_customer
-            await dao.insert_exception(
-                run_id=run_id, exception_type="MULTIPLE_INVOICE_MATCH", bank_txn_id=bank_txn_id, customer_id=candidate_id,
-                reason_code=alloc_result.reason, detail={"invoice_ids": alloc_result.ambiguous_invoice_ids},
-            )
-            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
-            flagged_invoice_ids.update(alloc_result.ambiguous_invoice_ids)
-            exception_minor += amount
-            unapplied_minor += amount
-            counts["ambiguous"] += 1
-            # customer_id IS known here (the tie is over which invoice, not
-            # which customer) - gl_posting.py credits this customer's
-            # ON_ACCOUNT_ADVANCE, not SUSPENSE.
-            payment_ledger_records.append({
-                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": candidate_id,
-                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
-            })
-            continue
-
-        if resolved_customer_id is None:
-            # Pool never resolved (0 candidates matched anything), or a
-            # locked customer had literally no open invoice to apply to.
-            # Below unapplied_tolerance_minor (config'd via the UNAPPLIED
-            # phase's threshold rule), this genuinely-unassigned amount is
-            # still tracked as unapplied but doesn't rise to a reviewable
-            # exception - the default tolerance is 0, so this is a no-op
-            # unless a definition explicitly configures a nonzero threshold.
-            if amount > unapplied_tolerance_minor:
-                await dao.insert_exception(
-                    run_id=run_id, exception_type="UNAPPLIED_CASH", bank_txn_id=bank_txn_id, customer_id=outcome["customer_id"],
-                    reason_code="no open invoice matched for any candidate", detail=None,
-                )
-                exception_minor += amount
-                counts["unresolved"] += 1
-            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
-            unapplied_minor += amount
-            # outcome["customer_id"] may itself be None (an unresolved pool)
-            # or set (a locked customer with no open invoice at all) -
-            # gl_posting.py's SUSPENSE-vs-ON_ACCOUNT_ADVANCE choice follows
-            # the same "is there a known customer_id" rule as every branch.
-            payment_ledger_records.append({
-                "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": outcome["customer_id"],
-                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
-            })
-            continue
-
-        # Committed: retroactively lock a resolved pool, write the match, apply allocations.
-        if outcome["customer_id"] is None:
-            await dao.lock_payment_customer(payment_id, resolved_customer_id, resolved_rule["rule_id"] if resolved_rule else None)
+        if item["customer_id"] is None:
+            # Retroactively lock a pool that Pass A resolved to one candidate.
+            await dao.lock_payment_customer(payment_id, customer_id, rule["rule_id"] if rule else None)
 
         match_group = await dao.insert_match_group(
-            run_id=run_id, match_type=resolved_outcome.match_type,
-            rule_id=resolved_rule["rule_id"] if resolved_rule else None,
-            confidence=resolved_rule["confidence"] if resolved_rule else None,
-            status="AUTO_MATCHED", reason=resolved_outcome.reason,
+            run_id=run_id, match_type=alloc_result.match_type,
+            rule_id=rule["rule_id"] if rule else None,
+            confidence=rule["confidence"] if rule else None,
+            status="AUTO_MATCHED", reason=alloc_result.reason,
         )
 
         cash_applied = 0
         still_open: list[str] = []
         shortfall_total_minor = 0
-        posted_allocations: list[dict] = []  # for gl_posting.py (M3) - see payment_ledger_records below
-        gap_role = GAP_ROLE_BY_RULE_KIND.get(resolved_rule["kind"]) if resolved_rule else None
-        for alloc in resolved_outcome.allocations:
+        posted_allocations: list[dict] = []
+        gap_role = GAP_ROLE_BY_RULE_KIND.get(rule["kind"]) if rule else None
+        for alloc in alloc_result.allocations:
             if alloc.cash_minor <= 0:
                 continue  # invoice_allocations.allocated_minor has CHECK(> 0) - nothing real moved, nothing to record
-            invoice = next(i for i in invoices_by_customer[resolved_customer_id] if i["invoice_id"] == alloc.invoice_id)
+            invoice = next(i for i in invoices_by_customer[customer_id] if i["invoice_id"] == alloc.invoice_id)
             close_amount = invoice["balance_due_minor"] if alloc.close_full else alloc.cash_minor
             await dao.apply_invoice_allocation(alloc.invoice_id, close_amount)
             await dao.insert_invoice_allocation(
@@ -404,12 +338,13 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             cash_applied += alloc.cash_minor
             if invoice["balance_due_minor"] <= 0:
                 # Remove it from the in-memory working set now, not just in
-                # the DB - otherwise a later payment in this same run can
-                # still "find" it via invoice-number/truncated-suffix match
-                # (neither rule checks balance > 0) and produce a
-                # zero-amount allocation, which the CHECK constraint rejects.
-                invoices_by_customer[resolved_customer_id] = [
-                    i for i in invoices_by_customer[resolved_customer_id] if i["invoice_id"] != alloc.invoice_id
+                # the DB - otherwise a later rule pass (or a later payment
+                # within the same rule pass) can still "find" it via
+                # invoice-number/truncated-suffix match (neither rule checks
+                # balance > 0) and produce a zero-amount allocation, which
+                # the CHECK constraint rejects.
+                invoices_by_customer[customer_id] = [
+                    i for i in invoices_by_customer[customer_id] if i["invoice_id"] != alloc.invoice_id
                 ]
             else:
                 still_open.append(alloc.invoice_id)  # recorded here, not re-looked-up below - it may since have been removed from the list above
@@ -428,28 +363,158 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         if still_open:
             if shortfall_total_minor > short_pay_tolerance_minor:
                 await dao.insert_exception(
-                    run_id=run_id, exception_type="SHORT_PAY", bank_txn_id=bank_txn_id, customer_id=resolved_customer_id,
+                    run_id=run_id, exception_type="SHORT_PAY", bank_txn_id=bank_txn_id, customer_id=customer_id,
                     reason_code=f"payment left {len(still_open)} invoice(s) with a remaining balance", detail={
                         "invoice_ids": still_open, "shortfall_minor": shortfall_total_minor, "tolerance_minor": short_pay_tolerance_minor,
                     },
                     match_group_id=match_group["match_group_id"],
                 )
-                exception_minor += amount
+                money["exception"] += amount
                 counts["short_pay"] += 1
             else:
-                matched_minor += amount
+                money["matched"] += amount
                 counts["matched"] += 1
             await dao.mark_bank_statement_status(bank_txn_id, "PARTIAL")
         else:
             await dao.mark_bank_statement_status(bank_txn_id, "MATCHED")
-            matched_minor += amount
+            money["matched"] += amount
             counts["matched"] += 1
 
-        unapplied_minor += max(0, leftover)
+        money["unapplied"] += max(0, leftover)
         payment_ledger_records.append({
-            "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": resolved_customer_id,
+            "payment_id": payment_id, "bank_txn_id": bank_txn_id, "customer_id": customer_id,
             "currency": bank_txn["currency"], "unapplied_minor": max(0, leftover), "allocations": posted_allocations,
         })
+
+    async def _unapplied(item: dict, customer_id: str | None) -> None:
+        """Nothing ever matched this payment - to any candidate (pool never
+        resolved) or to any open invoice of its one known customer. Same
+        UNAPPLIED_CASH treatment either way; only whether `customer_id` is
+        set determines SUSPENSE vs ON_ACCOUNT_ADVANCE downstream in
+        gl_posting.py."""
+        bank_txn = item["bank_txn"]
+        bank_txn_id = bank_txn["bank_txn_id"]
+        amount = bank_txn["amount_minor"]
+        if amount > unapplied_tolerance_minor:
+            await dao.insert_exception(
+                run_id=run_id, exception_type="UNAPPLIED_CASH", bank_txn_id=bank_txn_id, customer_id=customer_id,
+                reason_code="no open invoice matched for any candidate", detail=None,
+            )
+            money["exception"] += amount
+            counts["unresolved"] += 1
+        await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
+        money["unapplied"] += amount
+        payment_ledger_records.append({
+            "payment_id": item["payment_id"], "bank_txn_id": bank_txn_id, "customer_id": customer_id,
+            "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+        })
+
+    # --- Pass A: resolve WHICH CUSTOMER, pooled payments only. A locked
+    # payment (single candidate) already has its answer and skips straight
+    # into `pending` for Pass B - probing rules for it here would be
+    # redundant and, worse, would let it claim an invoice before Pass B's
+    # priority-ordered, whole-batch pass even starts.
+    pending: list[tuple[dict, str]] = []  # (item, resolved_customer_id) for Pass B
+    for outcome in outcomes:
+        candidates = [outcome["customer_id"]] if outcome["customer_id"] else outcome["candidate_pool"]
+        if len(candidates) == 1:
+            pending.append((outcome, candidates[0]))
+            continue
+
+        bank_txn = outcome["bank_txn"]
+        amount = bank_txn["amount_minor"]
+        per_candidate_matches: list[str] = []
+        for candidate_id in candidates:
+            alloc_result = None
+            for rule in allocation_rules:
+                rule_fn = ALLOCATION_RULES.get(rule["kind"])
+                if rule_fn is None:
+                    continue
+                alloc_result = await rule_fn({"total_received_minor": amount}, bank_txn, candidate_id, ctx, rule["config"])
+                if alloc_result.matched:
+                    break
+            if alloc_result is not None and alloc_result.allocations and not alloc_result.ambiguous:
+                per_candidate_matches.append(candidate_id)
+
+        if len(per_candidate_matches) >= 2:
+            # Double-Collision: 2+ different candidates each produced a clean match.
+            detail = {"candidates": [{"customer_id": cid} for cid in per_candidate_matches]}
+            await dao.insert_exception(
+                run_id=run_id, exception_type="DOUBLE_COLLISION", bank_txn_id=bank_txn["bank_txn_id"], customer_id=None,
+                reason_code=f"{len(per_candidate_matches)} candidates each produced a valid match", detail=detail,
+            )
+            await dao.mark_bank_statement_status(bank_txn["bank_txn_id"], "EXCEPTION")
+            money["exception"] += amount
+            money["unapplied"] += amount
+            counts["double_collision"] += 1
+            # customer_id=None: gl_posting.py can't credit any one customer's
+            # on-account - this goes to SUSPENSE, not ON_ACCOUNT_ADVANCE.
+            payment_ledger_records.append({
+                "payment_id": outcome["payment_id"], "bank_txn_id": bank_txn["bank_txn_id"], "customer_id": None,
+                "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+            })
+            continue
+
+        if len(per_candidate_matches) == 1:
+            pending.append((outcome, per_candidate_matches[0]))
+            continue
+
+        # 0 candidates matched anything at Pass A's probe - still let Pass B
+        # have a real, whole-batch-priority-ordered try (a sibling payment
+        # closing an invoice first shouldn't be the reason a pool never even
+        # got a fair shot) before giving up as UNAPPLIED_CASH.
+        pending.append((outcome, None))
+
+    # --- Pass B: rule-outer / payment-inner, grouped by resolved customer.
+    by_customer: dict[str, list[dict]] = defaultdict(list)
+    no_customer: list[dict] = []
+    for item, customer_id in pending:
+        if customer_id is None:
+            no_customer.append(item)
+        else:
+            by_customer[customer_id].append(item)
+
+    for customer_id, items in by_customer.items():
+        remaining = items  # preserves `outcomes`' original (transaction_date) order
+        for rule in allocation_rules:
+            rule_fn = ALLOCATION_RULES.get(rule["kind"])
+            if rule_fn is None or not remaining:
+                continue
+            still_remaining = []
+            for item in remaining:
+                bank_txn = item["bank_txn"]
+                amount = bank_txn["amount_minor"]
+                alloc_result = await rule_fn({"total_received_minor": amount}, bank_txn, customer_id, ctx, rule["config"])
+                if alloc_result.ambiguous:
+                    # MULTIPLE_INVOICE_MATCH - same customer, 2+ equally-valid
+                    # invoices at this rule; don't guess, don't retry lower
+                    # priority rules for it either (a weaker rule "resolving"
+                    # what a stronger rule refused to guess would be worse).
+                    await dao.insert_exception(
+                        run_id=run_id, exception_type="MULTIPLE_INVOICE_MATCH", bank_txn_id=bank_txn["bank_txn_id"], customer_id=customer_id,
+                        reason_code=alloc_result.reason, detail={"invoice_ids": alloc_result.ambiguous_invoice_ids},
+                    )
+                    await dao.mark_bank_statement_status(bank_txn["bank_txn_id"], "EXCEPTION")
+                    flagged_invoice_ids.update(alloc_result.ambiguous_invoice_ids)
+                    money["exception"] += amount
+                    money["unapplied"] += amount
+                    counts["ambiguous"] += 1
+                    payment_ledger_records.append({
+                        "payment_id": item["payment_id"], "bank_txn_id": bank_txn["bank_txn_id"], "customer_id": customer_id,
+                        "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+                    })
+                    continue
+                if alloc_result.allocations:
+                    await _commit(item, customer_id, rule, alloc_result)
+                    continue
+                still_remaining.append(item)
+            remaining = still_remaining
+        # Nothing in `remaining` matched any of the 9 rules for this customer.
+        for item in remaining:
+            await _unapplied(item, customer_id)
+
+    for item in no_customer:
+        await _unapplied(item, None)
 
     # No-Payment sweep: open invoices nothing in this run touched or flagged at all.
     no_payment_count = 0
@@ -466,9 +531,9 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     return {
         "matched_count": counts["matched"],
         "exception_count": counts["short_pay"] + counts["ambiguous"] + counts["double_collision"] + counts["unresolved"] + no_payment_count,
-        "matched_value_minor": matched_minor,
-        "exception_value_minor": exception_minor,
-        "unapplied_minor": unapplied_minor,
+        "matched_value_minor": money["matched"],
+        "exception_value_minor": money["exception"],
+        "unapplied_minor": money["unapplied"],
         "unresolved_pool_count": counts["ambiguous"] + counts["double_collision"] + counts["unresolved"],
         # M3: gl_posting.py's single source of truth for what to post - one
         # entry per payment processed this phase, every outcome type included.

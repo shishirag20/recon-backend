@@ -23,6 +23,7 @@ TRANSFORMS = (
     "PARSE_DATE",
     "REGEX",
     "PARSE_BOOL",
+    "TO_DECIMAL",
 )
 
 _DEFAULT_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y")
@@ -102,6 +103,14 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
         if text in _FALSE_VALUES:
             return False
         raise ValueError(f"not a recognized boolean: {raw_value!r}")
+
+    if transform == "TO_DECIMAL":
+        # A numeric-typed canonical column that isn't money (e.g.
+        # invoices.tds_rate_pct, a percentage) - needs a real Decimal at
+        # face value, no *100 scaling (that's TO_MINOR_UNITS' job) and no
+        # raw string (asyncpg doesn't coerce a str for a numeric column,
+        # same reasoning as PARSE_BOOL above).
+        return _clean_decimal(raw_value)
 
     raise AssertionError("unreachable")  # every TRANSFORMS value is handled above
 

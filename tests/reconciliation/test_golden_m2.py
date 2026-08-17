@@ -351,3 +351,67 @@ class TestPhase2Allocation:
         inv114 = await _invoice(conn, golden["invoices"]["114"])
         inv115 = await _invoice(conn, golden["invoices"]["115"])
         assert inv114["status"] == "OPEN" and inv115["status"] == "OPEN"
+
+
+class TestPhase2AllocationOrdering:
+    """Regression coverage for the rule-outer/payment-inner restructuring of
+    run_phase_2: a low-priority catch-all rule (overpayment, priority 8) on
+    an *earlier* payment must not be allowed to consume an invoice that a
+    *later* payment's higher-priority, more specific rule (bank-fee,
+    priority 6) needs - simply because it happened to be evaluated first.
+
+    Deliberately a separate, minimal fixture rather than reusing `golden`:
+    the shared fixture's Bright Textiles rows (BANK-002/003/004/014) don't
+    actually exercise this bug, because BANK-002 correctly matches INV-102
+    via the (higher-priority) TDS rule and so never touches the invoice
+    BANK-004's fee-match needs - the starvation this test targets requires
+    the *first* payment to have no exact/fee/TDS match of its own, only an
+    overpayment-fallback one that happens to land on the same invoice a
+    later payment needs precisely.
+    """
+
+    async def test_bank_fee_match_not_starved_by_earlier_overpayment(self, conn):
+        entity_id = await _seed_entity(conn)
+        customer_id = await _seed_customer(conn, entity_id, code="CUST-901", name="Ordering Test Co")
+
+        inv_a = await _seed_invoice(conn, entity_id, customer_id, number="INV-A", issue="2026-07-01", due="2026-07-31", total_minor=600000)
+        inv_b = await _seed_invoice(conn, entity_id, customer_id, number="INV-B", issue="2026-07-01", due="2026-07-31", total_minor=300000)
+
+        # Processed first (transaction_date order): no exact/fee match against
+        # either invoice - only overpayment's "closest fully-payable invoice"
+        # fallback applies, and INV-A (excess 3500) is closer than INV-B
+        # (excess 6500), so the old payment-outer design would let this one
+        # grab INV-A immediately.
+        payment1 = await _seed_bank_txn(
+            conn, entity_id, ref="ORD-001", payer="Ordering Test Co", narration="GENERIC SETTLEMENT",
+            amount_minor=950000, txn_date="2026-07-03",
+        )
+        # Processed second: designed to match INV-A *exactly* via the
+        # bank-fee rule (balance 600000 - amount 598000 == fee 2000) - a
+        # higher-priority rule than overpayment, so it should win INV-A
+        # regardless of processing order.
+        payment2 = await _seed_bank_txn(
+            conn, entity_id, ref="ORD-002", payer="Ordering Test Co", narration="FEE ADJUSTED PAYMENT",
+            amount_minor=598000, explicit_fee_minor=2000, txn_date="2026-07-06",
+        )
+
+        dao = ReconciliationDAO(conn)
+        definition = await dao.insert_definition(entity_id=entity_id, name="Ordering Test (pytest)", recon_type="AR", cadence=None, owner_user_id=None)
+        await dao.insert_rules_bulk(definition["definition_id"], list(DEFAULT_AR_RULE_CATALOG))
+        await dao.seed_gl_account_roles(entity_id)
+        run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-ORDERING", period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+        run_context = await dao.get_run_context(run["run_id"])
+        await engine.run(conn, dao, run["run_id"], run_context)
+
+        inv_a_after = await _invoice(conn, inv_a)
+        inv_b_after = await _invoice(conn, inv_b)
+        assert inv_a_after["status"] == "PAID" and inv_a_after["balance_due_minor"] == 0, "INV-A should be closed by payment2's exact bank-fee match, not payment1's overpayment fallback"
+        assert inv_b_after["status"] == "PAID" and inv_b_after["balance_due_minor"] == 0, "INV-B should be closed by payment1's overpayment fallback, once INV-A is correctly out of the running"
+
+        pay1 = await _payment_for(conn, payment1)
+        pay2 = await _payment_for(conn, payment2)
+        assert pay1["unapplied_minor"] == 650000, "payment1 should settle INV-B (300000) with 650000 excess on-account, not INV-A"
+        assert pay2["unapplied_minor"] == 0, "payment2 should cleanly close INV-A via its fee match, no leftover"
+
+        alloc2 = await conn.fetchrow("SELECT invoice_id FROM invoice_allocations WHERE payment_id = $1", pay2["payment_id"])
+        assert str(alloc2["invoice_id"]) == inv_a, "payment2 must be the one that settled INV-A"

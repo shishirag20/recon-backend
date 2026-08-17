@@ -138,9 +138,13 @@ class RunOut(BaseModel):
 class AllocationOut(BaseModel):
     allocation_id: UUID
     invoice_id: UUID
+    invoice_number: str | None = Field(description="The real, human-readable invoice number (invoices.invoice_number) - invoice_id is the internal row UUID.")
+    invoice_amount_minor: int | None = Field(description="The invoice's own total (invoices.total_amount_minor) - what was owed, not necessarily what this allocation actually applied.")
     payment_id: UUID
+    payment_amount_minor: int | None = Field(description="The payment's own total received (payments.total_received_minor) - what the bank transaction actually brought in, which may exceed or fall short of allocated_minor (overpayment/short-pay/fee cases).")
     bank_txn_id: UUID | None
-    allocated_minor: int
+    bank_reference: str | None = Field(description="The real bank reference/UTR from the source file (bank_statements.bank_reference) - bank_txn_id is the internal generated row UUID.")
+    allocated_minor: int = Field(description="How much of this payment was actually applied to this invoice - may differ from both invoice_amount_minor and payment_amount_minor.")
 
 
 class MatchGroupOut(BaseModel):

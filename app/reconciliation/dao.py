@@ -618,10 +618,17 @@ class ReconciliationDAO:
             "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
             "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS locked_by_rule_id, "
             "COALESCE(json_agg(json_build_object("
-            "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'payment_id', a.payment_id, "
-            "  'bank_txn_id', a.bank_txn_id, 'allocated_minor', a.allocated_minor"
+            "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'invoice_number', inv.invoice_number, "
+            "  'invoice_amount_minor', inv.total_amount_minor, "
+            "  'payment_id', a.payment_id, 'payment_amount_minor', p.total_received_minor, "
+            "  'bank_txn_id', a.bank_txn_id, 'bank_reference', bs.bank_reference, "
+            "  'allocated_minor', a.allocated_minor"
             ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
-            "FROM match_groups m LEFT JOIN invoice_allocations a ON a.match_group_id = m.match_group_id "
+            "FROM match_groups m "
+            "LEFT JOIN invoice_allocations a ON a.match_group_id = m.match_group_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = a.invoice_id "
+            "LEFT JOIN payments p ON p.payment_id = a.payment_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = a.bank_txn_id "
             "WHERE m.run_id = $1 GROUP BY m.match_group_id ORDER BY m.created_at",
             run_id,
         )
