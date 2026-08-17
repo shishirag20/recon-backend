@@ -225,12 +225,32 @@ class TestPhase1Identification:
             assert any(e["exception_type"] == "DUPLICATE" for e in exceptions)
             assert await _payment_for(conn, golden["bank"][key]) is None
 
-    async def test_halcyon_and_meridian_pool_then_resolve_in_phase2(self, conn, golden):
+    async def test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched(self, conn, golden):
+        """Matches the prototype exactly (index copy.html's exactAmountRule
+        probe): a candidate pool that resolves to exactly one customer with a
+        clean exact-amount hit is still only a *suggestion* - it must raise
+        Suspense for a human to confirm, never auto-commit a match_group or
+        lock the payment's customer_id, no matter how clean the hit looks."""
         await _run_full_reconciliation(conn, golden["entity_id"])
+
         halcyon_payment = await _payment_for(conn, golden["bank"]["011"])
-        assert str(halcyon_payment["customer_id"]) == golden["customers"]["halcyon"], "single-candidate pool should resolve via Phase 2"
+        assert halcyon_payment["customer_id"] is None, "a pool resolution must never lock the payment's customer"
+        halcyon_exceptions = await _exceptions_for(conn, golden["bank"]["011"])
+        assert any(e["exception_type"] == "SUSPENSE" for e in halcyon_exceptions)
+        halcyon_suspense = next(e for e in halcyon_exceptions if e["exception_type"] == "SUSPENSE")
+        assert halcyon_suspense["detail"]["suggested_customer_id"] == golden["customers"]["halcyon"]
+        assert halcyon_suspense["detail"]["suggested_invoice_ids"] == [golden["invoices"]["112"]]
+
         meridian_payment = await _payment_for(conn, golden["bank"]["012"])
-        assert str(meridian_payment["customer_id"]) == golden["customers"]["meridian"]
+        assert meridian_payment["customer_id"] is None
+        meridian_exceptions = await _exceptions_for(conn, golden["bank"]["012"])
+        assert any(e["exception_type"] == "SUSPENSE" for e in meridian_exceptions)
+        meridian_suspense = next(e for e in meridian_exceptions if e["exception_type"] == "SUSPENSE")
+        assert meridian_suspense["detail"]["suggested_customer_id"] == golden["customers"]["meridian"]
+
+        inv112 = await _invoice(conn, golden["invoices"]["112"])
+        inv113 = await _invoice(conn, golden["invoices"]["113"])
+        assert inv112["status"] == "OPEN" and inv113["status"] == "OPEN", "the suggested invoices must stay untouched until confirmed"
 
     async def test_bank_018_suspense(self, conn, golden):
         await _run_full_reconciliation(conn, golden["entity_id"])
@@ -261,7 +281,12 @@ class TestPhase2Allocation:
         # INV-101 is deliberately excluded here: Acme's own payment (BANK-001)
         # never locks at all (see test_acme_flagged_duplicate_not_locked), so
         # it's covered separately by test_acme_invoice_101_unpaid_due_to_duplicate_fixture_bug.
-        for key in ("111", "112", "113"):
+        # INV-112/113 (Halcyon/Meridian) are also excluded - BANK-011/012 only
+        # ever reach a candidate *pool*, never a Phase 1a lock, so per
+        # test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched
+        # they now correctly stay OPEN pending human confirmation instead of
+        # auto-settling here.
+        for key in ("111",):
             inv = await _invoice(conn, golden["invoices"][key])
             assert inv["status"] == "PAID" and inv["balance_due_minor"] == 0, f"INV-{key} should be exactly settled"
 
@@ -351,3 +376,67 @@ class TestPhase2Allocation:
         inv114 = await _invoice(conn, golden["invoices"]["114"])
         inv115 = await _invoice(conn, golden["invoices"]["115"])
         assert inv114["status"] == "OPEN" and inv115["status"] == "OPEN"
+
+
+class TestPhase2AllocationOrdering:
+    """Regression coverage for the rule-outer/payment-inner restructuring of
+    run_phase_2: a low-priority catch-all rule (overpayment, priority 8) on
+    an *earlier* payment must not be allowed to consume an invoice that a
+    *later* payment's higher-priority, more specific rule (bank-fee,
+    priority 6) needs - simply because it happened to be evaluated first.
+
+    Deliberately a separate, minimal fixture rather than reusing `golden`:
+    the shared fixture's Bright Textiles rows (BANK-002/003/004/014) don't
+    actually exercise this bug, because BANK-002 correctly matches INV-102
+    via the (higher-priority) TDS rule and so never touches the invoice
+    BANK-004's fee-match needs - the starvation this test targets requires
+    the *first* payment to have no exact/fee/TDS match of its own, only an
+    overpayment-fallback one that happens to land on the same invoice a
+    later payment needs precisely.
+    """
+
+    async def test_bank_fee_match_not_starved_by_earlier_overpayment(self, conn):
+        entity_id = await _seed_entity(conn)
+        customer_id = await _seed_customer(conn, entity_id, code="CUST-901", name="Ordering Test Co")
+
+        inv_a = await _seed_invoice(conn, entity_id, customer_id, number="INV-A", issue="2026-07-01", due="2026-07-31", total_minor=600000)
+        inv_b = await _seed_invoice(conn, entity_id, customer_id, number="INV-B", issue="2026-07-01", due="2026-07-31", total_minor=300000)
+
+        # Processed first (transaction_date order): no exact/fee match against
+        # either invoice - only overpayment's "closest fully-payable invoice"
+        # fallback applies, and INV-A (excess 3500) is closer than INV-B
+        # (excess 6500), so the old payment-outer design would let this one
+        # grab INV-A immediately.
+        payment1 = await _seed_bank_txn(
+            conn, entity_id, ref="ORD-001", payer="Ordering Test Co", narration="GENERIC SETTLEMENT",
+            amount_minor=950000, txn_date="2026-07-03",
+        )
+        # Processed second: designed to match INV-A *exactly* via the
+        # bank-fee rule (balance 600000 - amount 598000 == fee 2000) - a
+        # higher-priority rule than overpayment, so it should win INV-A
+        # regardless of processing order.
+        payment2 = await _seed_bank_txn(
+            conn, entity_id, ref="ORD-002", payer="Ordering Test Co", narration="FEE ADJUSTED PAYMENT",
+            amount_minor=598000, explicit_fee_minor=2000, txn_date="2026-07-06",
+        )
+
+        dao = ReconciliationDAO(conn)
+        definition = await dao.insert_definition(entity_id=entity_id, name="Ordering Test (pytest)", recon_type="AR", cadence=None, owner_user_id=None)
+        await dao.insert_rules_bulk(definition["definition_id"], list(DEFAULT_AR_RULE_CATALOG))
+        await dao.seed_gl_account_roles(entity_id)
+        run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-ORDERING", period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+        run_context = await dao.get_run_context(run["run_id"])
+        await engine.run(conn, dao, run["run_id"], run_context)
+
+        inv_a_after = await _invoice(conn, inv_a)
+        inv_b_after = await _invoice(conn, inv_b)
+        assert inv_a_after["status"] == "PAID" and inv_a_after["balance_due_minor"] == 0, "INV-A should be closed by payment2's exact bank-fee match, not payment1's overpayment fallback"
+        assert inv_b_after["status"] == "PAID" and inv_b_after["balance_due_minor"] == 0, "INV-B should be closed by payment1's overpayment fallback, once INV-A is correctly out of the running"
+
+        pay1 = await _payment_for(conn, payment1)
+        pay2 = await _payment_for(conn, payment2)
+        assert pay1["unapplied_minor"] == 650000, "payment1 should settle INV-B (300000) with 650000 excess on-account, not INV-A"
+        assert pay2["unapplied_minor"] == 0, "payment2 should cleanly close INV-A via its fee match, no leftover"
+
+        alloc2 = await conn.fetchrow("SELECT invoice_id FROM invoice_allocations WHERE payment_id = $1", pay2["payment_id"])
+        assert str(alloc2["invoice_id"]) == inv_a, "payment2 must be the one that settled INV-A"

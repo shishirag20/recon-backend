@@ -26,7 +26,9 @@ _TRANSFORM_DESCRIPTION = (
     "PARSE_DATE (transform_param is a comma-separated list of strptime formats to try in order), "
     "REGEX (transform_param is a pattern with one capture group; the group's text is returned), "
     "PARSE_BOOL (true/false/1/0/yes/no, case-insensitive -> a real bool; use for a boolean-typed "
-    "canonical column like is_bank_charge, since TRIM leaves it a string and asyncpg rejects that). "
+    "canonical column like is_bank_charge, since TRIM leaves it a string and asyncpg rejects that), "
+    "TO_DECIMAL (parse a decimal at face value, no scaling - use for a numeric-typed canonical "
+    "column that isn't money, like invoices.tds_rate_pct, since TRIM leaves it a string too). "
     "See app/datahub/transforms.py for the reference implementation - this is the exact "
     "code path both /field-mappings/preview and the ingestion worker call, so a mapping "
     "that previews cleanly will ingest identically."
@@ -67,7 +69,8 @@ class DataSourceOut(BaseModel):
 class FieldMappingIn(BaseModel):
     source_field: str = Field(min_length=1, description="Column name as it appears in the raw uploaded file.")
     canonical_field: str = Field(
-        min_length=1,
+        default="",
+        min_length=0,
         description=(
             "Target column on the stream's canonical table. BANK: transaction_date, currency, "
             "amount_minor, amount_home_minor, dr_cr, bank_reference, narration, payer_name, ... "
@@ -83,6 +86,7 @@ class FieldMappingIn(BaseModel):
 
 
 class FieldMappingOut(FieldMappingIn):
+    canonical_field: str = Field(default="", min_length=0)
     mapping_id: UUID
     stream: str = Field(description="BANK, INVOICE, CUSTOMER, ... - mappings are shared globally per stream, not per data source.")
     version: int = Field(description="Mapping sets are versioned; only one version per stream is is_active at a time.")
@@ -182,6 +186,29 @@ class ResolvedHeader(BaseModel):
 
 class ResolveHeadersResponse(BaseModel):
     results: list[ResolvedHeader]
+
+
+class ResolveMappingRequest(BaseModel):
+    headers: list[str] = Field(
+        min_length=1,
+        description="Raw column headers from an actual file - read client-side before upload.",
+    )
+
+
+class ResolvedFieldMapping(BaseModel):
+    source_field: str
+    canonical_field: str | None = None
+    transform: str = "NONE"
+    transform_param: str | None = None
+    is_matched: bool = Field(
+        description="Whether this source field was matched to an existing synonym in the active mapping."
+    )
+
+
+class ResolveMappingResponse(BaseModel):
+    stream: str
+    canonical_fields: list[str]
+    mappings: list[ResolvedFieldMapping]
 
 
 class CanonicalFieldsResponse(BaseModel):

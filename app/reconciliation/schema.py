@@ -70,6 +70,19 @@ class MatcherCatalogResponse(BaseModel):
     bank_fields: list[str] = Field(description="Valid config.bank_field values - direct bank_statements columns, plus extract:vpa/gstin/pan sentinels.")
 
 
+class AlgorithmInfo(BaseModel):
+    name: str = Field(description="Technical/callable name - a MATCHER_REGISTRY key for category='matcher', a function name in generic_functions.py for category='generic_function'.")
+    category: str = Field(description="'matcher' (usable today via kind='field-match') or 'generic_function' (standalone, not wired into any rule yet).")
+    label: str
+    description: str
+    action_verb: str | None = Field(default=None, description="UI action verb, only set for generic_function entries.")
+    wired: bool = Field(description="True if this algorithm is actually reachable from a real reconciliation run today.")
+
+
+class AlgorithmCatalogResponse(BaseModel):
+    algorithms: list[AlgorithmInfo]
+
+
 class RuleCreate(BaseModel):
     phase: str = Field(description="One of RECON_PHASES, e.g. 'CUSTOMER_LOCK'.")
     kind: str = Field(description="Must already be registered for `phase` - GET .../rules to see what's seeded. 'field-match' composes a new identification/pooling rule from an existing matcher, no code change needed - see the config fields below.")
@@ -125,16 +138,21 @@ class RunOut(BaseModel):
 class AllocationOut(BaseModel):
     allocation_id: UUID
     invoice_id: UUID
+    invoice_number: str | None = Field(description="The real, human-readable invoice number (invoices.invoice_number) - invoice_id is the internal row UUID.")
+    invoice_amount_minor: int | None = Field(description="The invoice's own total (invoices.total_amount_minor) - what was owed, not necessarily what this allocation actually applied.")
     payment_id: UUID
+    payment_amount_minor: int | None = Field(description="The payment's own total received (payments.total_received_minor) - what the bank transaction actually brought in, which may exceed or fall short of allocated_minor (overpayment/short-pay/fee cases).")
     bank_txn_id: UUID | None
-    allocated_minor: int
+    bank_reference: str | None = Field(description="The real bank reference/UTR from the source file (bank_statements.bank_reference) - bank_txn_id is the internal generated row UUID.")
+    allocated_minor: int = Field(description="How much of this payment was actually applied to this invoice - may differ from both invoice_amount_minor and payment_amount_minor.")
 
 
 class MatchGroupOut(BaseModel):
     match_group_id: UUID
     run_id: UUID
     match_type: str = Field(description="EXACT | TOLERANCE | PARTIAL | SUBSET_SUM | MANY_TO_ONE | ONE_TO_MANY | MANUAL")
-    rule_id: UUID | None
+    rule_id: UUID | None = Field(description="The ALLOCATION-phase rule that committed this match group.")
+    locked_by_rule_id: UUID | None = Field(description="The CUSTOMER_LOCK-phase rule that identified the payment's customer.")
     confidence: int | None
     status: str = Field(description="AUTO_MATCHED | SUGGESTED | CONFIRMED | REJECTED")
     reason: str | None
@@ -148,24 +166,29 @@ class MatchGroupOut(BaseModel):
 class ExceptionOut(BaseModel):
     exception_id: UUID
     run_id: UUID
-    exception_no: str | None
+    exception_no: str | None = None
     exception_type: str = Field(
         description="SHORT_PAY | OVERPAYMENT | UNAPPLIED_CASH | TIMING_DIFFERENCE | GL_VARIANCE | DUPLICATE | "
         "MULTIPLE_INVOICE_MATCH | DOUBLE_COLLISION | SUSPENSE | BANK_CHARGE | GATEWAY_VARIANCE | NO_PAYMENT"
     )
-    bank_txn_id: UUID | None
-    invoice_id: UUID | None
-    customer_id: UUID | None
-    discrepancy_minor: int | None
-    reason_code: str | None
+    bank_txn_id: UUID | None = None
+    invoice_id: UUID | None = None
+    customer_id: UUID | None = None
+    customer_name: str | None = Field(default=None, description="Human-readable customer/remitter name.")
+    customer_code: str | None = None
+    invoice_number: str | None = None
+    bank_reference: str | None = None
+    discrepancy_minor: int | None = None
+    amount_minor: int | None = None
+    reason_code: str | None = None
     status: str = Field(description="OPEN | INVESTIGATING | RESOLVED | AUTO_RESOLVED | DEFERRED | WRITTEN_OFF | ADJUSTED | CARRIED_FORWARD")
-    resolution_outcome: str | None = Field(description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
-    resolver_id: UUID | None
-    resolution_notes: str | None
-    resolved_at: datetime | None
+    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT")
+    resolver_id: UUID | None = None
+    resolution_notes: str | None = None
+    resolved_at: datetime | None = None
     created_at: datetime
-    detail: dict | None = Field(description="Candidate lists for MULTIPLE_INVOICE_MATCH/DOUBLE_COLLISION; variance breakdown for GL_VARIANCE.")
-    match_group_id: UUID | None
+    detail: dict | None = Field(default=None, description="Candidate lists for MULTIPLE_INVOICE_MATCH/DOUBLE_COLLISION; variance breakdown for GL_VARIANCE.")
+    match_group_id: UUID | None = None
 
     model_config = {"from_attributes": True}
 

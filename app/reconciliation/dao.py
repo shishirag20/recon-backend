@@ -15,14 +15,10 @@ Phase-2 working set (open invoices, open memos) and writing
 resolving a Phase-1b pool (`lock_payment_customer`). The queue claim/
 heartbeat/complete/fail SQL lives in app/workers/reconciliation_worker.py
 itself, not here - same split as app/workers/ingestion_worker.py's
-`_CLAIM_SQL` etc., which aren't in DataHubDAO either. M3 adds: resolving
-GL role -> gl_account_id, writing balanced `gl_journal_entries`/
-`gl_journal_lines`, the standalone-bank-charge query, the SL-vs-GL control
-proof (`sum_open_ar_balance` vs `get_gl_control_balance`), and match/
-exception review + resolution (`list_match_groups_for_run`,
-`list_exceptions_for_run`, `update_exception`). Sign-off/audit land in M4 -
-see the milestone map in router.py.
+`_CLAIM_SQL` etc., which aren't in DataHubDAO either. `gl_journal_entries`
+writes land in M3 - see the milestone map in router.py.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -47,18 +43,30 @@ class ReconciliationDAO:
 
     # -- entities (read-only sanity check, same pattern as DataHubDAO) ----------
     async def entity_exists(self, entity_id: str) -> bool:
-        row = await self.conn.fetchrow("SELECT 1 FROM entities WHERE entity_id = $1", entity_id)
+        row = await self.conn.fetchrow(
+            "SELECT 1 FROM entities WHERE entity_id = $1", entity_id
+        )
         return row is not None
 
     # -- reconciliation_definitions ----------------------------------------------
     async def insert_definition(
-        self, *, entity_id: str, name: str, recon_type: str, cadence: str | None, owner_user_id: str | None
+        self,
+        *,
+        entity_id: str,
+        name: str,
+        recon_type: str,
+        cadence: str | None,
+        owner_user_id: str | None,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO reconciliation_definitions (definition_id, entity_id, name, recon_type, cadence, owner_user_id) "
             "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) "
             "RETURNING definition_id, entity_id, name, recon_type, cadence, owner_user_id",
-            entity_id, name, recon_type, cadence, owner_user_id,
+            entity_id,
+            name,
+            recon_type,
+            cadence,
+            owner_user_id,
         )
         return _row(row)
 
@@ -79,7 +87,9 @@ class ReconciliationDAO:
         return _rows(rows)
 
     # -- reconciliation_rules ------------------------------------------------------
-    async def insert_rules_bulk(self, definition_id: str, rules: list[tuple]) -> list[dict]:
+    async def insert_rules_bulk(
+        self, definition_id: str, rules: list[tuple]
+    ) -> list[dict]:
         """`rules` is a list of (phase, kind, name, priority, confidence, config)
         tuples - see constants.DEFAULT_AR_RULE_CATALOG for the shape."""
         out = []
@@ -89,7 +99,13 @@ class ReconciliationDAO:
                 "(rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config) "
                 "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true, $6, $7::jsonb) "
                 "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
-                definition_id, phase, kind, name, priority, confidence, config,
+                definition_id,
+                phase,
+                kind,
+                name,
+                priority,
+                confidence,
+                config,
             )
             out.append(_row(row))
         return out
@@ -129,12 +145,16 @@ class ReconciliationDAO:
         )
         return _row(row)
 
-    async def update_rule(self, rule_id: str, *, enabled: bool | None, config: dict | None) -> dict | None:
+    async def update_rule(
+        self, rule_id: str, *, enabled: bool | None, config: dict | None
+    ) -> dict | None:
         row = await self.conn.fetchrow(
             "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), config = COALESCE($3::jsonb, config) "
             "WHERE rule_id = $1 "
             "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
-            rule_id, enabled, config,
+            rule_id,
+            enabled,
+            config,
         )
         return _row(row)
 
@@ -147,20 +167,31 @@ class ReconciliationDAO:
         per definition creation - without duplicating rows."""
         out = []
         async with self.conn.transaction():
-            for role_code, (account_code, account_name, account_type, normal_balance) in GL_ROLE_DEFAULTS.items():
+            for role_code, (
+                account_code,
+                account_name,
+                account_type,
+                normal_balance,
+            ) in GL_ROLE_DEFAULTS.items():
                 gl_account = await self.conn.fetchrow(
                     "INSERT INTO gl_accounts (gl_account_id, entity_id, account_code, account_name, account_type, normal_balance) "
                     "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) "
                     "ON CONFLICT (entity_id, account_code) DO UPDATE SET account_code = EXCLUDED.account_code "
                     "RETURNING gl_account_id",
-                    entity_id, account_code, account_name, account_type, normal_balance,
+                    entity_id,
+                    account_code,
+                    account_name,
+                    account_type,
+                    normal_balance,
                 )
                 row = await self.conn.fetchrow(
                     "INSERT INTO gl_account_roles (role_id, entity_id, role_code, gl_account_id) "
                     "VALUES (gen_random_uuid(), $1, $2, $3) "
                     "ON CONFLICT (entity_id, role_code) DO UPDATE SET gl_account_id = EXCLUDED.gl_account_id "
                     "RETURNING role_id, entity_id, role_code, gl_account_id",
-                    entity_id, role_code, gl_account["gl_account_id"],
+                    entity_id,
+                    role_code,
+                    gl_account["gl_account_id"],
                 )
                 out.append(_row(row))
         return out
@@ -174,6 +205,12 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
+    async def get_gl_account_roles_map(self, entity_id: str) -> dict[str, str]:
+        """`{role_code: gl_account_id}` for this entity - gl_posting.py never
+        hardcodes an account_code, it always resolves through this map."""
+        rows = await self.list_gl_account_roles(entity_id)
+        return {r["role_code"]: str(r["gl_account_id"]) for r in rows}
+
     # -- reconciliation_runs (queue) ------------------------------------------------
     _RUN_COLUMNS = (
         "run_id, definition_id, run_no, period_start, period_end, status, volume, matched_count, "
@@ -182,28 +219,40 @@ class ReconciliationDAO:
     )
 
     async def insert_run(
-        self, *, definition_id: str, run_no: str, period_start: date | None, period_end: date | None
+        self,
+        *,
+        definition_id: str,
+        run_no: str,
+        period_start: date | None,
+        period_end: date | None,
     ) -> dict:
         row = await self.conn.fetchrow(
             f"INSERT INTO reconciliation_runs (run_id, definition_id, run_no, period_start, period_end, status) "
             f"VALUES (gen_random_uuid(), $1, $2, $3, $4, 'QUEUED') "
             f"RETURNING {self._RUN_COLUMNS}",
-            definition_id, run_no, period_start, period_end,
+            definition_id,
+            run_no,
+            period_start,
+            period_end,
         )
         return _row(row)
 
     async def get_run(self, run_id: str) -> dict | None:
         row = await self.conn.fetchrow(
-            f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs WHERE run_id = $1", run_id
+            f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs WHERE run_id = $1",
+            run_id,
         )
         return _row(row)
 
-    async def list_runs(self, *, definition_id: str | None, status: str | None) -> list[dict]:
+    async def list_runs(
+        self, *, definition_id: str | None, status: str | None
+    ) -> list[dict]:
         rows = await self.conn.fetch(
             f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs "
             f"WHERE ($1::uuid IS NULL OR definition_id = $1) AND ($2::text IS NULL OR status = $2) "
             f"ORDER BY started_at DESC",
-            definition_id, status,
+            definition_id,
+            status,
         )
         return _rows(rows)
 
@@ -235,7 +284,7 @@ class ReconciliationDAO:
         attempts to identify a paying customer for. Excludes `is_bank_charge`
         rows entirely; the engine routes those straight to GL posting (M3),
         never through customer identification. Includes `explicit_fee_minor`
-        even though Phase 1 doesn't use it - Phase 2's bank-fee
+        even though Phase 1 doesn't use it - Phase 2's fee-tolerance-match
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
             "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
@@ -282,7 +331,9 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
-    async def bank_reference_already_matched(self, entity_id: str, bank_reference: str, exclude_bank_txn_id: str) -> bool:
+    async def bank_reference_already_matched(
+        self, entity_id: str, bank_reference: str, exclude_bank_txn_id: str
+    ) -> bool:
         """True if `bank_reference` belongs to another already-MATCHED row
         for this entity - the cross-run half of the duplicate-reference
         check. The within-run half (two PENDING rows in the same batch
@@ -291,13 +342,20 @@ class ReconciliationDAO:
         row = await self.conn.fetchrow(
             "SELECT 1 FROM bank_statements "
             "WHERE entity_id = $1 AND bank_reference = $2 AND recon_status = 'MATCHED' AND bank_txn_id != $3",
-            entity_id, bank_reference, exclude_bank_txn_id,
+            entity_id,
+            bank_reference,
+            exclude_bank_txn_id,
         )
         return row is not None
 
     async def insert_payment(
-        self, *, bank_txn_id: str, customer_id: str | None, total_received_minor: int,
-        locked_by_rule_id: str | None, candidate_pool: list[str] | None,
+        self,
+        *,
+        bank_txn_id: str,
+        customer_id: str | None,
+        total_received_minor: int,
+        locked_by_rule_id: str | None,
+        candidate_pool: list[str] | None,
     ) -> dict:
         """`unapplied_minor` starts equal to the full received amount -
         nothing's been allocated to an invoice yet; Phase 2 (M2) decrements
@@ -310,26 +368,51 @@ class ReconciliationDAO:
             "VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5::jsonb) "
             "RETURNING payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor, "
             "locked_by_rule_id, candidate_pool",
-            bank_txn_id, customer_id, total_received_minor, locked_by_rule_id, candidate_pool,
+            bank_txn_id,
+            customer_id,
+            total_received_minor,
+            locked_by_rule_id,
+            candidate_pool,
         )
         return _row(row)
 
     async def insert_exception(
-        self, *, run_id: str, exception_type: str, bank_txn_id: str | None, customer_id: str | None,
-        reason_code: str | None, detail: dict | None, match_group_id: str | None = None, invoice_id: str | None = None,
+        self,
+        *,
+        run_id: str,
+        exception_type: str,
+        bank_txn_id: str | None,
+        customer_id: str | None,
+        reason_code: str | None,
+        detail: dict | None,
+        match_group_id: str | None = None,
+        invoice_id: str | None = None,
+        discrepancy_minor: int | None = None,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO reconciliation_exceptions "
-            "(exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, reason_code, status, detail, match_group_id) "
-            "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'OPEN', $7::jsonb, $8) "
-            "RETURNING exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, reason_code, status, detail, match_group_id",
-            run_id, exception_type, bank_txn_id, customer_id, invoice_id, reason_code, detail, match_group_id,
+            "(exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, discrepancy_minor, reason_code, status, detail, match_group_id) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, 'OPEN', $8::jsonb, $9) "
+            "RETURNING exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, discrepancy_minor, reason_code, status, detail, match_group_id",
+            run_id,
+            exception_type,
+            bank_txn_id,
+            customer_id,
+            invoice_id,
+            discrepancy_minor,
+            reason_code,
+            detail,
+            match_group_id,
         )
         return _row(row)
 
-    async def mark_bank_statement_status(self, bank_txn_id: str, recon_status: str) -> None:
+    async def mark_bank_statement_status(
+        self, bank_txn_id: str, recon_status: str
+    ) -> None:
         await self.conn.execute(
-            "UPDATE bank_statements SET recon_status = $2 WHERE bank_txn_id = $1", bank_txn_id, recon_status
+            "UPDATE bank_statements SET recon_status = $2 WHERE bank_txn_id = $1",
+            bank_txn_id,
+            recon_status,
         )
 
     # -- Phase 2 working set (open invoices, open memos) ----------------------------
@@ -343,7 +426,7 @@ class ReconciliationDAO:
         `due_date` into the next month) - filtering on `due_date` would wrongly
         exclude every not-yet-due invoice from a run that's supposed to cover
         cash received *within* the period. Includes `tds_rate_pct` so
-        tds-match can compute the effective TDS amount itself
+        tds-net-match can compute the effective TDS amount itself
         (`total_amount_minor * tds_rate_pct / 100`) rather than depending on
         a pre-populated `allowed_tds_minor` - the ingestion mapping has no
         way to derive that product today (see docs/reconciliation.md §8)."""
@@ -353,7 +436,8 @@ class ReconciliationDAO:
             "FROM invoices WHERE entity_id = $1 AND status != 'PAID' "
             "AND ($2::date IS NULL OR issue_date <= $2) "
             "ORDER BY customer_id, due_date, invoice_id",
-            entity_id, period_end,
+            entity_id,
+            period_end,
         )
         return _rows(rows)
 
@@ -368,28 +452,52 @@ class ReconciliationDAO:
 
     # -- match_groups / invoice_allocations (Phase 2 output) -------------------------
     async def insert_match_group(
-        self, *, run_id: str, match_type: str, rule_id: str | None, confidence: int | None, status: str, reason: str
+        self,
+        *,
+        run_id: str,
+        match_type: str,
+        rule_id: str | None,
+        confidence: int | None,
+        status: str,
+        reason: str,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO match_groups (match_group_id, run_id, match_type, rule_id, confidence, status, reason) "
             "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6) "
             "RETURNING match_group_id, run_id, match_type, rule_id, confidence, status, reason",
-            run_id, match_type, rule_id, confidence, status, reason,
+            run_id,
+            match_type,
+            rule_id,
+            confidence,
+            status,
+            reason,
         )
         return _row(row)
 
     async def insert_invoice_allocation(
-        self, *, match_group_id: str, invoice_id: str, payment_id: str, bank_txn_id: str, allocated_minor: int
+        self,
+        *,
+        match_group_id: str,
+        invoice_id: str,
+        payment_id: str,
+        bank_txn_id: str,
+        allocated_minor: int,
     ) -> dict:
         row = await self.conn.fetchrow(
             "INSERT INTO invoice_allocations (allocation_id, match_group_id, invoice_id, payment_id, bank_txn_id, allocated_minor) "
             "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) "
             "RETURNING allocation_id, match_group_id, invoice_id, payment_id, bank_txn_id, allocated_minor",
-            match_group_id, invoice_id, payment_id, bank_txn_id, allocated_minor,
+            match_group_id,
+            invoice_id,
+            payment_id,
+            bank_txn_id,
+            allocated_minor,
         )
         return _row(row)
 
-    async def apply_invoice_allocation(self, invoice_id: str, amount_minor: int) -> dict:
+    async def apply_invoice_allocation(
+        self, invoice_id: str, amount_minor: int
+    ) -> dict:
         """Decrements balance_due_minor and flips status: PAID once it
         reaches zero, PARTIALLY_SETTLED otherwise. `amount_minor` must
         already be capped at the invoice's remaining balance by the caller -
@@ -400,35 +508,37 @@ class ReconciliationDAO:
             "updated_at = now() "
             "WHERE invoice_id = $1 "
             "RETURNING invoice_id, balance_due_minor, status",
-            invoice_id, amount_minor,
+            invoice_id,
+            amount_minor,
         )
         return _row(row)
 
-    async def apply_payment_allocation(self, payment_id: str, amount_minor: int) -> dict:
+    async def apply_payment_allocation(
+        self, payment_id: str, amount_minor: int
+    ) -> dict:
         row = await self.conn.fetchrow(
             "UPDATE payments SET unapplied_minor = unapplied_minor - $2 "
             "WHERE payment_id = $1 "
             "RETURNING payment_id, unapplied_minor, customer_id",
-            payment_id, amount_minor,
+            payment_id,
+            amount_minor,
         )
         return _row(row)
 
-    async def lock_payment_customer(self, payment_id: str, customer_id: str, rule_id: str | None) -> None:
+    async def lock_payment_customer(
+        self, payment_id: str, customer_id: str, rule_id: str | None
+    ) -> None:
         """Retroactively resolves a Phase-1b pool once Phase 2 disambiguates
         it to exactly one candidate - the payment becomes indistinguishable
         from one Phase 1a locked directly."""
         await self.conn.execute(
             "UPDATE payments SET customer_id = $2, candidate_pool = NULL, locked_by_rule_id = $3 WHERE payment_id = $1",
-            payment_id, customer_id, rule_id,
+            payment_id,
+            customer_id,
+            rule_id,
         )
 
-    # -- M3: GL posting --------------------------------------------------------------
-    async def get_gl_account_roles_map(self, entity_id: str) -> dict[str, str]:
-        """`{role_code: gl_account_id}` for this entity - gl_posting.py never
-        hardcodes an account_code, it always resolves through this map."""
-        rows = await self.list_gl_account_roles(entity_id)
-        return {r["role_code"]: str(r["gl_account_id"]) for r in rows}
-
+    # -- M3: gl_journal_entries/gl_journal_lines/gl_control_balances -----------------
     async def insert_journal(
         self, *, entity_id: str, run_id: str | None, posting_date, source_type: str, memo: str | None,
         lines: list[dict],
@@ -496,13 +606,31 @@ class ReconciliationDAO:
 
     # -- M3: match/exception review ---------------------------------------------------
     async def list_match_groups_for_run(self, run_id: str) -> list[dict]:
+        """`m.rule_id` is the Phase-2 (ALLOCATION) rule that committed this
+        match group. `locked_by_rule_id` is the separate Phase-1a
+        (CUSTOMER_LOCK) rule that identified the payment's customer in the
+        first place - pulled from `payments` via the group's first
+        allocation, since every allocation in one match group shares the
+        same payment. Both are surfaced together so the UI can show the
+        full "how did this get matched" story (identification + allocation),
+        not just the allocation half."""
         rows = await self.conn.fetch(
             "SELECT m.match_group_id, m.run_id, m.match_type, m.rule_id, m.confidence, m.status, m.reason, m.created_at, "
+            "(SELECT p.locked_by_rule_id FROM payments p "
+            "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
+            "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS locked_by_rule_id, "
             "COALESCE(json_agg(json_build_object("
-            "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'payment_id', a.payment_id, "
-            "  'bank_txn_id', a.bank_txn_id, 'allocated_minor', a.allocated_minor"
+            "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'invoice_number', inv.invoice_number, "
+            "  'invoice_amount_minor', inv.total_amount_minor, "
+            "  'payment_id', a.payment_id, 'payment_amount_minor', p.total_received_minor, "
+            "  'bank_txn_id', a.bank_txn_id, 'bank_reference', bs.bank_reference, "
+            "  'allocated_minor', a.allocated_minor"
             ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
-            "FROM match_groups m LEFT JOIN invoice_allocations a ON a.match_group_id = m.match_group_id "
+            "FROM match_groups m "
+            "LEFT JOIN invoice_allocations a ON a.match_group_id = m.match_group_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = a.invoice_id "
+            "LEFT JOIN payments p ON p.payment_id = a.payment_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = a.bank_txn_id "
             "WHERE m.run_id = $1 GROUP BY m.match_group_id ORDER BY m.created_at",
             run_id,
         )
@@ -510,21 +638,73 @@ class ReconciliationDAO:
 
     async def list_exceptions_for_run(self, run_id: str, status: str | None) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
-            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
-            "resolved_at, created_at, detail, match_group_id "
-            "FROM reconciliation_exceptions WHERE run_id = $1 AND ($2::text IS NULL OR status = $2) "
-            "ORDER BY created_at",
+            "SELECT e.exception_id, e.run_id, e.exception_no, e.exception_type, e.bank_txn_id, e.invoice_id, e.customer_id, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS discrepancy_minor, "
+            "e.reason_code, e.status, e.resolution_outcome, e.resolver_id, e.resolution_notes, "
+            "e.resolved_at, e.created_at, e.detail, e.match_group_id, "
+            "COALESCE(c.company_name, bs.payer_name) AS customer_name, "
+            "c.customer_code, "
+            "inv.invoice_number, "
+            "bs.bank_reference, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS amount_minor "
+            "FROM reconciliation_exceptions e "
+            "LEFT JOIN customers c ON c.customer_id = e.customer_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = e.invoice_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = e.bank_txn_id "
+            "WHERE e.run_id = $1 AND ($2::text IS NULL OR e.status = $2) "
+            "ORDER BY e.created_at",
             run_id, status,
         )
         return _rows(rows)
 
     async def get_exception(self, exception_id: str) -> dict | None:
         row = await self.conn.fetchrow(
-            "SELECT exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
-            "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
-            "resolved_at, created_at, detail, match_group_id "
-            "FROM reconciliation_exceptions WHERE exception_id = $1",
+            "SELECT e.exception_id, e.run_id, e.exception_no, e.exception_type, e.bank_txn_id, e.invoice_id, e.customer_id, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS discrepancy_minor, "
+            "e.reason_code, e.status, e.resolution_outcome, e.resolver_id, e.resolution_notes, "
+            "e.resolved_at, e.created_at, e.detail, e.match_group_id, "
+            "COALESCE(c.company_name, bs.payer_name) AS customer_name, "
+            "c.customer_code, "
+            "inv.invoice_number, "
+            "bs.bank_reference, "
+            "COALESCE("
+            "  e.discrepancy_minor, "
+            "  (e.detail->>'shortfall_minor')::bigint, "
+            "  (e.detail->>'variance_minor')::bigint, "
+            "  (e.detail->>'amount_minor')::bigint, "
+            "  inv.balance_due_minor, "
+            "  inv.total_amount_minor, "
+            "  bs.amount_minor"
+            ") AS amount_minor "
+            "FROM reconciliation_exceptions e "
+            "LEFT JOIN customers c ON c.customer_id = e.customer_id "
+            "LEFT JOIN invoices inv ON inv.invoice_id = e.invoice_id "
+            "LEFT JOIN bank_statements bs ON bs.bank_txn_id = e.bank_txn_id "
+            "WHERE e.exception_id = $1",
             exception_id,
         )
         return _row(row)

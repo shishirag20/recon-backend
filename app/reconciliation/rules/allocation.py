@@ -158,7 +158,10 @@ async def dust_writeoff(payment: dict, bank_txn: dict, customer_id: str, ctx: Al
     it's not worth carrying forward - write it off rather than leaving the
     invoice open indefinitely for a trivial amount."""
     amount = payment["total_received_minor"]
-    threshold = config.get("amount", {}).get("value_minor", 500)
+    threshold = config.get("amount", {}).get("value_minor")
+    if threshold is None:
+        val = config.get("max_writeoff_amount") or config.get("materiality_threshold") or 500
+        threshold = int(val * 100) if val < 50 else int(val)
     matches = [inv for inv in _open_invoices(ctx, customer_id) if 0 < inv["balance_due_minor"] - amount <= threshold]
     if len(matches) == 1:
         inv = matches[0]

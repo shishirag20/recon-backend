@@ -17,7 +17,12 @@ from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
 from app.datahub import transforms
-from app.datahub.canonical import EDITABLE_FIELDS, KNOWN_FIELDS, STREAM_TABLES, SEARCH_COLUMNS
+from app.datahub.canonical import (
+    EDITABLE_FIELDS,
+    KNOWN_FIELDS,
+    STREAM_TABLES,
+    SEARCH_COLUMNS,
+)
 from app.datahub.constants import (
     DataHubErrors,
     MAX_UPLOAD_BYTES,
@@ -35,9 +40,13 @@ class DataHubService:
         self.dao = dao
 
     # -- data_sources --------------------------------------------------------
-    async def create_data_source(self, *, entity_id: str, name: str, kind: str, stream: str):
+    async def create_data_source(
+        self, *, entity_id: str, name: str, kind: str, stream: str
+    ):
         if stream not in STREAM_VALUES:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM)
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM
+            )
         if not await self.dao.entity_exists(entity_id):
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, DataHubErrors.ENTITY_NOT_FOUND
@@ -71,15 +80,112 @@ class DataHubService:
     @staticmethod
     def _require_valid_stream(stream: str) -> None:
         if stream not in STREAM_VALUES:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM)
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, DataHubErrors.INVALID_STREAM
+            )
 
-    async def get_active_mappings(self, stream: str):
+    async def get_active_mappings(self, stream: str) -> list[dict]:
         self._require_valid_stream(stream)
         return await self.dao.get_active_mappings(stream)
 
     async def create_mapping_version(self, stream: str, mappings: list[dict]):
         self._require_valid_stream(stream)
-        return await self.dao.insert_mapping_version(stream, mappings)
+
+        # 1. Clean, filter and deduplicate incoming mappings
+        incoming_by_source: dict[tuple, dict] = {}
+        for m in mappings:
+            source = str(m.get("source_field", "")).strip()
+            canonical = (
+                str(m.get("canonical_field", "")).strip()
+                if m.get("canonical_field")
+                else ""
+            )
+            if not source or not canonical or canonical == "-":
+                continue
+            transform = str(m.get("transform", "NONE")).strip().upper() or "NONE"
+            transform_param = m.get("transform_param")
+            if isinstance(transform_param, str):
+                transform_param = transform_param.strip() or None
+
+            norm_src = transforms.normalize_header(source)
+            mapping_dict = {
+                "source_field": source,
+                "canonical_field": canonical,
+                "transform": transform,
+                "transform_param": transform_param,
+            }
+
+            if transform == "CONST":
+                dedup_key = (norm_src, canonical.lower(), transform)
+            else:
+                dedup_key = (norm_src,)
+
+            incoming_by_source[dedup_key] = mapping_dict
+
+        # 2. Merge with existing active mappings to preserve global synonym dictionary
+        active_mappings = await self.get_active_mappings(stream)
+        merged_mappings: list[dict] = list(incoming_by_source.values())
+
+        for m in active_mappings:
+            src = str(m.get("source_field", "")).strip()
+            canon = str(m.get("canonical_field", "")).strip()
+            tr = str(m.get("transform", "NONE")).strip().upper() or "NONE"
+            param = m.get("transform_param")
+            if isinstance(param, str):
+                param = param.strip() or None
+
+            norm_s = transforms.normalize_header(src)
+            if tr == "CONST":
+                key = (norm_s, canon.lower(), tr)
+            else:
+                key = (norm_s,)
+
+            if key not in incoming_by_source:
+                merged_mappings.append(
+                    {
+                        "source_field": src,
+                        "canonical_field": canon,
+                        "transform": tr,
+                        "transform_param": param,
+                    }
+                )
+
+        # 3. Idempotency check: compare merged mappings against active mappings
+        active_keys = {
+            (
+                transforms.normalize_header(m["source_field"]),
+                str(m.get("canonical_field", "")).strip().lower(),
+                str(m.get("transform", "NONE")).strip().upper(),
+                (
+                    str(m.get("transform_param", "")).strip().lower()
+                    if m.get("transform_param") is not None
+                    else None
+                ),
+            )
+            for m in active_mappings
+            if m.get("source_field")
+            and m.get("canonical_field")
+            and str(m.get("canonical_field")).strip() != "-"
+        }
+        merged_keys = {
+            (
+                transforms.normalize_header(m["source_field"]),
+                str(m.get("canonical_field", "")).strip().lower(),
+                str(m.get("transform", "NONE")).strip().upper(),
+                (
+                    str(m.get("transform_param", "")).strip().lower()
+                    if m.get("transform_param") is not None
+                    else None
+                ),
+            )
+            for m in merged_mappings
+        }
+
+        # Short-circuit if mapping content is identical
+        if merged_keys == active_keys and len(merged_mappings) == len(active_mappings):
+            return active_mappings
+
+        return await self.dao.insert_mapping_version(stream, merged_mappings)
 
     async def preview_mapping(
         self,
@@ -91,7 +197,7 @@ class DataHubService:
         mappings = (
             mappings_override
             if mappings_override is not None
-            else await self.dao.get_active_mappings(stream)
+            else await self.get_active_mappings(stream)
         )
         if not mappings:
             raise HTTPException(
@@ -109,12 +215,93 @@ class DataHubService:
         check `ingestion_worker.py` does to compute `unmapped_columns`, just
         surfaced before upload instead of only after."""
         self._require_valid_stream(stream)
-        mappings = await self.dao.get_active_mappings(stream)
-        mapped_headers = {transforms.normalize_header(m["source_field"]) for m in mappings}
+        mappings = await self.get_active_mappings(stream)
+        mapped_headers = {
+            transforms.normalize_header(m["source_field"]) for m in mappings
+        }
         return [
-            {"source_field": c, "matched": transforms.normalize_header(c) in mapped_headers}
+            {
+                "source_field": c,
+                "matched": transforms.normalize_header(c) in mapped_headers,
+            }
             for c in columns
         ]
+
+    async def resolve_mapping(self, stream: str, headers: list[str]) -> dict:
+        """Combines header matching, active mappings, and canonical fields into a single atomic
+        pre-flight query for a file's headers."""
+        self._require_valid_stream(stream)
+        active_mappings = await self.get_active_mappings(stream)
+        canonical_fields = await self.canonical_fields(stream)
+        valid_canonical_set = set(canonical_fields)
+
+        synonym_map: dict[str, list[dict]] = {}
+        const_mappings: list[dict] = []
+        for m in active_mappings:
+            if m.get("transform") == "CONST":
+                const_mappings.append(m)
+            else:
+                norm_src = transforms.normalize_header(m["source_field"])
+                synonym_map.setdefault(norm_src, []).append(m)
+
+        resolved_mappings: list[dict] = []
+        seen_sources = set()
+
+        for header in headers:
+            norm_header = transforms.normalize_header(header)
+            if norm_header in seen_sources:
+                continue
+            seen_sources.add(norm_header)
+
+            if norm_header in synonym_map:
+                for m in synonym_map[norm_header]:
+                    target = (
+                        m.get("canonical_field")
+                        if m.get("canonical_field") in valid_canonical_set
+                        else ""
+                    )
+                    resolved_mappings.append(
+                        {
+                            "source_field": header,
+                            "canonical_field": target or None,
+                            "transform": m.get("transform", "NONE") if target else "NONE",
+                            "transform_param": m.get("transform_param") if target else None,
+                            "is_matched": True,
+                        }
+                    )
+            else:
+                resolved_mappings.append(
+                    {
+                        "source_field": header,
+                        "canonical_field": None,
+                        "transform": "NONE",
+                        "transform_param": None,
+                        "is_matched": False,
+                    }
+                )
+
+        for cm in const_mappings:
+            target = (
+                cm.get("canonical_field")
+                if cm.get("canonical_field") in valid_canonical_set
+                else ""
+            )
+            if target:
+                resolved_mappings.append(
+                    {
+                        "source_field": cm.get("source_field", "constant"),
+                        "canonical_field": target,
+                        "transform": "CONST",
+                        "transform_param": cm.get("transform_param"),
+                        "is_matched": True,
+                    }
+                )
+
+        return {
+            "stream": stream,
+            "canonical_fields": canonical_fields,
+            "mappings": resolved_mappings,
+        }
 
     async def canonical_fields(self, stream: str) -> list[str]:
         self._require_valid_stream(stream)
@@ -134,7 +321,9 @@ class DataHubService:
                 status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, DataHubErrors.UNSUPPORTED_FORMAT
             )
         source = await self.get_data_source(source_id)  # 404s if missing
-        stream = source["stream"]  # derived from the source, never client-supplied - see migration 0023's rationale
+        stream = source[
+            "stream"
+        ]  # derived from the source, never client-supplied - see migration 0023's rationale
 
         job_id = new_id()
         safe_filename = os.path.basename(file.filename or "upload")
@@ -143,10 +332,14 @@ class DataHubService:
 
         content_hash = await self._save_upload(file, dest_dir, dest_path)
 
-        existing = await self.dao.find_job_by_content_hash(source_id=source_id, content_hash=content_hash)
+        existing = await self.dao.find_job_by_content_hash(
+            source_id=source_id, content_hash=content_hash
+        )
         if existing is not None:
             await run_in_threadpool(_remove_quietly, dest_path)
-            raise HTTPException(status.HTTP_409_CONFLICT, DataHubErrors.DUPLICATE_UPLOAD)
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, DataHubErrors.DUPLICATE_UPLOAD
+            )
 
         return await self.dao.insert_ingest_job(
             job_id=job_id,
@@ -248,7 +441,9 @@ class DataHubService:
         """Every record of this stream ever ingested for an entity, across
         every job/data source that ever fed it - not scoped to one upload."""
         if not await self.dao.entity_exists(entity_id):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, DataHubErrors.ENTITY_NOT_FOUND)
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, DataHubErrors.ENTITY_NOT_FOUND
+            )
         table, pk_column = self._stream_table(stream)
         return await self.dao.list_records_by_entity(
             table=table,
