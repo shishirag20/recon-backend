@@ -23,10 +23,15 @@ from tests.reconciliation.test_golden_m2 import golden  # noqa: F401 - reused fi
 pytestmark = pytest.mark.asyncio
 
 # The M2 golden run leaves exactly this much AR open across every non-PAID
-# invoice (INV-101, 107, 108, 114, 115, 117, 120, 121) - see docs/reconciliation.md.
+# invoice (INV-101, 107, 108, 112, 113, 114, 115, 117, 120, 121) - see
+# docs/reconciliation.md. INV-112/113 (Halcyon/Meridian) are included here
+# now too: their payments only ever reach a candidate pool (never an
+# independently confirmed Phase 1a lock), so per
+# test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched they
+# correctly stay open pending human confirmation instead of auto-settling.
 # Seeding a GL control balance of 5,000,000 (Rs 50,000) deliberately
-# understates it by 1,250,000 (Rs 12,500), so the control proof must fire.
-_EXPECTED_SL_BALANCE_MINOR = 6_250_000
+# understates it by 2,950,000 (Rs 29,500), so the control proof must fire.
+_EXPECTED_SL_BALANCE_MINOR = 7_950_000
 _SEEDED_GL_CONTROL_BALANCE_MINOR = 5_000_000
 _EXPECTED_VARIANCE_MINOR = _EXPECTED_SL_BALANCE_MINOR - _SEEDED_GL_CONTROL_BALANCE_MINOR
 

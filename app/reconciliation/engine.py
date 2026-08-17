@@ -204,16 +204,17 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     (index copy.html's arReconcile: pool resolution happens once, before its
     per-customer `allocRules.forEach(rule => payments.forEach(...))` loop):
 
-    Pass A resolves WHICH CUSTOMER a pooled (multi-candidate) payment belongs
-    to - unchanged from the original single-pass design: try every candidate
-    through all 9 rules, first-match-wins per candidate, then compare across
-    candidates (2+ clean matches -> Double-Collision, exactly 1 -> resolved,
-    0 -> left unresolved). This is a "which identity" question, orthogonal to
-    invoice selection, so it keeps its own logic rather than being folded
-    into Pass B.
+    Pass A resolves every pooled (candidate_pool, Phase 1b) payment entirely
+    on its own: try every candidate through all 9 rules, first-match-wins per
+    candidate. 2+ clean matches -> Double-Collision. Exactly 1 or 0 -> always
+    a Suspense exception (with the suggestion, if any, in `detail`) - a pool
+    is never auto-committed, no matter how clean the eventual invoice match,
+    since nothing independently confirmed the identity (matches the
+    prototype's own `exactAmountRule` probe: even a single clean hit only
+    ever becomes a `suggestedCustomerId` + Suspense, never a real match).
+    Only a payment Phase 1a locked outright skips straight into Pass B.
 
-    Pass B resolves WHICH INVOICE for every payment that now has a definite
-    customer (locked outright by Phase 1a, or resolved by Pass A just above).
+    Pass B resolves WHICH INVOICE for every payment Phase 1a actually locked.
     Grouped by customer, it runs **rule-outer / payment-inner**: rule 1
     (exact-invoice-num) gets a complete pass over every one of that
     customer's still-unresolved payments before rule 2 is tried on anyone,
@@ -291,20 +292,16 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
     async def _commit(item: dict, customer_id: str, rule: dict | None, alloc_result) -> None:
         """Writes one committed match: match_group, invoice_allocations,
         balance decrements, Short-Pay check, and the payment_ledger_records
-        entry. Shared by both passes (a pool that resolves to a single
-        candidate never separately commits in Pass A - it flows into Pass B
-        as an already-resolved customer, same as a payment locked outright).
-        Mutates the enclosing function's `money`/`counts`/`touched_invoice_ids`/
-        `payment_ledger_records` in place - all mutable containers, so this
-        closure needs no `nonlocal`."""
+        entry. Only ever called from Pass B, so `item` always has a genuine
+        Phase 1a lock behind it - a pool never reaches here (see `_suspense`
+        above; Pass A resolves every pool outcome itself, auto-commit or
+        not). Mutates the enclosing function's `money`/`counts`/
+        `touched_invoice_ids`/`payment_ledger_records` in place - all
+        mutable containers, so this closure needs no `nonlocal`."""
         payment_id = item["payment_id"]
         bank_txn = item["bank_txn"]
         bank_txn_id = bank_txn["bank_txn_id"]
         amount = bank_txn["amount_minor"]
-
-        if item["customer_id"] is None:
-            # Retroactively lock a pool that Pass A resolved to one candidate.
-            await dao.lock_payment_customer(payment_id, customer_id, rule["rule_id"] if rule else None)
 
         match_group = await dao.insert_match_group(
             run_id=run_id, match_type=alloc_result.match_type,
@@ -409,36 +406,66 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
         })
 
-    # --- Pass A: resolve WHICH CUSTOMER, pooled payments only. A locked
-    # payment (single candidate) already has its answer and skips straight
-    # into `pending` for Pass B - probing rules for it here would be
-    # redundant and, worse, would let it claim an invoice before Pass B's
-    # priority-ordered, whole-batch pass even starts.
+    async def _suspense(item: dict, reason_code: str, detail: dict | None) -> None:
+        """A candidate-pool payment (Phase 1b - no independently confirmed
+        identity, only a weak hint like a narration-token overlap) never
+        auto-commits, no matter how clean the eventual invoice match looks -
+        matching the prototype exactly (index copy.html's own
+        `exactAmountRule` probe: even a single-candidate exact-amount hit
+        only ever sets `suggestedCustomerId`/`suggestedInvoiceId` and still
+        raises a Suspense exception for a human to confirm). `detail` carries
+        the suggestion so it isn't lost - a future "confirm this" action can
+        read it back."""
+        bank_txn = item["bank_txn"]
+        bank_txn_id = bank_txn["bank_txn_id"]
+        amount = bank_txn["amount_minor"]
+        await dao.insert_exception(
+            run_id=run_id, exception_type="SUSPENSE", bank_txn_id=bank_txn_id, customer_id=None,
+            reason_code=reason_code, detail=detail,
+        )
+        await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
+        money["exception"] += amount
+        money["unapplied"] += amount
+        counts["unresolved"] += 1
+        payment_ledger_records.append({
+            "payment_id": item["payment_id"], "bank_txn_id": bank_txn_id, "customer_id": None,
+            "currency": bank_txn["currency"], "unapplied_minor": amount, "allocations": [],
+        })
+
+    # --- Pass A: pooled payments only (candidate_pool, from Phase 1b) - a
+    # locked payment (outcome["customer_id"] already set by Phase 1a, an
+    # independently confirmed identity) skips straight into `pending` for
+    # Pass B. A pool, however many candidates or however clean the eventual
+    # match, is ALWAYS resolved right here as Suspense/Double-Collision -
+    # never deferred into Pass B's auto-commit. Only a locked identity is
+    # trusted enough to write a real match_group.
     pending: list[tuple[dict, str]] = []  # (item, resolved_customer_id) for Pass B
     for outcome in outcomes:
-        candidates = [outcome["customer_id"]] if outcome["customer_id"] else outcome["candidate_pool"]
-        if len(candidates) == 1:
-            pending.append((outcome, candidates[0]))
+        if outcome["customer_id"] is not None:
+            pending.append((outcome, outcome["customer_id"]))
             continue
 
+        candidates = outcome["candidate_pool"]
         bank_txn = outcome["bank_txn"]
         amount = bank_txn["amount_minor"]
-        per_candidate_matches: list[str] = []
+        per_candidate_matches: list[tuple[str, dict | None, object]] = []  # (customer_id, rule, alloc_result)
         for candidate_id in candidates:
             alloc_result = None
+            fired_rule = None
             for rule in allocation_rules:
                 rule_fn = ALLOCATION_RULES.get(rule["kind"])
                 if rule_fn is None:
                     continue
                 alloc_result = await rule_fn({"total_received_minor": amount}, bank_txn, candidate_id, ctx, rule["config"])
                 if alloc_result.matched:
+                    fired_rule = rule
                     break
             if alloc_result is not None and alloc_result.allocations and not alloc_result.ambiguous:
-                per_candidate_matches.append(candidate_id)
+                per_candidate_matches.append((candidate_id, fired_rule, alloc_result))
 
         if len(per_candidate_matches) >= 2:
             # Double-Collision: 2+ different candidates each produced a clean match.
-            detail = {"candidates": [{"customer_id": cid} for cid in per_candidate_matches]}
+            detail = {"candidates": [{"customer_id": cid} for cid, _, _ in per_candidate_matches]}
             await dao.insert_exception(
                 run_id=run_id, exception_type="DOUBLE_COLLISION", bank_txn_id=bank_txn["bank_txn_id"], customer_id=None,
                 reason_code=f"{len(per_candidate_matches)} candidates each produced a valid match", detail=detail,
@@ -456,23 +483,31 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
             continue
 
         if len(per_candidate_matches) == 1:
-            pending.append((outcome, per_candidate_matches[0]))
+            cid, rule, alloc_result = per_candidate_matches[0]
+            await _suspense(
+                outcome,
+                reason_code="one likely match for the exact amount, but identity wasn't independently confirmed - review and confirm",
+                detail={
+                    "suggested_customer_id": cid,
+                    "suggested_invoice_ids": [a.invoice_id for a in alloc_result.allocations],
+                    "suggested_rule_id": str(rule["rule_id"]) if rule else None,
+                },
+            )
             continue
 
-        # 0 candidates matched anything at Pass A's probe - still let Pass B
-        # have a real, whole-batch-priority-ordered try (a sibling payment
-        # closing an invoice first shouldn't be the reason a pool never even
-        # got a fair shot) before giving up as UNAPPLIED_CASH.
-        pending.append((outcome, None))
+        # 0 of the pool's candidates produced any match at all.
+        await _suspense(
+            outcome,
+            reason_code=f"candidate pool of {len(candidates)} customers but none resolved by exact amount",
+            detail={"candidate_customer_ids": candidates},
+        )
 
-    # --- Pass B: rule-outer / payment-inner, grouped by resolved customer.
+    # --- Pass B: rule-outer / payment-inner, grouped by resolved customer -
+    # every item here came from a genuine Phase 1a lock (Pass A never defers
+    # a pool resolution into this pass).
     by_customer: dict[str, list[dict]] = defaultdict(list)
-    no_customer: list[dict] = []
     for item, customer_id in pending:
-        if customer_id is None:
-            no_customer.append(item)
-        else:
-            by_customer[customer_id].append(item)
+        by_customer[customer_id].append(item)
 
     for customer_id, items in by_customer.items():
         remaining = items  # preserves `outcomes`' original (transaction_date) order
@@ -512,9 +547,6 @@ async def run_phase_2(conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: 
         # Nothing in `remaining` matched any of the 9 rules for this customer.
         for item in remaining:
             await _unapplied(item, customer_id)
-
-    for item in no_customer:
-        await _unapplied(item, None)
 
     # No-Payment sweep: open invoices nothing in this run touched or flagged at all.
     no_payment_count = 0

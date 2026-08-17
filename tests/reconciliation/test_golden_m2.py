@@ -225,12 +225,32 @@ class TestPhase1Identification:
             assert any(e["exception_type"] == "DUPLICATE" for e in exceptions)
             assert await _payment_for(conn, golden["bank"][key]) is None
 
-    async def test_halcyon_and_meridian_pool_then_resolve_in_phase2(self, conn, golden):
+    async def test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched(self, conn, golden):
+        """Matches the prototype exactly (index copy.html's exactAmountRule
+        probe): a candidate pool that resolves to exactly one customer with a
+        clean exact-amount hit is still only a *suggestion* - it must raise
+        Suspense for a human to confirm, never auto-commit a match_group or
+        lock the payment's customer_id, no matter how clean the hit looks."""
         await _run_full_reconciliation(conn, golden["entity_id"])
+
         halcyon_payment = await _payment_for(conn, golden["bank"]["011"])
-        assert str(halcyon_payment["customer_id"]) == golden["customers"]["halcyon"], "single-candidate pool should resolve via Phase 2"
+        assert halcyon_payment["customer_id"] is None, "a pool resolution must never lock the payment's customer"
+        halcyon_exceptions = await _exceptions_for(conn, golden["bank"]["011"])
+        assert any(e["exception_type"] == "SUSPENSE" for e in halcyon_exceptions)
+        halcyon_suspense = next(e for e in halcyon_exceptions if e["exception_type"] == "SUSPENSE")
+        assert halcyon_suspense["detail"]["suggested_customer_id"] == golden["customers"]["halcyon"]
+        assert halcyon_suspense["detail"]["suggested_invoice_ids"] == [golden["invoices"]["112"]]
+
         meridian_payment = await _payment_for(conn, golden["bank"]["012"])
-        assert str(meridian_payment["customer_id"]) == golden["customers"]["meridian"]
+        assert meridian_payment["customer_id"] is None
+        meridian_exceptions = await _exceptions_for(conn, golden["bank"]["012"])
+        assert any(e["exception_type"] == "SUSPENSE" for e in meridian_exceptions)
+        meridian_suspense = next(e for e in meridian_exceptions if e["exception_type"] == "SUSPENSE")
+        assert meridian_suspense["detail"]["suggested_customer_id"] == golden["customers"]["meridian"]
+
+        inv112 = await _invoice(conn, golden["invoices"]["112"])
+        inv113 = await _invoice(conn, golden["invoices"]["113"])
+        assert inv112["status"] == "OPEN" and inv113["status"] == "OPEN", "the suggested invoices must stay untouched until confirmed"
 
     async def test_bank_018_suspense(self, conn, golden):
         await _run_full_reconciliation(conn, golden["entity_id"])
@@ -261,7 +281,12 @@ class TestPhase2Allocation:
         # INV-101 is deliberately excluded here: Acme's own payment (BANK-001)
         # never locks at all (see test_acme_flagged_duplicate_not_locked), so
         # it's covered separately by test_acme_invoice_101_unpaid_due_to_duplicate_fixture_bug.
-        for key in ("111", "112", "113"):
+        # INV-112/113 (Halcyon/Meridian) are also excluded - BANK-011/012 only
+        # ever reach a candidate *pool*, never a Phase 1a lock, so per
+        # test_halcyon_and_meridian_pool_raises_suspense_not_auto_matched
+        # they now correctly stay OPEN pending human confirmation instead of
+        # auto-settling here.
+        for key in ("111",):
             inv = await _invoice(conn, golden["invoices"][key])
             assert inv["status"] == "PAID" and inv["balance_due_minor"] == 0, f"INV-{key} should be exactly settled"
 
