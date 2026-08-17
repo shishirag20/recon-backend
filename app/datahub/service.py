@@ -227,7 +227,7 @@ class DataHubService:
             for c in columns
         ]
 
-    async def resolve_schema(self, stream: str, headers: list[str]) -> dict:
+    async def resolve_mapping(self, stream: str, headers: list[str]) -> dict:
         """Combines header matching, active mappings, and canonical fields into a single atomic
         pre-flight query for a file's headers."""
         self._require_valid_stream(stream)

@@ -28,8 +28,8 @@ from app.datahub.schema import (
     MappingPreviewResponse,
     ResolveHeadersRequest,
     ResolveHeadersResponse,
-    ResolveSchemaRequest,
-    ResolveSchemaResponse,
+    ResolveMappingRequest,
+    ResolveMappingResponse,
 )
 from app.datahub.service import DataHubService
 from app.db.pool import get_connection
@@ -151,16 +151,16 @@ async def resolve_field_mapping_headers(
 
 
 @router.post(
-    "/field-mappings/{stream}/resolve-schema",
-    response_model=ResolveSchemaResponse,
+    "/field-mappings/{stream}/resolve-mapping",
+    response_model=ResolveMappingResponse,
     summary="Resolve file headers against active field mappings and return canonical fields and pre-matched rows",
 )
-async def resolve_field_mapping_schema(
-    stream: str, payload: ResolveSchemaRequest, service: DataHubService = Depends(get_service)
+async def resolve_field_mapping(
+    stream: str, payload: ResolveMappingRequest, service: DataHubService = Depends(get_service)
 ):
     """Combines resolve-headers, active-mappings, and canonical-fields into a single atomic call
     for a file's column headers."""
-    return await service.resolve_schema(stream, payload.headers)
+    return await service.resolve_mapping(stream, payload.headers)
 
 
 @router.get(

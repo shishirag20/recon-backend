@@ -188,7 +188,7 @@ class ResolveHeadersResponse(BaseModel):
     results: list[ResolvedHeader]
 
 
-class ResolveSchemaRequest(BaseModel):
+class ResolveMappingRequest(BaseModel):
     headers: list[str] = Field(
         min_length=1,
         description="Raw column headers from an actual file - read client-side before upload.",
@@ -205,7 +205,7 @@ class ResolvedFieldMapping(BaseModel):
     )
 
 
-class ResolveSchemaResponse(BaseModel):
+class ResolveMappingResponse(BaseModel):
     stream: str
     canonical_fields: list[str]
     mappings: list[ResolvedFieldMapping]
