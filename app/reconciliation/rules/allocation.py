@@ -27,6 +27,13 @@ from app.reconciliation.rules import AllocationContext, AllocationOutcome, Invoi
 RuleFn = Callable[[dict, dict, str, AllocationContext, dict], Awaitable[AllocationOutcome]]
 
 
+def _rupees(amount_minor: int) -> str:
+    """Every `reason` string below is user-facing (shown verbatim in the
+    frontend's "Resolved Via" column) - amounts must be formatted here, not
+    left as raw minor units, or ₹20 renders as "2000"."""
+    return f"₹{amount_minor / 100:,.2f}"
+
+
 def _open_invoices(ctx: AllocationContext, customer_id: str) -> list[dict]:
     return ctx.invoices_by_customer.get(customer_id, [])
 
@@ -78,7 +85,7 @@ async def exact_balance_match(payment: dict, bank_txn: dict, customer_id: str, c
         inv = ties[0]
         return AllocationOutcome(allocations=[InvoiceAllocation(inv["invoice_id"], amount)], match_type="EXACT", reason="exact balance match")
     if len(ties) > 1:
-        return AllocationOutcome(ambiguous=True, ambiguous_invoice_ids=[inv["invoice_id"] for inv in ties], reason=f"{len(ties)} invoices tie on exact balance {amount}")
+        return AllocationOutcome(ambiguous=True, ambiguous_invoice_ids=[inv["invoice_id"] for inv in ties], reason=f"{len(ties)} invoices tie on exact balance {_rupees(amount)}")
     return AllocationOutcome()
 
 
@@ -97,7 +104,7 @@ async def tds_net_match(payment: dict, bank_txn: dict, customer_id: str, ctx: Al
         if inv["balance_due_minor"] - computed_tds == amount:
             return AllocationOutcome(
                 allocations=[InvoiceAllocation(inv["invoice_id"], amount, close_full=True)],
-                match_type="TOLERANCE", reason=f"amount matches balance net of {computed_tds} minor TDS",
+                match_type="TOLERANCE", reason=f"amount matches balance net of {_rupees(computed_tds)} TDS",
             )
     return AllocationOutcome()
 
@@ -123,34 +130,27 @@ async def subset_sum_fifo(payment: dict, bank_txn: dict, customer_id: str, ctx: 
 async def fee_tolerance_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
     """2.6 - the shortfall exactly equals the bank row's own
     `explicit_fee_minor` (the fee is decoupled from the invoice, not treated
-    as an unexplained partial payment), or - failing that - a small
-    unexplained shortfall within `config['amount']['value_minor']` tolerance.
-    Only fires when exactly one open invoice qualifies; 2+ is left
-    unresolved rather than guessed."""
+    as an unexplained partial payment). Only fires when the bank row actually
+    declares a fee - an unexplained residual with no `explicit_fee_minor` is
+    deliberately left to `write-off` (priority 7) instead of being guessed at
+    here. `config['amount']['value_minor']` is unused; kept in the catalog
+    row for backward compatibility with any saved config, not read. Only
+    fires when exactly one open invoice qualifies; 2+ is left unresolved
+    rather than guessed."""
     amount = payment["total_received_minor"]
     explicit_fee = bank_txn.get("explicit_fee_minor") or 0
-    tolerance = config.get("amount", {}).get("value_minor", 500)
+    if explicit_fee <= 0:
+        return AllocationOutcome()
+
     invoices = _open_invoices(ctx, customer_id)
-
-    if explicit_fee > 0:
-        fee_matches = [inv for inv in invoices if inv["balance_due_minor"] - amount == explicit_fee]
-        if len(fee_matches) == 1:
-            inv = fee_matches[0]
-            return AllocationOutcome(
-                allocations=[InvoiceAllocation(inv["invoice_id"], amount, close_full=True)],
-                match_type="TOLERANCE", reason=f"shortfall {explicit_fee} matches the row's own bank fee",
-            )
-        if fee_matches:
-            return AllocationOutcome()  # ambiguous among fee-matches - don't guess, don't fall through partially
-
-    tolerance_matches = [inv for inv in invoices if 0 < inv["balance_due_minor"] - amount <= tolerance]
-    if len(tolerance_matches) == 1:
-        inv = tolerance_matches[0]
+    fee_matches = [inv for inv in invoices if inv["balance_due_minor"] - amount == explicit_fee]
+    if len(fee_matches) == 1:
+        inv = fee_matches[0]
         return AllocationOutcome(
             allocations=[InvoiceAllocation(inv["invoice_id"], amount, close_full=True)],
-            match_type="TOLERANCE", reason=f"shortfall within {tolerance} minor-unit tolerance",
+            match_type="TOLERANCE", reason=f"shortfall {_rupees(explicit_fee)} matches the row's own bank fee",
         )
-    return AllocationOutcome()
+    return AllocationOutcome()  # 0 or 2+ fee-matches - ambiguous or no match, don't guess
 
 
 async def dust_writeoff(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
@@ -167,7 +167,7 @@ async def dust_writeoff(payment: dict, bank_txn: dict, customer_id: str, ctx: Al
         inv = matches[0]
         return AllocationOutcome(
             allocations=[InvoiceAllocation(inv["invoice_id"], amount, close_full=True)],
-            match_type="TOLERANCE", reason=f"residual within dust threshold ({threshold}), written off",
+            match_type="TOLERANCE", reason=f"residual within threshold ({_rupees(threshold)}), written off",
         )
     return AllocationOutcome()
 
@@ -185,7 +185,7 @@ async def overpay_on_account(payment: dict, bank_txn: dict, customer_id: str, ct
     inv, excess = min(overpaid, key=lambda pair: pair[1])
     return AllocationOutcome(
         allocations=[InvoiceAllocation(inv["invoice_id"], inv["balance_due_minor"])],
-        match_type="TOLERANCE", reason=f"closest invoice fully settled, {excess} minor excess on-account",
+        match_type="TOLERANCE", reason=f"closest invoice fully settled, {_rupees(excess)} excess on-account",
     )
 
 

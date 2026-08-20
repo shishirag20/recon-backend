@@ -135,6 +135,30 @@ async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) ->
     )
 
 
+def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> dict | None:
+    """The "Invoice Number in Narration" cross-check (kind
+    `invoice-number-in-narration`). Deliberately NOT in `IDENTIFICATION_RULES`
+    - it doesn't compete in the first-match-wins CUSTOMER_LOCK loop, it's
+    called directly by `engine.py::run_phase_1` and reconciled against
+    whatever that loop separately decides.
+
+    Same substring check as Phase 2's `exact-invoice-num`
+    (allocation.py::invoice_number_match), just unscoped: it searches every
+    open invoice for this entity, not one customer's, since the whole point
+    is to catch a narration referencing a *different* customer's invoice than
+    the one Phase 1a is about to lock."""
+    if not narration:
+        return None
+    for inv in all_open_invoices:
+        if extract.contains_substring(narration, inv["invoice_number"]):
+            return {
+                "customer_id": str(inv["customer_id"]),
+                "invoice_id": str(inv["invoice_id"]),
+                "invoice_number": inv["invoice_number"],
+            }
+    return None
+
+
 IDENTIFICATION_RULES: dict[str, RuleFn] = {
     "dup-utr": dup_utr_check,
     "expected-utr": utr_match,

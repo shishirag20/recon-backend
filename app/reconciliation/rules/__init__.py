@@ -29,6 +29,13 @@ class RuleContext:
     reference_codes: list[dict]
     expected_remittances: list[dict]
     duplicate_refs_in_run: set[str] = field(default_factory=set)
+    # Every open invoice for this entity, across every customer - not scoped
+    # to whichever customer a rule is currently evaluating, unlike everything
+    # else on this context. Only used by the "Invoice Number in Narration"
+    # cross-check, which needs to search entity-wide by design (a narration
+    # can reference a real invoice belonging to a customer other than the one
+    # actually being identified - that's the mismatch it exists to catch).
+    all_open_invoices: list[dict] = field(default_factory=list)
 
 
 @dataclass

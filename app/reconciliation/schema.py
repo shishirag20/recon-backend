@@ -153,6 +153,9 @@ class MatchGroupOut(BaseModel):
     match_type: str = Field(description="EXACT | TOLERANCE | PARTIAL | SUBSET_SUM | MANY_TO_ONE | ONE_TO_MANY | MANUAL")
     rule_id: UUID | None = Field(description="The ALLOCATION-phase rule that committed this match group.")
     locked_by_rule_id: UUID | None = Field(description="The CUSTOMER_LOCK-phase rule that identified the payment's customer.")
+    narration_crosscheck_rule_id: UUID | None = Field(
+        description="The 'Invoice Number in Narration' cross-check rule, set only when it found a narration-referenced invoice and confirmed it belongs to the locked customer."
+    )
     confidence: int | None
     status: str = Field(description="AUTO_MATCHED | SUGGESTED | CONFIRMED | REJECTED")
     reason: str | None

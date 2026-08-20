@@ -22,13 +22,14 @@ from app.reconciliation.constants import (
     PHASE_CANDIDATE_POOL,
     PHASE_CUSTOMER_LOCK,
     PHASE_INTAKE_VALIDATION,
+    PHASE_NARRATION_CHECK,
     PHASE_SHORT_PAY,
     PHASE_UNAPPLIED,
 )
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext, get_threshold_minor
 from app.reconciliation.rules.allocation import ALLOCATION_RULES
-from app.reconciliation.rules.identification import IDENTIFICATION_RULES
+from app.reconciliation.rules.identification import IDENTIFICATION_RULES, narration_invoice_owner
 from app.reconciliation.rules.pooling import POOLING_RULES
 
 
@@ -56,6 +57,7 @@ async def run(
         "exception_count": (
             phase1["duplicate_count"]
             + phase1["suspense_count"]
+            + phase1["customer_invoice_mismatch_count"]
             + phase2["exception_count"]
             + (1 if gl["gl_variance"] else 0)
         ),
@@ -92,6 +94,7 @@ async def run_phase_1(
     """
     entity_id = str(run_context["entity_id"])
     definition_id = str(run_context["definition_id"])
+    period_end = run_context.get("period_end")
 
     rules = await dao.list_rules(definition_id)
     intake_rules = sorted(
@@ -102,6 +105,16 @@ async def run_phase_1(
         (r for r in rules if r["phase"] == PHASE_CUSTOMER_LOCK and r["enabled"]),
         key=lambda r: r["priority"],
     )
+    # Its own phase (NARRATION_CHECK), not CUSTOMER_LOCK - it runs after both
+    # 1a and 1b have had their chance for a row, not inside either's
+    # first-match-wins loop. Exactly one enabled row is expected, same
+    # convention as the single `threshold` row per SHORT_PAY/UNAPPLIED/
+    # GL_CHECK phase.
+    crosscheck_rules = sorted(
+        (r for r in rules if r["phase"] == PHASE_NARRATION_CHECK and r["enabled"]),
+        key=lambda r: r["priority"],
+    )
+    crosscheck_rule = crosscheck_rules[0] if crosscheck_rules else None
     pooling_rules = sorted(
         (r for r in rules if r["phase"] == PHASE_CANDIDATE_POOL and r["enabled"]),
         key=lambda r: r["priority"],
@@ -113,15 +126,20 @@ async def run_phase_1(
     )
     duplicate_refs_in_run = {ref for ref, count in ref_counts.items() if count > 1}
 
+    all_open_invoices = await dao.load_open_invoices(entity_id, period_end)
+    customer_master = await dao.load_customer_master(entity_id)
+    cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
+
     ctx = RuleContext(
         entity_id=entity_id,
         dao=dao,
         conn=conn,
-        customers=await dao.load_customer_master(entity_id),
+        customers=customer_master,
         bank_accounts=await dao.load_customer_bank_accounts(entity_id),
         reference_codes=await dao.load_customer_reference_codes(entity_id),
         expected_remittances=await dao.load_expected_remittances(entity_id),
         duplicate_refs_in_run=duplicate_refs_in_run,
+        all_open_invoices=all_open_invoices,
     )
 
     outcomes: list[dict] = []
@@ -165,6 +183,7 @@ async def run_phase_1(
             counts["duplicate"] += 1
             continue
 
+        # Phase 1a (CUSTOMER_LOCK) - first match wins.
         fired_rule = None
         result = None
         for rule in identification_rules:
@@ -176,13 +195,90 @@ async def run_phase_1(
                 fired_rule = rule
                 break
 
+        # Phase 1b (CANDIDATE_POOL) - only reached if 1a locked nothing.
+        candidates: list[str] = []
+        if result is None or not result.customer_id:
+            for rule in pooling_rules:
+                rule_fn = POOLING_RULES.get(rule["kind"])
+                if rule_fn is None:
+                    continue
+                candidates = await rule_fn(bank_txn, ctx, rule["config"])
+                if candidates:
+                    break
+
+        # Phase 1c (NARRATION_CHECK) - runs after both 1a and 1b have had
+        # their chance, reconciled against whichever (if either) actually
+        # produced something. Searches every customer's open invoices (not
+        # just whoever 1a/1b already identified) for one the narration
+        # references.
+        narration_match = (
+            narration_invoice_owner(bank_txn.get("narration") or "", ctx.all_open_invoices)
+            if crosscheck_rule is not None
+            else None
+        )
+
+        if narration_match and result is not None and result.customer_id and narration_match["customer_id"] != result.customer_id:
+            # Two independently-confirmed answers disagree - don't let the
+            # lock stand unquestioned. No payments row locks to either
+            # candidate; money is still tracked (Dr CASH_CONTROL / Cr
+            # SUSPENSE, same GL shape as Suspense/Double-Collision) pending a
+            # human decision.
+            locked_name = cust_name_map.get(result.customer_id, result.customer_id[:8])
+            narration_name = cust_name_map.get(narration_match["customer_id"], narration_match["customer_id"][:8])
+            amt_fmt = f"₹{amount_minor / 100:,.2f}"
+            reason = (
+                f"{amt_fmt} payment locked to {locked_name} via {fired_rule['kind']}, but narration "
+                f"references {narration_name}'s invoice {narration_match['invoice_number']}"
+            )
+            payment = await dao.insert_payment(
+                bank_txn_id=bank_txn_id,
+                customer_id=None,
+                total_received_minor=amount_minor,
+                locked_by_rule_id=None,
+                candidate_pool=None,
+            )
+            await dao.insert_exception(
+                run_id=run_id,
+                exception_type="CUSTOMER_INVOICE_MISMATCH",
+                bank_txn_id=bank_txn_id,
+                customer_id=None,
+                discrepancy_minor=amount_minor,
+                reason_code=reason,
+                detail={
+                    "locked_customer_id": result.customer_id,
+                    "locked_customer_name": locked_name,
+                    "locked_via_rule": fired_rule["kind"],
+                    "narration_customer_id": narration_match["customer_id"],
+                    "narration_customer_name": narration_name,
+                    "narration_invoice_id": narration_match["invoice_id"],
+                    "narration_invoice_number": narration_match["invoice_number"],
+                },
+            )
+            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
+            exception_minor += amount_minor
+            counts["customer_invoice_mismatch"] += 1
+            suspense_records.append(
+                {
+                    "payment_id": payment["payment_id"],
+                    "bank_txn_id": bank_txn_id,
+                    "currency": bank_txn["currency"],
+                    "unapplied_minor": amount_minor,
+                    "memo": "Customer/invoice mismatch receipt - narration disagrees with the identified customer",
+                }
+            )
+            continue
+
         if result is not None and result.customer_id:
+            crosscheck_confirmed = bool(
+                narration_match and narration_match["customer_id"] == result.customer_id
+            )
             payment = await dao.insert_payment(
                 bank_txn_id=bank_txn_id,
                 customer_id=result.customer_id,
                 total_received_minor=amount_minor,
                 locked_by_rule_id=fired_rule["rule_id"],
                 candidate_pool=None,
+                narration_crosscheck_rule_id=crosscheck_rule["rule_id"] if crosscheck_confirmed else None,
             )
             outcomes.append(
                 {
@@ -195,14 +291,14 @@ async def run_phase_1(
             counts["locked"] += 1
             continue
 
-        candidates: list[str] = []
-        for rule in pooling_rules:
-            rule_fn = POOLING_RULES.get(rule["kind"])
-            if rule_fn is None:
-                continue
-            candidates = await rule_fn(bank_txn, ctx, rule["config"])
-            if candidates:
-                break
+        if not candidates and narration_match:
+            # Phase 1a locked nobody and the pooling rules found nothing
+            # either - fall back to the cross-check's own candidate rather
+            # than dropping straight to Suspense-with-no-suggestion. Still
+            # just a hint (single-candidate pool), never an auto-lock: Pass A
+            # in run_phase_2 always resolves a pool via Suspense/
+            # Double-Collision, never a silent commit.
+            candidates = [narration_match["customer_id"]]
 
         if candidates:
             payment = await dao.insert_payment(
@@ -266,6 +362,7 @@ async def run_phase_1(
         "outcomes": outcomes,
         "duplicate_count": counts["duplicate"],
         "suspense_count": counts["suspense"],
+        "customer_invoice_mismatch_count": counts["customer_invoice_mismatch"],
         "exception_value_minor": exception_minor,
         # M3: gl_posting.py posts these straight to SUSPENSE (no customer_id at all).
         "suspense_records": suspense_records,

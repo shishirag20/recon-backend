@@ -51,6 +51,11 @@ RECON_TYPES = ("AR", "AP", "BANK")  # only AR has an engine implementation today
 PHASE_INTAKE_VALIDATION = "INTAKE_VALIDATION"
 PHASE_CUSTOMER_LOCK = "CUSTOMER_LOCK"        # Phase 1a in the proposal doc
 PHASE_CANDIDATE_POOL = "CANDIDATE_POOL"      # Phase 1b
+# Runs after both 1a and 1b have had their chance for a row, reconciled
+# against whichever (if either) actually identified a customer - not one of
+# the six CUSTOMER_LOCK rules, so it gets its own phase rather than
+# competing in that first-match-wins loop. See engine.py::run_phase_1.
+PHASE_NARRATION_CHECK = "NARRATION_CHECK"
 PHASE_ALLOCATION = "ALLOCATION"              # Phase 2
 PHASE_SHORT_PAY = "SHORT_PAY"
 PHASE_UNAPPLIED = "UNAPPLIED"
@@ -58,7 +63,7 @@ PHASE_GL_CHECK = "GL_CHECK"
 
 RECON_PHASES = (
     PHASE_INTAKE_VALIDATION, PHASE_CUSTOMER_LOCK, PHASE_CANDIDATE_POOL,
-    PHASE_ALLOCATION, PHASE_SHORT_PAY, PHASE_UNAPPLIED, PHASE_GL_CHECK,
+    PHASE_NARRATION_CHECK, PHASE_ALLOCATION, PHASE_SHORT_PAY, PHASE_UNAPPLIED, PHASE_GL_CHECK,
 )
 
 # -- reconciliation_runs.status lifecycle ------------------------------------
@@ -83,7 +88,7 @@ MATCH_STATUSES = ("AUTO_MATCHED", "SUGGESTED", "CONFIRMED", "REJECTED")
 EXCEPTION_TYPES = (
     "SHORT_PAY", "OVERPAYMENT", "UNAPPLIED_CASH", "TIMING_DIFFERENCE", "GL_VARIANCE",
     "DUPLICATE", "MULTIPLE_INVOICE_MATCH", "DOUBLE_COLLISION", "SUSPENSE", "BANK_CHARGE",
-    "GATEWAY_VARIANCE", "NO_PAYMENT",
+    "GATEWAY_VARIANCE", "NO_PAYMENT", "CUSTOMER_INVOICE_MISMATCH",
 )
 EXCEPTION_STATUSES = (
     "OPEN", "INVESTIGATING", "RESOLVED", "AUTO_RESOLVED", "DEFERRED",
@@ -193,6 +198,21 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
      {"source": "customer_bank_accounts", "match_field": "bank_account_no", "mode": "suffix"}),
     (PHASE_CANDIDATE_POOL, "narration-tokens", "Token-Based Narration Match", 2, 50,
      {"source": "customers", "match_field": "company_name", "mode": "token_substring"}),
+
+    # Phase 1c - NARRATION_CHECK. Runs after both CUSTOMER_LOCK and
+    # CANDIDATE_POOL have had their chance for a row - not a normal
+    # first-match-wins rule itself, and never locks a customer on its own.
+    # It independently resolves which customer owns whatever invoice number
+    # the narration references (searched across every customer's invoices,
+    # not just whoever the phases above identified) and cross-checks that
+    # against their result: agreement is recorded
+    # (payments.narration_crosscheck_rule_id, surfaced in the "Resolved Via"
+    # UI); disagreement raises a CUSTOMER_INVOICE_MISMATCH exception instead
+    # of letting the lock stand unquestioned; and if 1a/1b found nobody at
+    # all, it seeds a single-candidate pool as a last-resort suggestion. See
+    # engine.py::run_phase_1.
+    (PHASE_NARRATION_CHECK, "invoice-number-in-narration", "Invoice Number in Narration", 1, 100,
+     {"description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?"}),
 
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool)
     (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
