@@ -17,7 +17,6 @@ import asyncpg
 
 from app.reconciliation import gl_posting
 from app.reconciliation.constants import (
-    GAP_ROLE_BY_RULE_KIND,
     PHASE_ALLOCATION,
     PHASE_CANDIDATE_POOL,
     PHASE_CUSTOMER_LOCK,
@@ -28,13 +27,7 @@ from app.reconciliation.constants import (
 )
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext, get_threshold_minor
-from app.reconciliation.rules.allocation import (
-    ALLOCATION_RULES,
-    dust_writeoff_close,
-    fee_tolerance_close,
-    resolve_dust_threshold,
-    tds_adjusted_close,
-)
+from app.reconciliation.rules.allocation import ALLOCATION_RULES, resolve_invoice_settlement
 from app.reconciliation.rules.identification import IDENTIFICATION_RULES, narration_invoice_owner
 from app.reconciliation.rules.pooling import POOLING_RULES
 
@@ -449,11 +442,12 @@ async def run_phase_2(
     customer's still-unresolved payments before rule 2 is tried on anyone,
     and so on down the priority list. This is the actual fix - the previous
     single-pass, payment-outer design let an *earlier* payment's low-priority
-    catch-all (rule 8, overpayment) permanently consume an invoice that a
-    *later* payment's higher-priority, more specific rule (rule 6, bank-fee)
-    needed, simply because it happened to be evaluated first. Every payment
-    now gets first crack at the specific/exact rules across the whole batch
-    before anyone is allowed to fall through to a generic one.
+    catch-all (partial-payment, the last rule) permanently consume an invoice
+    that a *later* payment's higher-priority, more specific rule
+    (exact-invoice-num) needed, simply because it happened to be evaluated
+    first. Every payment now gets first crack at the specific/exact rules
+    across the whole batch before anyone is allowed to fall through to a
+    generic one.
 
     Returns `payment_ledger_records` (one entry per payment processed here,
     every outcome type - committed, ambiguous, double-collision, unresolved)
@@ -567,7 +561,6 @@ async def run_phase_2(
         still_open: list[str] = []
         shortfall_total_minor = 0
         posted_allocations: list[dict] = []
-        gap_role = GAP_ROLE_BY_RULE_KIND.get(rule["kind"]) if rule else None
         for alloc in alloc_result.allocations:
             if alloc.cash_minor <= 0:
                 continue  # invoice_allocations.allocated_minor has CHECK(> 0) - nothing real moved, nothing to record
@@ -589,13 +582,16 @@ async def run_phase_2(
             )
             gap_minor = (
                 close_amount - alloc.cash_minor
-            )  # >0 only for close_full rules that absorbed a shortfall (TDS/fee/write-off)
+            )  # >0 only for close_full allocations that absorbed a shortfall (TDS/fee/write-off)
             posted_allocations.append(
                 {
                     "invoice_id": alloc.invoice_id,
                     "cash_minor": alloc.cash_minor,
                     "gap_minor": gap_minor,
-                    "gap_role": gap_role if gap_minor > 0 else None,
+                    # Per-allocation, not per-rule - a single subset-sum combo
+                    # can mix a raw-balance invoice with a TDS-adjusted one,
+                    # each needing its own gap destination.
+                    "gap_role": alloc.gap_role if gap_minor > 0 else None,
                 }
             )
             invoice["balance_due_minor"] = max(
@@ -775,18 +771,17 @@ async def run_phase_2(
         number in narration is self-sufficient evidence of which invoice
         this is, so it's allocated directly against exactly that one
         invoice, bypassing customer scoping entirely. Unlike `_commit`
-        there's no subset-sum/exact-amount cascade (both genuinely need a
-        bounded, known customer's invoice set to search) - but the three
-        single-invoice tolerance rules (TDS-net, fee-tolerance, dust
-        write-off) are checked against this one invoice, via the same
-        `*_close` helpers `_commit`'s rule functions use, so a payment
-        short by TDS/a bank fee/a dust residual still closes the invoice
-        here instead of always falling through to a flat Short-Pay.
-        customer_id stays NULL throughout - on the payment, the
-        match_group, and the GL posting (gl_posting.py routes any leftover
-        to SUSPENSE rather than ON_ACCOUNT_ADVANCE whenever a
-        payment_ledger_records entry's customer_id is None, same as an
-        ordinary unidentified receipt)."""
+        there's no subset-sum cascade here (that genuinely needs a bounded,
+        known customer's invoice set to search) - but the same settlement
+        classifier every other Phase 2 rule uses
+        (`allocation.py::resolve_invoice_settlement`) is run against this
+        one invoice, so a payment short by TDS/a bank fee/a dust residual
+        still closes it, and an overpayment is reported as such instead of
+        being mislabeled an exact match. customer_id stays NULL throughout -
+        on the payment, the match_group, and the GL posting (gl_posting.py
+        routes any leftover to SUSPENSE rather than ON_ACCOUNT_ADVANCE
+        whenever a payment_ledger_records entry's customer_id is None, same
+        as an ordinary unidentified receipt)."""
         payment_id = item["payment_id"]
         bank_txn = item["bank_txn"]
         bank_txn_id = bank_txn["bank_txn_id"]
@@ -799,67 +794,23 @@ async def run_phase_2(
             return
 
         inv_label = invoice.get("document_number") or invoice["invoice_number"]
-
-        # Priority-ordered (same order the catalog gives them) single-invoice
-        # tolerance check - only fires for rules the definition actually has
-        # enabled. First match wins, same as Pass B's per-rule cascade.
-        rule = None
-        reason = None
-        for candidate in allocation_rules:
-            kind = candidate["kind"]
-            if kind == "tds-match":
-                result = tds_adjusted_close(amount, invoice)
-                if result is not None:
-                    _, reason = result
-                    rule = candidate
-                    break
-            elif kind == "bank-fee":
-                explicit_fee = bank_txn.get("explicit_fee_minor") or 0
-                if explicit_fee > 0:
-                    result = fee_tolerance_close(amount, invoice, explicit_fee)
-                    if result is not None:
-                        reason = result
-                        rule = candidate
-                        break
-            elif kind == "write-off":
-                threshold = resolve_dust_threshold(candidate["config"] or {})
-                result = dust_writeoff_close(amount, invoice, threshold)
-                if result is not None:
-                    reason = result
-                    rule = candidate
-                    break
-
-        close_full = rule is not None
-        cash = amount if close_full else min(amount, invoice["balance_due_minor"])
-        close_amount = invoice["balance_due_minor"] if close_full else cash
+        settle = resolve_invoice_settlement(amount, invoice, bank_txn)
+        cash = settle.cash_minor
+        close_amount = invoice["balance_due_minor"] if settle.close_full else cash
         gap_minor = close_amount - cash
-        gap_role = GAP_ROLE_BY_RULE_KIND.get(rule["kind"]) if rule else None
-        # Same "closest invoice fully settled, excess on-account" case
-        # overpay_on_account handles for a known customer - here the excess
-        # just has nowhere to go but SUSPENSE (no customer to credit
-        # on-account), but it still shouldn't be mislabeled EXACT: `cash`
-        # below is min(amount, balance), so an overpayment and a true exact
-        # match both land on cash == balance_due_minor without this check.
-        is_overpay = not close_full and amount > invoice["balance_due_minor"]
-        if reason is None:
-            if is_overpay:
-                excess_fmt = f"₹{(amount - invoice['balance_due_minor']) / 100:,.2f}"
-                reason = (
-                    f"{inv_label!r} in narration - no customer identified, "
-                    f"invoice fully settled, {excess_fmt} excess unapplied"
-                )
-            else:
-                reason = f"{inv_label!r} in narration - no customer identified, matched directly"
+        gap_role = settle.gap_role
+        base_reason = f"{inv_label!r} in narration - no customer identified"
+        reason = (
+            f"{base_reason}, matched directly"
+            if settle.status in ("EXACT", "PARTIAL")
+            else f"{base_reason}, {settle.reason}"
+        )
 
         match_group = await dao.insert_match_group(
             run_id=run_id,
-            match_type=(
-                "TOLERANCE"
-                if close_full or is_overpay
-                else ("EXACT" if cash == invoice["balance_due_minor"] else "PARTIAL")
-            ),
-            rule_id=rule["rule_id"] if rule else None,
-            confidence=rule["confidence"] if rule else None,
+            match_type="EXACT" if settle.status == "EXACT" else ("PARTIAL" if settle.status == "PARTIAL" else "TOLERANCE"),
+            rule_id=None,
+            confidence=None,
             status="AUTO_MATCHED",
             reason=reason,
         )

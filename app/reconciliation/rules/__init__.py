@@ -84,12 +84,17 @@ class InvoiceAllocation:
     `close_full=True` means the invoice's balance should go to zero
     regardless of `cash_minor` being less than its original balance - the
     gap is being explicitly absorbed (a bank fee, a dust write-off, TDS
-    withheld at source), not left owing. The gap itself isn't posted
-    anywhere yet in M2 - that's gl_posting.py's job in M3; this just decides
-    the invoice is *done*."""
+    withheld at source), not left owing. `gap_role` (a GL_ROLE_* constant)
+    says where that gap posts - set per-allocation by whichever rule
+    identified this invoice (allocation.py::resolve_invoice_settlement),
+    since a single subset-sum combo can now mix a raw-balance invoice with a
+    TDS-adjusted one, each needing its own destination. The gap itself isn't
+    posted anywhere yet in M2 - that's gl_posting.py's job in M3; this just
+    decides the invoice is *done* and where its gap belongs."""
     invoice_id: str
     cash_minor: int
     close_full: bool = False
+    gap_role: str | None = None
 
 
 @dataclass
