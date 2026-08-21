@@ -24,6 +24,8 @@ TRANSFORMS = (
     "REGEX",
     "PARSE_BOOL",
     "TO_DECIMAL",
+    "CONST_IF_PRESENT",
+    "FILL_DOWN",
 )
 
 _DEFAULT_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y")
@@ -57,6 +59,17 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
     if raw_value is None or (isinstance(raw_value, str) and raw_value.strip() == ""):
         return None
 
+    if transform == "CONST_IF_PRESENT":
+        # Like CONST, but only when the raw cell actually has something in
+        # it - CONST fires unconditionally (checked above, before this blank
+        # guard), which is wrong for a column that's only sometimes
+        # populated (e.g. a bank statement with separate Credit/Debit amount
+        # columns instead of one signed Amount column: mapping both
+        # `Credit -> dr_cr` and `Debit -> dr_cr` with CONST_IF_PRESENT lets
+        # whichever column actually has a value win, instead of one CONST
+        # blindly stamping every row the same direction).
+        return transform_param
+
     if transform == "NONE":
         return raw_value
     if transform == "TRIM":
@@ -78,7 +91,16 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
     if transform == "NEGATE":
         return str(-_clean_decimal(raw_value))
 
-    if transform == "PARSE_DATE":
+    if transform in ("PARSE_DATE", "FILL_DOWN"):
+        # FILL_DOWN parses identically to PARSE_DATE - transform_param is the
+        # same comma-separated format list. The only difference is upstream:
+        # apply_fill_down() (called once, before any row is processed) has
+        # already carried a blank cell in this raw column forward from the
+        # last non-blank row - e.g. a bank statement that prints the date
+        # once per day, on a header/opening-balance row, leaving every
+        # transaction row under it blank. By the time this function sees the
+        # value it's never actually blank, so no cross-row state belongs
+        # here - apply_transform stays a pure, single-value function.
         formats = [f.strip() for f in transform_param.split(",")] if transform_param else list(_DEFAULT_DATE_FORMATS)
         text = raw_value.strip()
         for fmt in formats:
@@ -123,6 +145,34 @@ def normalize_header(name: str) -> str:
     for "the same" column (e.g. "Amount" vs "amount " vs "AMOUNT") must all
     resolve to the same synonym row instead of requiring a byte-exact match."""
     return name.strip().lower()
+
+
+def apply_fill_down(rows: list[dict], mappings: list) -> list[dict]:
+    """Forward-fills blank cells in any raw source column mapped with
+    transform='FILL_DOWN', using the last non-blank value seen earlier in
+    file order - e.g. a bank statement that prints the date once per day, on
+    a header/opening-balance row, leaving every transaction row under it
+    blank. Must run once, over the whole file, before apply_mapping is
+    called on any individual row - apply_mapping/apply_transform stay pure,
+    single-row functions with no cross-row memory of their own. A no-op
+    (returns `rows` unchanged) when no active mapping uses FILL_DOWN."""
+    fill_down_sources = {normalize_header(m["source_field"]) for m in mappings if m["transform"] == "FILL_DOWN"}
+    if not fill_down_sources:
+        return rows
+    last_seen: dict[str, str] = {}
+    filled_rows = []
+    for row in rows:
+        new_row = dict(row)
+        for key, value in row.items():
+            normalized_key = normalize_header(key)
+            if normalized_key not in fill_down_sources:
+                continue
+            if value is not None and str(value).strip() != "":
+                last_seen[normalized_key] = value
+            elif normalized_key in last_seen:
+                new_row[key] = last_seen[normalized_key]
+        filled_rows.append(new_row)
+    return filled_rows
 
 
 def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:

@@ -5,7 +5,7 @@ Once field_mappings became a global, stream-scoped synonym dictionary
 column header that doesn't match an existing synonym gets sent here, the
 model guesses which canonical field it corresponds to, and the caller
 (app/workers/ingestion_worker.py) persists that guess back into the
-dictionary via DataHubDAO.insert_mapping_version - so the shared mapping
+dictionary via DataHubDAO.save_mapping - so the shared mapping
 gets smarter over time instead of failing the same unknown column on every
 future upload.
 

@@ -135,6 +135,40 @@ async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) ->
     )
 
 
+async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+    """1.7a - last resort in the CUSTOMER_LOCK cascade, only reached if
+    nothing richer (UTR, account+IFSC, VPA, customer-code, GSTIN/PAN,
+    fuzzy-name) found anything. For a remittance with none of that data -
+    just a bank narration and an invoice/document number in it - this is the
+    only signal left: does the narration reference a real open invoice
+    (entity-wide, not scoped to any customer - nobody's been identified
+    yet), and does *that invoice* already know its own customer (from ERP
+    ingestion)? If so, lock the payment to it.
+
+    Deliberately placed last, not first: it's a real signal but a shorter,
+    more collision-prone one than the others (document numbers are often
+    short digit strings glued into free-text narration with no delimiter -
+    see docs/reconciliation.md's cross-check on the real CMR data), so a
+    solid identity match earlier in the cascade should always win first.
+
+    Reuses narration_invoice_owner() - the same search the NARRATION_CHECK
+    cross-check (Phase 1c) independently performs after this cascade runs;
+    if this rule is what locked the payment, that cross-check will find the
+    same invoice and record agreement rather than raise a mismatch."""
+    match = narration_invoice_owner(bank_txn.get("narration") or "", ctx.all_open_invoices)
+    if match is None or match["customer_id"] is None:
+        # Either no invoice reference found, or it was found but that
+        # invoice itself has no customer yet either (migration 0031) - this
+        # rule can only *identify*, it can't invent a customer that doesn't
+        # exist anywhere. Falls through to Phase 1b / the narration-pool
+        # fallback / Suspense, same as today.
+        return IdentificationResult()
+    return IdentificationResult(
+        customer_id=match["customer_id"],
+        reason=f"document/invoice number {match['matched_number']!r} in narration (invoice's own customer)",
+    )
+
+
 def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> dict | None:
     """The "Invoice Number in Narration" cross-check (kind
     `invoice-number-in-narration`). Deliberately NOT in `IDENTIFICATION_RULES`
@@ -146,15 +180,32 @@ def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> di
     (allocation.py::invoice_number_match), just unscoped: it searches every
     open invoice for this entity, not one customer's, since the whole point
     is to catch a narration referencing a *different* customer's invoice than
-    the one Phase 1a is about to lock."""
+    the one Phase 1a is about to lock.
+
+    Checks both invoice_number and document_number (migration 0033) - some
+    ERP exports label the customer-facing reference "Document Number" rather
+    than "Invoice Number" (see CMR_BOOK_DATA.csv), or carry both as
+    genuinely different values. Either one appearing in narration is
+    equally strong evidence of which invoice this is."""
     if not narration:
         return None
     for inv in all_open_invoices:
+        matched_number = None
         if extract.contains_substring(narration, inv["invoice_number"]):
+            matched_number = inv["invoice_number"]
+        elif inv.get("document_number") and extract.contains_substring(narration, inv["document_number"]):
+            matched_number = inv["document_number"]
+        if matched_number is not None:
             return {
-                "customer_id": str(inv["customer_id"]),
+                # None (migration 0031, an invoice ingested without a
+                # resolvable customer) must stay None here, not str(None) -
+                # engine.py's mismatch check treats a real customer_id that
+                # disagrees with Phase 1a's lock very differently from "this
+                # invoice doesn't have one yet to disagree with."
+                "customer_id": str(inv["customer_id"]) if inv["customer_id"] is not None else None,
                 "invoice_id": str(inv["invoice_id"]),
                 "invoice_number": inv["invoice_number"],
+                "matched_number": matched_number,
             }
     return None
 
@@ -167,5 +218,6 @@ IDENTIFICATION_RULES: dict[str, RuleFn] = {
     "customer-code": reference_code_match,
     "gstin-pan": gstin_pan_match,
     "fuzzy-name": fuzzy_name_match,
+    "document-number-narration": document_number_match,
     "field-match": generic_field_match,
 }

@@ -66,6 +66,15 @@ class AllocationContext:
     conn: asyncpg.Connection
     invoices_by_customer: dict[str, list[dict]]
     memos_by_customer: dict[str, list[dict]] = field(default_factory=dict)
+    # Entity-wide, not scoped to any customer - invoices ingested without a
+    # resolvable customer_code (migration 0031). Only invoice_number_match/
+    # truncated_suffix_match search this, and only after that customer's own
+    # invoices come up empty: a literal invoice-number match in narration is
+    # self-sufficient evidence, unlike balance-based rules (subset-sum etc.),
+    # which would be unsafe to run across an unbounded, unrelated pool. A hit
+    # here promotes the invoice into invoices_by_customer and backfills its
+    # customer_id - see allocation.py's _promote_unresolved_invoice.
+    unresolved_invoices: list[dict] = field(default_factory=list)
 
 
 @dataclass

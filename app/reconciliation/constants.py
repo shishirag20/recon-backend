@@ -192,6 +192,13 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
      {"source": "customers", "extract": ["gstin", "pan"]}),
     (PHASE_CUSTOMER_LOCK, "fuzzy-name", "Company Name Match", 6, 85,
      {"source": "customers", "match_field": "company_name", "min_similarity": 0.85}),
+    # Last resort: no UTR/account/VPA/customer-code/GSTIN/PAN/fuzzy-name
+    # match at all - e.g. a remittance with no rich payer data on the bank
+    # side, only a narration. Only fires if the referenced invoice already
+    # has its own customer_id (from ERP ingestion) - see
+    # app/reconciliation/rules/identification.py::document_number_match.
+    (PHASE_CUSTOMER_LOCK, "document-number-narration", "Document Number in Narration Match", 7, 85,
+     {"source": "invoices", "match_field": "invoice_number", "location": "narration"}),
 
     # Phase 1b - CANDIDATE_POOL (only reached if Phase 1a locked nothing)
     (PHASE_CANDIDATE_POOL, "account-suffix", "Masked Account Suffix Match", 1, 60,

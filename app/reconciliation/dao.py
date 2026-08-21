@@ -237,6 +237,52 @@ class ReconciliationDAO:
         )
         return _row(row)
 
+    # DEV-ONLY: wipes every run/match/exception/GL posting for a definition
+    # and resets invoices/bank_statements back to their pre-reconciliation
+    # state, so the same source data can be re-run from scratch while
+    # iterating on rules/mappings. Not meant to survive past dev - grep
+    # "DEV-ONLY" to find every piece of this if/when it's time to remove it.
+    async def reset_definition(self, definition_id: str, entity_id: str) -> None:
+        async with self.conn.transaction():
+            await self.conn.execute(
+                "DELETE FROM reconciliation_exceptions WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            # match_groups -> invoice_allocations cascades (ON DELETE CASCADE);
+            # gl_journal_entries -> gl_journal_lines cascades too. Order here
+            # only matters for invoice_allocations.gl_journal_id, a plain FK
+            # (no cascade) - deleting match_groups first removes the
+            # referencing rows before gl_journal_entries is touched.
+            await self.conn.execute(
+                "DELETE FROM match_groups WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM gl_journal_entries WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM payments WHERE bank_txn_id IN "
+                "(SELECT bank_txn_id FROM bank_statements WHERE entity_id = $1)",
+                entity_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM reconciliation_runs WHERE definition_id = $1", definition_id
+            )
+            await self.conn.execute(
+                "UPDATE invoices SET balance_due_minor = total_amount_minor, status = 'OPEN' "
+                "WHERE entity_id = $1",
+                entity_id,
+            )
+            await self.conn.execute(
+                "UPDATE bank_statements SET recon_status = 'PENDING', gl_posted = false "
+                "WHERE entity_id = $1",
+                entity_id,
+            )
+
     async def get_run(self, run_id: str) -> dict | None:
         row = await self.conn.fetchrow(
             f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs WHERE run_id = $1",
@@ -437,7 +483,7 @@ class ReconciliationDAO:
         a pre-populated `allowed_tds_minor` - the ingestion mapping has no
         way to derive that product today (see docs/reconciliation.md §8)."""
         rows = await self.conn.fetch(
-            "SELECT invoice_id, customer_id, invoice_number, issue_date, due_date, "
+            "SELECT invoice_id, customer_id, invoice_number, document_number, issue_date, due_date, "
             "total_amount_minor, balance_due_minor, allowed_tds_minor, tds_rate_pct, status "
             "FROM invoices WHERE entity_id = $1 AND status != 'PAID' "
             "AND ($2::date IS NULL OR issue_date <= $2) "
@@ -516,6 +562,21 @@ class ReconciliationDAO:
             "RETURNING invoice_id, balance_due_minor, status",
             invoice_id,
             amount_minor,
+        )
+        return _row(row)
+
+    async def link_invoice_customer(self, invoice_id: str, customer_id: str) -> dict:
+        """Backfills customer_id on an invoice ingested without one
+        (migration 0031), once a narration-based invoice-number match ties it
+        to a real payment's already-identified customer. Only ever called
+        against a row that's currently NULL there - see
+        allocation.py's _promote_unresolved_invoice."""
+        row = await self.conn.fetchrow(
+            "UPDATE invoices SET customer_id = $2, updated_at = now() "
+            "WHERE invoice_id = $1 "
+            "RETURNING invoice_id, customer_id",
+            invoice_id,
+            customer_id,
         )
         return _row(row)
 

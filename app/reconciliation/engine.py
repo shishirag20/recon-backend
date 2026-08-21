@@ -28,7 +28,13 @@ from app.reconciliation.constants import (
 )
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext, get_threshold_minor
-from app.reconciliation.rules.allocation import ALLOCATION_RULES
+from app.reconciliation.rules.allocation import (
+    ALLOCATION_RULES,
+    dust_writeoff_close,
+    fee_tolerance_close,
+    resolve_dust_threshold,
+    tds_adjusted_close,
+)
 from app.reconciliation.rules.identification import IDENTIFICATION_RULES, narration_invoice_owner
 from app.reconciliation.rules.pooling import POOLING_RULES
 
@@ -217,7 +223,13 @@ async def run_phase_1(
             else None
         )
 
-        if narration_match and result is not None and result.customer_id and narration_match["customer_id"] != result.customer_id:
+        if (
+            narration_match
+            and result is not None
+            and result.customer_id
+            and narration_match["customer_id"] is not None
+            and narration_match["customer_id"] != result.customer_id
+        ):
             # Two independently-confirmed answers disagree - don't let the
             # lock stand unquestioned. No payments row locks to either
             # candidate; money is still tracked (Dr CASH_CONTROL / Cr
@@ -291,13 +303,19 @@ async def run_phase_1(
             counts["locked"] += 1
             continue
 
-        if not candidates and narration_match:
+        if not candidates and narration_match and narration_match["customer_id"] is not None:
             # Phase 1a locked nobody and the pooling rules found nothing
             # either - fall back to the cross-check's own candidate rather
             # than dropping straight to Suspense-with-no-suggestion. Still
             # just a hint (single-candidate pool), never an auto-lock: Pass A
             # in run_phase_2 always resolves a pool via Suspense/
             # Double-Collision, never a silent commit.
+            # (The None guard matters now that document-number-narration
+            # exists as a real rule above this: if it already tried and
+            # declined - the referenced invoice has no customer either -
+            # narration_match["customer_id"] is None here, and appending
+            # that would silently push a dead-end [None] candidate into Pass
+            # A, which can never resolve to anything.)
             candidates = [narration_match["customer_id"]]
 
         if candidates:
@@ -317,6 +335,35 @@ async def run_phase_1(
                 }
             )
             counts["pooled"] += 1
+            continue
+
+        # Truly no customer anywhere - not on the payment side (Phase 1a/1b
+        # found nobody), not on the invoice side either (narration_match's
+        # own customer_id is None, migration 0031). The invoice number/
+        # document number itself is still self-sufficient evidence of which
+        # invoice this is, even with no identity to attach it to - hand it
+        # to Phase 2 as a direct match instead of dropping straight to
+        # Suspense. customer_id stays NULL on the payment (there's nothing
+        # to backfill it with); run_phase_2's direct-match pass allocates
+        # against exactly this invoice, bypassing customer scoping entirely.
+        if narration_match:
+            payment = await dao.insert_payment(
+                bank_txn_id=bank_txn_id,
+                customer_id=None,
+                total_received_minor=amount_minor,
+                locked_by_rule_id=None,
+                candidate_pool=None,
+            )
+            outcomes.append(
+                {
+                    "payment_id": payment["payment_id"],
+                    "bank_txn": bank_txn,
+                    "customer_id": None,
+                    "candidate_pool": None,
+                    "direct_invoice_id": narration_match["invoice_id"],
+                }
+            )
+            counts["direct_match"] += 1
             continue
 
         # Neither phase found anything at all - Suspense. Still gets a
@@ -431,6 +478,13 @@ async def run_phase_2(
     customer_master = await dao.load_customer_master(entity_id)
     cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
     invoices_by_customer: dict[str, list[dict]] = defaultdict(list)
+    # Ingested (migration 0031) but never linked to a customer - not "this
+    # customer's invoice" to any payment yet, so it's kept out of
+    # invoices_by_customer entirely rather than under a bogus str(None) =
+    # "None" key that no real customer_id would ever look up. Tracked here so
+    # it's still visible (see the unresolved-customer sweep below) instead of
+    # silently invisible to every allocation rule forever.
+    unresolved_invoices: list[dict] = []
     for inv in invoices:
         # Normalize once here (asyncpg returns uuid.UUID, not str) so every
         # downstream consumer - allocation.py's rules, this function's own
@@ -438,6 +492,9 @@ async def run_phase_2(
         # plain strings consistently, instead of each having to remember to
         # convert (see docs/reconciliation.md's UUID-vs-str bug history).
         inv["invoice_id"] = str(inv["invoice_id"])
+        if inv["customer_id"] is None:
+            unresolved_invoices.append(inv)
+            continue
         inv["customer_id"] = str(inv["customer_id"])
         invoices_by_customer[inv["customer_id"]].append(inv)
 
@@ -466,6 +523,7 @@ async def run_phase_2(
         conn=conn,
         invoices_by_customer=invoices_by_customer,
         memos_by_customer=memos_by_customer,
+        unresolved_invoices=unresolved_invoices,
     )
 
     money = {"matched": 0, "exception": 0, "unapplied": 0}
@@ -709,6 +767,171 @@ async def run_phase_2(
             }
         )
 
+    async def _commit_direct_match(item: dict, invoice: dict) -> None:
+        """Writes a direct invoice match for a payment with no customer
+        identified anywhere - not on the payment side (Phase 1a/1b found
+        nobody) and not on the invoice side either (migration 0031, no
+        ERP-linked customer_id to backfill from). The invoice/document
+        number in narration is self-sufficient evidence of which invoice
+        this is, so it's allocated directly against exactly that one
+        invoice, bypassing customer scoping entirely. Unlike `_commit`
+        there's no subset-sum/exact-amount cascade (both genuinely need a
+        bounded, known customer's invoice set to search) - but the three
+        single-invoice tolerance rules (TDS-net, fee-tolerance, dust
+        write-off) are checked against this one invoice, via the same
+        `*_close` helpers `_commit`'s rule functions use, so a payment
+        short by TDS/a bank fee/a dust residual still closes the invoice
+        here instead of always falling through to a flat Short-Pay.
+        customer_id stays NULL throughout - on the payment, the
+        match_group, and the GL posting (gl_posting.py routes any leftover
+        to SUSPENSE rather than ON_ACCOUNT_ADVANCE whenever a
+        payment_ledger_records entry's customer_id is None, same as an
+        ordinary unidentified receipt)."""
+        payment_id = item["payment_id"]
+        bank_txn = item["bank_txn"]
+        bank_txn_id = bank_txn["bank_txn_id"]
+        amount = bank_txn["amount_minor"]
+
+        if min(amount, invoice["balance_due_minor"]) <= 0:
+            # Already fully closed by something else this run - nothing left
+            # to allocate; treat like any other payment that matched nothing.
+            await _unapplied(item, None)
+            return
+
+        inv_label = invoice.get("document_number") or invoice["invoice_number"]
+
+        # Priority-ordered (same order the catalog gives them) single-invoice
+        # tolerance check - only fires for rules the definition actually has
+        # enabled. First match wins, same as Pass B's per-rule cascade.
+        rule = None
+        reason = None
+        for candidate in allocation_rules:
+            kind = candidate["kind"]
+            if kind == "tds-match":
+                result = tds_adjusted_close(amount, invoice)
+                if result is not None:
+                    _, reason = result
+                    rule = candidate
+                    break
+            elif kind == "bank-fee":
+                explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+                if explicit_fee > 0:
+                    result = fee_tolerance_close(amount, invoice, explicit_fee)
+                    if result is not None:
+                        reason = result
+                        rule = candidate
+                        break
+            elif kind == "write-off":
+                threshold = resolve_dust_threshold(candidate["config"] or {})
+                result = dust_writeoff_close(amount, invoice, threshold)
+                if result is not None:
+                    reason = result
+                    rule = candidate
+                    break
+
+        close_full = rule is not None
+        cash = amount if close_full else min(amount, invoice["balance_due_minor"])
+        close_amount = invoice["balance_due_minor"] if close_full else cash
+        gap_minor = close_amount - cash
+        gap_role = GAP_ROLE_BY_RULE_KIND.get(rule["kind"]) if rule else None
+        # Same "closest invoice fully settled, excess on-account" case
+        # overpay_on_account handles for a known customer - here the excess
+        # just has nowhere to go but SUSPENSE (no customer to credit
+        # on-account), but it still shouldn't be mislabeled EXACT: `cash`
+        # below is min(amount, balance), so an overpayment and a true exact
+        # match both land on cash == balance_due_minor without this check.
+        is_overpay = not close_full and amount > invoice["balance_due_minor"]
+        if reason is None:
+            if is_overpay:
+                excess_fmt = f"₹{(amount - invoice['balance_due_minor']) / 100:,.2f}"
+                reason = (
+                    f"{inv_label!r} in narration - no customer identified, "
+                    f"invoice fully settled, {excess_fmt} excess unapplied"
+                )
+            else:
+                reason = f"{inv_label!r} in narration - no customer identified, matched directly"
+
+        match_group = await dao.insert_match_group(
+            run_id=run_id,
+            match_type=(
+                "TOLERANCE"
+                if close_full or is_overpay
+                else ("EXACT" if cash == invoice["balance_due_minor"] else "PARTIAL")
+            ),
+            rule_id=rule["rule_id"] if rule else None,
+            confidence=rule["confidence"] if rule else None,
+            status="AUTO_MATCHED",
+            reason=reason,
+        )
+        await dao.apply_invoice_allocation(invoice["invoice_id"], close_amount)
+        await dao.insert_invoice_allocation(
+            match_group_id=match_group["match_group_id"],
+            invoice_id=invoice["invoice_id"],
+            payment_id=payment_id,
+            bank_txn_id=bank_txn_id,
+            allocated_minor=cash,
+        )
+        invoice["balance_due_minor"] = max(0, invoice["balance_due_minor"] - close_amount)
+        touched_invoice_ids.add(invoice["invoice_id"])
+        if invoice["balance_due_minor"] <= 0:
+            # Same in-memory-removal reasoning as _commit: stop a later
+            # payment in this same run from "finding" it again.
+            unresolved_invoices[:] = [
+                i for i in unresolved_invoices if i["invoice_id"] != invoice["invoice_id"]
+            ]
+
+        await dao.apply_payment_allocation(payment_id, cash)
+        leftover = amount - cash
+
+        if invoice["balance_due_minor"] > 0:
+            if invoice["balance_due_minor"] > short_pay_tolerance_minor:
+                shortfall_fmt = f"₹{invoice['balance_due_minor'] / 100:,.2f}"
+                reason = f"Unidentified payment short-paid {inv_label} by {shortfall_fmt}"
+                await dao.insert_exception(
+                    run_id=run_id,
+                    exception_type="SHORT_PAY",
+                    bank_txn_id=bank_txn_id,
+                    customer_id=None,
+                    discrepancy_minor=invoice["balance_due_minor"],
+                    reason_code=reason,
+                    detail={
+                        "invoice_ids": [invoice["invoice_id"]],
+                        "shortfall_minor": invoice["balance_due_minor"],
+                        "tolerance_minor": short_pay_tolerance_minor,
+                        "invoice_numbers": [inv_label],
+                    },
+                    match_group_id=match_group["match_group_id"],
+                )
+                money["exception"] += amount
+                counts["short_pay"] += 1
+            else:
+                money["matched"] += amount
+                counts["matched"] += 1
+            await dao.mark_bank_statement_status(bank_txn_id, "PARTIAL")
+        else:
+            await dao.mark_bank_statement_status(bank_txn_id, "MATCHED")
+            money["matched"] += amount
+            counts["matched"] += 1
+
+        money["unapplied"] += max(0, leftover)
+        payment_ledger_records.append(
+            {
+                "payment_id": payment_id,
+                "bank_txn_id": bank_txn_id,
+                "customer_id": None,
+                "currency": bank_txn["currency"],
+                "unapplied_minor": max(0, leftover),
+                "allocations": [
+                    {
+                        "invoice_id": invoice["invoice_id"],
+                        "cash_minor": cash,
+                        "gap_minor": gap_minor if gap_minor > 0 else 0,
+                        "gap_role": gap_role if gap_minor > 0 else None,
+                    }
+                ],
+            }
+        )
+
     # --- Pass A: pooled payments only (candidate_pool, from Phase 1b) - a
     # locked payment (outcome["customer_id"] already set by Phase 1a, an
     # independently confirmed identity) skips straight into `pending` for
@@ -718,6 +941,23 @@ async def run_phase_2(
     # trusted enough to write a real match_group.
     pending: list[tuple[dict, str]] = []  # (item, resolved_customer_id) for Pass B
     for outcome in outcomes:
+        if outcome.get("direct_invoice_id"):
+            # No customer anywhere (payment or invoice) - resolved by
+            # run_phase_1's direct-match fallback. Bypasses Pass A/B's
+            # customer-scoped machinery entirely; see _commit_direct_match.
+            invoice = next(
+                (i for i in unresolved_invoices if i["invoice_id"] == outcome["direct_invoice_id"]),
+                None,
+            )
+            if invoice is None:
+                # Already closed by another direct match earlier in this
+                # same run (two payments' narration both named it) - can't
+                # double-allocate it, so this one matched nothing.
+                await _unapplied(outcome, None)
+            else:
+                await _commit_direct_match(outcome, invoice)
+            continue
+
         if outcome["customer_id"] is not None:
             pending.append((outcome, outcome["customer_id"]))
             continue
@@ -919,6 +1159,33 @@ async def run_phase_2(
                     },
                 )
                 no_payment_count += 1
+
+    # Unresolved-customer sweep: invoices ingested without a resolvable
+    # customer_code (migration 0031) - a distinct problem from an ordinary
+    # No-Payment (that customer's own invoice, just not paid yet). Flagged
+    # every run until a narration-based invoice-number match (or a human)
+    # resolves the customer, at which point the invoice moves into the
+    # normal invoices_by_customer working set and stops appearing here.
+    for inv in unresolved_invoices:
+        if inv["balance_due_minor"] <= 0:
+            continue
+        bal_fmt = f"₹{inv['balance_due_minor'] / 100:,.2f}"
+        reason = f"Invoice {inv['invoice_number']} ({bal_fmt}) has no linked customer - cannot be reconciled"
+        await dao.insert_exception(
+            run_id=run_id,
+            exception_type="NO_PAYMENT",
+            bank_txn_id=None,
+            customer_id=None,
+            invoice_id=inv["invoice_id"],
+            discrepancy_minor=inv["balance_due_minor"],
+            reason_code=reason,
+            detail={
+                "invoice_number": inv["invoice_number"],
+                "balance_due_minor": inv["balance_due_minor"],
+                "unresolved_customer": True,
+            },
+        )
+        no_payment_count += 1
 
     return {
         "matched_count": counts["matched"],

@@ -88,104 +88,35 @@ class DataHubService:
         self._require_valid_stream(stream)
         return await self.dao.get_active_mappings(stream)
 
-    async def create_mapping_version(self, stream: str, mappings: list[dict]):
+    async def save_mapping(self, stream: str, mappings: list[dict]) -> list[dict]:
+        """Replaces this stream's entire mapping set with exactly what's
+        submitted - a true replace, not a merge with whatever's currently
+        active. If you want to keep an existing synonym, include it in
+        `mappings`; anything omitted is gone after this call. That's
+        deliberate: with no version history (see migration 0032), silently
+        preserving omitted rows would make it impossible to ever remove a
+        bad mapping through this API - which was a real bug here before
+        (rewritten from a merge-based implementation that did exactly that).
+        Only light validation/normalization happens here; the DAO does the
+        actual atomic swap."""
         self._require_valid_stream(stream)
-
-        # 1. Clean, filter and deduplicate incoming mappings
-        incoming_by_source: dict[tuple, dict] = {}
+        cleaned = []
         for m in mappings:
             source = str(m.get("source_field", "")).strip()
-            canonical = (
-                str(m.get("canonical_field", "")).strip()
-                if m.get("canonical_field")
-                else ""
-            )
-            if not source or not canonical or canonical == "-":
+            if not source:
                 continue
+            canonical = str(m.get("canonical_field") or "").strip()
             transform = str(m.get("transform", "NONE")).strip().upper() or "NONE"
             transform_param = m.get("transform_param")
             if isinstance(transform_param, str):
                 transform_param = transform_param.strip() or None
-
-            norm_src = transforms.normalize_header(source)
-            mapping_dict = {
+            cleaned.append({
                 "source_field": source,
                 "canonical_field": canonical,
                 "transform": transform,
                 "transform_param": transform_param,
-            }
-
-            if transform == "CONST":
-                dedup_key = (norm_src, canonical.lower(), transform)
-            else:
-                dedup_key = (norm_src,)
-
-            incoming_by_source[dedup_key] = mapping_dict
-
-        # 2. Merge with existing active mappings to preserve global synonym dictionary
-        active_mappings = await self.get_active_mappings(stream)
-        merged_mappings: list[dict] = list(incoming_by_source.values())
-
-        for m in active_mappings:
-            src = str(m.get("source_field", "")).strip()
-            canon = str(m.get("canonical_field", "")).strip()
-            tr = str(m.get("transform", "NONE")).strip().upper() or "NONE"
-            param = m.get("transform_param")
-            if isinstance(param, str):
-                param = param.strip() or None
-
-            norm_s = transforms.normalize_header(src)
-            if tr == "CONST":
-                key = (norm_s, canon.lower(), tr)
-            else:
-                key = (norm_s,)
-
-            if key not in incoming_by_source:
-                merged_mappings.append(
-                    {
-                        "source_field": src,
-                        "canonical_field": canon,
-                        "transform": tr,
-                        "transform_param": param,
-                    }
-                )
-
-        # 3. Idempotency check: compare merged mappings against active mappings
-        active_keys = {
-            (
-                transforms.normalize_header(m["source_field"]),
-                str(m.get("canonical_field", "")).strip().lower(),
-                str(m.get("transform", "NONE")).strip().upper(),
-                (
-                    str(m.get("transform_param", "")).strip().lower()
-                    if m.get("transform_param") is not None
-                    else None
-                ),
-            )
-            for m in active_mappings
-            if m.get("source_field")
-            and m.get("canonical_field")
-            and str(m.get("canonical_field")).strip() != "-"
-        }
-        merged_keys = {
-            (
-                transforms.normalize_header(m["source_field"]),
-                str(m.get("canonical_field", "")).strip().lower(),
-                str(m.get("transform", "NONE")).strip().upper(),
-                (
-                    str(m.get("transform_param", "")).strip().lower()
-                    if m.get("transform_param") is not None
-                    else None
-                ),
-            )
-            for m in merged_mappings
-        }
-
-        # Short-circuit if mapping content is identical
-        if merged_keys == active_keys and len(merged_mappings) == len(active_mappings):
-            return active_mappings
-
-        return await self.dao.insert_mapping_version(stream, merged_mappings)
+            })
+        return await self.dao.save_mapping(stream, cleaned)
 
     async def preview_mapping(
         self,
@@ -203,6 +134,11 @@ class DataHubService:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, DataHubErrors.NO_ACTIVE_MAPPING
             )
+        # Same pre-pass the real worker runs (app/workers/ingestion_worker.py)
+        # before any row's own mapping - a no-op unless the mapping actually
+        # uses FILL_DOWN, but needed for parity: this endpoint's docstring
+        # promises "exactly what a real upload would produce."
+        sample_rows = transforms.apply_fill_down(sample_rows, mappings)
         results = []
         for raw_row in sample_rows:
             canonical, issues = transforms.apply_mapping(raw_row, mappings)

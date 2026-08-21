@@ -212,6 +212,36 @@ async def create_run(
     )
 
 
+# DEV-ONLY: wipes every run/match/exception/GL posting this definition has
+# ever produced, resets invoices/bank_statements back to pre-reconciliation
+# state, and enqueues a fresh run - for iterating on rules/mappings against
+# the same source data without manual cleanup between attempts. Grep
+# "DEV-ONLY" (here, service.py, dao.py) to find and remove this later.
+@router.post(
+    "/reconciliations/{definition_id}/rerun",
+    response_model=RunOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="[DEV-ONLY] Reset this definition's reconciliation state and enqueue a fresh run",
+)
+async def rerun(
+    definition_id: UUID,
+    payload: RunCreate,
+    service: ReconciliationService = Depends(get_service),
+):
+    """Deletes every reconciliation_run/match_group/reconciliation_exception/
+    gl_journal_entry this definition has produced, resets every invoice's
+    balance_due_minor/status and every bank_statement's recon_status/
+    gl_posted for the entity back to their pre-reconciliation values, then
+    enqueues a new QUEUED run exactly like POST .../runs. Destructive and
+    irreversible - dev/debug use only, not for a real reconciliation
+    history."""
+    return await service.rerun(
+        str(definition_id),
+        period_start=payload.period_start,
+        period_end=payload.period_end,
+    )
+
+
 @router.get(
     "/reconciliations/{definition_id}/runs",
     response_model=list[RunOut],
