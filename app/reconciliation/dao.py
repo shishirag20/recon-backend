@@ -146,14 +146,15 @@ class ReconciliationDAO:
         return _row(row)
 
     async def update_rule(
-        self, rule_id: str, *, enabled: bool | None, config: dict | None
+        self, rule_id: str, *, enabled: bool | None, confidence: int | None = None, config: dict | None = None
     ) -> dict | None:
         row = await self.conn.fetchrow(
-            "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), config = COALESCE($3::jsonb, config) "
+            "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), confidence = COALESCE($3, confidence), config = COALESCE($4::jsonb, config) "
             "WHERE rule_id = $1 "
             "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
             rule_id,
             enabled,
+            confidence,
             config,
         )
         return _row(row)

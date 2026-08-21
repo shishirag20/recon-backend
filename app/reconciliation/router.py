@@ -40,6 +40,7 @@ from app.reconciliation.schema import (
     PaymentOut,
     ResolveNoPaymentRequest,
     ResolveSuspenseRequest,
+    RuleCategoriesResponse,
     RuleCreate,
     RuleOut,
     RuleUpdate,
@@ -56,6 +57,19 @@ def get_service(
     conn: asyncpg.Connection = Depends(get_connection),
 ) -> ReconciliationService:
     return ReconciliationService(ReconciliationDAO(conn))
+
+
+@router.get(
+    "/reconciliations/rule-categories",
+    response_model=RuleCategoriesResponse,
+    summary="Get rule data categories and canonical fields for Rule Studio UI",
+)
+async def get_rule_categories(
+    service: ReconciliationService = Depends(get_service),
+):
+    """Returns valid data categories (Bank Statement, Customers, Expected Remittances, Sub-Ledger, General Ledger)
+    and their canonical fields for rule configuration dropdowns."""
+    return await service.get_rule_categories()
 
 
 # -- reconciliation_definitions ------------------------------------------------
@@ -165,7 +179,7 @@ async def update_rule(
     """`config` is a full replacement, not a merge - submit the rule's
     complete config, not just the keys you're changing."""
     return await service.update_rule(
-        str(definition_id), str(rule_id), enabled=payload.enabled, config=payload.config
+        str(definition_id), str(rule_id), enabled=payload.enabled, confidence=payload.confidence, config=payload.config
     )
 
 

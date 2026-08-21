@@ -103,5 +103,9 @@ def get_threshold_minor(rules: list[dict], phase: str) -> int:
     it back to unconditional."""
     for rule in rules:
         if rule["phase"] == phase and rule["enabled"] and rule["kind"] == "threshold":
-            return rule["config"].get("amount", {}).get("value_minor", 0)
+            cfg = rule.get("config") or {}
+            val = cfg.get("amount", {}).get("value_minor")
+            if val is None:
+                val = cfg.get("value_minor") or cfg.get("threshold") or 0
+            return int(val)
     return 0

@@ -84,17 +84,19 @@ async def exact_balance_match(payment: dict, bank_txn: dict, customer_id: str, c
 
 async def tds_net_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
     """2.4 - payment equals balance net of TDS withheld at source. The
-    effective TDS amount is computed here from `tds_rate_pct` (a percentage)
-    rather than trusting a pre-populated `allowed_tds_minor`, since no
-    ingestion mapping can derive that product today (docs/reconciliation.md
-    §8) - `allowed_tds_minor` is used as a fallback if it's already set."""
+    effective TDS amount is computed here from `tds_rate_pct` (from invoice or
+    configured rule default, e.g. 10.0% or 2.0%) or `allowed_tds_minor`, with
+    optional variance tolerance."""
     amount = payment["total_received_minor"]
+    default_tds_rate = config.get("tds_rate_pct") or config.get("rate_pct") or config.get("default_tds_rate_pct")
+    tds_tolerance = config.get("amount", {}).get("value_minor") or config.get("tolerance_minor", 0)
     for inv in _open_invoices(ctx, customer_id):
-        tds_rate = inv.get("tds_rate_pct")
+        tds_rate = inv.get("tds_rate_pct") or default_tds_rate
         computed_tds = int(round(inv["total_amount_minor"] * float(tds_rate) / 100)) if tds_rate else (inv.get("allowed_tds_minor") or 0)
         if computed_tds <= 0:
             continue
-        if inv["balance_due_minor"] - computed_tds == amount:
+        shortfall = inv["balance_due_minor"] - amount
+        if shortfall == computed_tds or (tds_tolerance > 0 and abs(shortfall - computed_tds) <= tds_tolerance):
             return AllocationOutcome(
                 allocations=[InvoiceAllocation(inv["invoice_id"], amount, close_full=True)],
                 match_type="TOLERANCE", reason=f"amount matches balance net of {computed_tds} minor TDS",
@@ -108,7 +110,7 @@ async def subset_sum_fifo(payment: dict, bank_txn: dict, customer_id: str, ctx: 
     single-invoice exact match is exact-amount's job (earlier
     priority) - this only searches combinations of size >= 2."""
     amount = payment["total_received_minor"]
-    max_invoices = config.get("max_invoices", 10)
+    max_invoices = config.get("max_invoices") or config.get("max_combo", 10)
     invoices = _open_invoices(ctx, customer_id)[:max_invoices]  # already sorted by due_date
     for size in range(2, len(invoices) + 1):
         for combo in itertools.combinations(invoices, size):
@@ -129,7 +131,7 @@ async def fee_tolerance_match(payment: dict, bank_txn: dict, customer_id: str, c
     unresolved rather than guessed."""
     amount = payment["total_received_minor"]
     explicit_fee = bank_txn.get("explicit_fee_minor") or 0
-    tolerance = config.get("amount", {}).get("value_minor", 500)
+    tolerance = config.get("amount", {}).get("value_minor") or config.get("max_fee_amount") or 500
     invoices = _open_invoices(ctx, customer_id)
 
     if explicit_fee > 0:

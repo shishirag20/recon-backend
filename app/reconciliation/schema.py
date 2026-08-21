@@ -49,6 +49,7 @@ class RuleOut(BaseModel):
 
 class RuleUpdate(BaseModel):
     enabled: bool | None = None
+    confidence: int | None = None
     config: dict | None = Field(default=None, description="Full replacement of the rule's config, not a merge.")
 
 
@@ -68,6 +69,24 @@ class MatcherCatalogResponse(BaseModel):
     matchers: list[MatcherInfo]
     sources: list[SourceInfo]
     bank_fields: list[str] = Field(description="Valid config.bank_field values - direct bank_statements columns, plus extract:vpa/gstin/pan sentinels.")
+
+
+class RuleCategoryField(BaseModel):
+    key: str
+    label: str
+    type: str = "string"
+
+
+class RuleCategory(BaseModel):
+    key: str
+    label: str
+    stream: str
+    description: str
+    fields: list[RuleCategoryField]
+
+
+class RuleCategoriesResponse(BaseModel):
+    categories: list[RuleCategory]
 
 
 class AlgorithmInfo(BaseModel):

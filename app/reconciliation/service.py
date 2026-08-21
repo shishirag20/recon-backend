@@ -25,7 +25,9 @@ from app.reconciliation.constants import (
     ReconciliationErrors,
     RECON_PHASES,
     RECON_TYPES,
+    RULE_DATA_CATEGORIES,
 )
+from app.reconciliation.schema import RuleCategoriesResponse
 from app.reconciliation.dao import ReconciliationDAO, new_run_no
 from app.reconciliation.rules.allocation import ALLOCATION_RULES
 from app.reconciliation.rules.identification import IDENTIFICATION_RULES
@@ -120,6 +122,7 @@ class ReconciliationService:
         rule_id: str,
         *,
         enabled: bool | None,
+        confidence: int | None = None,
         config: dict | None,
     ):
         await self.get_definition(definition_id)
@@ -130,7 +133,7 @@ class ReconciliationService:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, ReconciliationErrors.RULE_NOT_FOUND
             )
-        return await self.dao.update_rule(rule_id, enabled=enabled, config=config)
+        return await self.dao.update_rule(rule_id, enabled=enabled, confidence=confidence, config=config)
 
     def list_matcher_catalog(self) -> dict:
         """Static reference data (no DB) for the `kind="field-match"`
@@ -406,3 +409,6 @@ class ReconciliationService:
             resolution_notes=note, resolver_id=None, match_group_id=match_group_id,
         )
         return await self.dao.get_exception(exception_id)
+
+    async def get_rule_categories(self) -> RuleCategoriesResponse:
+        return RuleCategoriesResponse(categories=RULE_DATA_CATEGORIES)

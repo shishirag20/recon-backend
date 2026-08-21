@@ -168,12 +168,6 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # prototype never modeled them as rules at all. Removed rather than
     # finished, since nothing consumes their configurability today.
     #
-    # Phase 0 - INTAKE_VALIDATION (runs once per bank_txn, before customer
-    # identification even starts; a reject here means Phase 1a/1b never run
-    # for that row at all - see engine.py's run_phase_1)
-    (PHASE_INTAKE_VALIDATION, "dup-utr", "Duplicate UTR Check", 1, 100,
-     {"description": "Reject a bank_reference already MATCHED in a prior run for this entity"}),
-
     # Phase 1a - CUSTOMER_LOCK (lock the paying customer; first match wins)
     (PHASE_CUSTOMER_LOCK, "expected-utr", "Pre-Advised UTR Match", 1, 98,
      {"source": "expected_remittances", "match_field": "utr_number"}),
@@ -228,3 +222,83 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     (PHASE_GL_CHECK, "threshold", "GL Control Variance Tolerance", 1, 100,
      {"amount": {"mode": "abs", "value_minor": 0}}),
 )
+
+
+# -- Rule Studio Category & Canonical Fields Catalog -------------------------
+RULE_DATA_CATEGORIES = [
+    {
+        "key": "Bank Statement",
+        "label": "Bank Statement",
+        "stream": "BANK",
+        "description": "Bank statement transactions feed",
+        "fields": [
+            {"key": "bank_reference", "label": "Bank Reference (UTR)", "type": "string"},
+            {"key": "narration", "label": "Transaction Narration", "type": "string"},
+            {"key": "amount_minor", "label": "Transaction Amount", "type": "number"},
+            {"key": "payer_name", "label": "Payer Name", "type": "string"},
+            {"key": "payer_account_no", "label": "Payer Account Number", "type": "string"},
+            {"key": "payer_ifsc", "label": "Payer IFSC Code", "type": "string"},
+            {"key": "bank_txn_id", "label": "Bank Transaction ID", "type": "string"},
+            {"key": "post_date", "label": "Posting Date", "type": "date"},
+            {"key": "value_date", "label": "Value Date", "type": "date"},
+            {"key": "payer_account_no, payer_ifsc", "label": "Payer Account & IFSC", "type": "string"},
+        ],
+    },
+    {
+        "key": "Customers",
+        "label": "Customers Master",
+        "stream": "CUSTOMER",
+        "description": "Customer master records & registered payment details",
+        "fields": [
+            {"key": "customer_code", "label": "Customer Code", "type": "string"},
+            {"key": "customer_name", "label": "Customer Name", "type": "string"},
+            {"key": "company_name", "label": "Company Name", "type": "string"},
+            {"key": "account_number", "label": "Bank Account Number", "type": "string"},
+            {"key": "ifsc_code", "label": "IFSC Code", "type": "string"},
+            {"key": "vpa_handle", "label": "UPI VPA Handle", "type": "string"},
+            {"key": "gstin", "label": "GSTIN Tax ID", "type": "string"},
+            {"key": "pan", "label": "PAN Number", "type": "string"},
+            {"key": "account_number, ifsc_code", "label": "Bank Account & IFSC", "type": "string"},
+        ],
+    },
+    {
+        "key": "Expected Remittances",
+        "label": "Expected Remittances",
+        "stream": "REMITTANCE",
+        "description": "Pre-advised customer payment notices",
+        "fields": [
+            {"key": "utr_number", "label": "Expected UTR Number", "type": "string"},
+            {"key": "expected_amount_minor", "label": "Expected Remittance Amount", "type": "number"},
+            {"key": "customer_id", "label": "Customer ID", "type": "string"},
+            {"key": "status", "label": "Remittance Status", "type": "string"},
+            {"key": "reconciled", "label": "Reconciled Status", "type": "boolean"},
+            {"key": "expected_date", "label": "Expected Settlement Date", "type": "date"},
+        ],
+    },
+    {
+        "key": "Sub-Ledger",
+        "label": "Sub-Ledger (Invoices)",
+        "stream": "INVOICE",
+        "description": "Customer open sub-ledger and invoices",
+        "fields": [
+            {"key": "invoice_number", "label": "Invoice Number", "type": "string"},
+            {"key": "total_amount_minor", "label": "Invoice Total Amount", "type": "number"},
+            {"key": "balance_due_minor", "label": "Balance Due Amount", "type": "number"},
+            {"key": "allowed_tds_minor", "label": "Allowed TDS Deduction", "type": "number"},
+            {"key": "customer_id", "label": "Customer ID", "type": "string"},
+            {"key": "status", "label": "Invoice Status", "type": "string"},
+            {"key": "due_date", "label": "Invoice Due Date", "type": "date"},
+        ],
+    },
+    {
+        "key": "General Ledger",
+        "label": "General Ledger",
+        "stream": "LEDGER",
+        "description": "GL control accounts and trial balance figures",
+        "fields": [
+            {"key": "control_account", "label": "Control Account Code", "type": "string"},
+            {"key": "balance", "label": "Account Balance", "type": "number"},
+            {"key": "variance", "label": "GL Variance Amount", "type": "number"},
+        ],
+    },
+]
