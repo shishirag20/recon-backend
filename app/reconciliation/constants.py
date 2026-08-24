@@ -233,14 +233,20 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
       "source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool).
-    # tds-match/bank-fee/write-off/overpayment used to be standalone rules
-    # here (priorities 4/6/7/8) - removed. Every rule below now runs the same
-    # settlement check (allocation.py::resolve_invoice_settlement) against
-    # whichever invoice(s) it identifies: TDS/bank-fee/dust-write-off
-    # variance and overpayment are handled inline by exact-invoice-num,
-    # invoice-suffix, exact-amount, and subset-sum alike, not as their own
-    # later-priority fallback pass (2026-08 note - see engine.py's
-    # `_commit_direct_match` and allocation.py's rule docstrings).
+    # tds-match/bank-fee/write-off used to be standalone rules here - removed
+    # (2026-08a). Every rule below now runs the same settlement check
+    # (allocation.py::resolve_invoice_settlement) against whichever
+    # invoice(s) it identifies: TDS/bank-fee/dust-write-off variance is
+    # handled inline by exact-invoice-num, invoice-suffix, exact-amount, and
+    # subset-sum alike, not as their own later-priority fallback pass (see
+    # engine.py's `_commit_direct_match` and allocation.py's rule
+    # docstrings). `overpayment` (below) stayed a standalone rule but moved
+    # to AFTER subset-sum (2026-08b) - it used to be folded into
+    # exact-amount, but that let a rough "closest invoice, excess on-account"
+    # guess grab a payment before subset-sum ever got a chance to check for
+    # an exact multi-invoice split, a strictly better explanation when one
+    # exists (e.g. a payment that doesn't match any single invoice but sums
+    # exactly across two of that customer's open invoices).
     (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
      {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
     (PHASE_ALLOCATION, "invoice-suffix", "Truncated Invoice Number Match", 2, 90,
@@ -249,7 +255,9 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
      {"amount": {"mode": "exact", "field": "balance_due_minor"}, "tie_break": "ambiguous_exception"}),
     (PHASE_ALLOCATION, "subset-sum", "Combined Invoice Match (Many-to-Many)", 4, 85,
      {"amount": {"mode": "subset_sum"}, "order_by": "due_date", "max_invoices": 10}),
-    (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 5, 100,
+    (PHASE_ALLOCATION, "overpayment", "Overpayment to On-Account Credit", 5, 100,
+     {"gl_role": GL_ROLE_ON_ACCOUNT_ADVANCE}),
+    (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 6, 100,
      {"mode": "partial", "allow_short_pay": True}),
     # Not dispatched through ALLOCATION_RULES like the five above - it never
     # competes in the customer-scoped, per-payment cascade, since by
@@ -265,7 +273,7 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # distinctly from that rule (and from "invoice-number-in-narration") on
     # purpose - all three used to collide on nearly-identical display names,
     # which is exactly what made "Resolved Via" confusing (2026-08 fix).
-    (PHASE_ALLOCATION, "direct-invoice-match", "Direct Invoice Match", 6, 85,
+    (PHASE_ALLOCATION, "direct-invoice-match", "Direct Invoice Match", 7, 85,
      {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 3.0/3.1/3.2 - SHORT_PAY / UNAPPLIED / GL_CHECK: one `threshold`

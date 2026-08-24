@@ -327,9 +327,11 @@ async def run_phase_1(
             # Phase 1a locked nobody and the pooling rules found nothing
             # either - fall back to the cross-check's own candidate rather
             # than dropping straight to Suspense-with-no-suggestion. Still
-            # just a hint (single-candidate pool), never an auto-lock: Pass A
-            # in run_phase_2 always resolves a pool via Suspense/
-            # Double-Collision, never a silent commit.
+            # just a hint (single-candidate pool) at this point, not an
+            # identification-phase lock - but Pass A in run_phase_2 will
+            # commit it for real if it ends up as the pool's only candidate
+            # with a clean rule match (2026-08 change), same as any other
+            # single-candidate pool.
             # (The None guard matters now that document-number-narration
             # exists as a real rule above this: if it already tried and
             # declined - the referenced invoice has no customer either -
@@ -455,12 +457,16 @@ async def run_phase_2(
 
     Pass A resolves every pooled (candidate_pool, Phase 1b) payment entirely
     on its own: try every candidate through all 9 rules, first-match-wins per
-    candidate. 2+ clean matches -> Double-Collision. Exactly 1 or 0 -> always
-    a Suspense exception (with the suggestion, if any, in `detail`) - a pool
-    is never auto-committed, no matter how clean the eventual invoice match,
-    since nothing independently confirmed the identity (matches the
-    prototype's own `exactAmountRule` probe: even a single clean hit only
-    ever becomes a `suggestedCustomerId` + Suspense, never a real match).
+    candidate. 2+ clean matches -> Double-Collision, a genuine ambiguity (the
+    same amount legitimately matches two different customers' invoices, and
+    nothing here can safely pick one). Exactly 1 clean match -> committed for
+    real via `_commit`, the same path Pass B uses (2026-08 change - a
+    single-candidate pool with a clean rule match used to always be
+    downgraded to a Suspense suggestion, never auto-committed, regardless of
+    how clean the match was; the prototype's own `exactAmountRule` probe did
+    the same, but that call was revisited - a unique candidate plus a
+    non-ambiguous rule match is no weaker a signal than most identification
+    rules already auto-lock on). 0 matches -> Suspense with no suggestion.
     Only a payment Phase 1a locked outright skips straight into Pass B.
 
     Pass B resolves WHICH INVOICE for every payment Phase 1a actually locked.
@@ -913,10 +919,10 @@ async def run_phase_2(
     # --- Pass A: pooled payments only (candidate_pool, from Phase 1b) - a
     # locked payment (outcome["customer_id"] already set by Phase 1a, an
     # independently confirmed identity) skips straight into `pending` for
-    # Pass B. A pool, however many candidates or however clean the eventual
-    # match, is ALWAYS resolved right here as Suspense/Double-Collision -
-    # never deferred into Pass B's auto-commit. Only a locked identity is
-    # trusted enough to write a real match_group.
+    # Pass B. A pool is always resolved right here, never deferred into Pass
+    # B: 2+ clean matches -> Double-Collision (genuine ambiguity, no safe
+    # pick), exactly 1 clean match -> committed for real (2026-08 change -
+    # see run_phase_2's docstring), 0 matches -> Suspense with no suggestion.
     pending: list[tuple[dict, str]] = []  # (item, resolved_customer_id) for Pass B
     for outcome in outcomes:
         if outcome.get("direct_invoice_id"):
@@ -1019,18 +1025,18 @@ async def run_phase_2(
             continue
 
         if len(per_candidate_matches) == 1:
+            # Exactly one pooled candidate, and it produced a clean
+            # (non-ambiguous) rule match - the same "unique answer" bar
+            # Double-Collision uses to decide *not* to trust a pool, just
+            # inverted: 2+ clean matches means real ambiguity, but a single
+            # clean match against a single candidate is no longer treated as
+            # merely a suggestion (2026-08 change - was always Suspense
+            # before, regardless of how clean the match was; see this run's
+            # git history for the prior behavior/rationale if that's ever
+            # needed again). Committed exactly like a Pass B match - same
+            # `_commit`, same match_group/GL treatment.
             cid, rule, alloc_result = per_candidate_matches[0]
-            await _suspense(
-                outcome,
-                reason_code="one likely match for the exact amount, but identity wasn't independently confirmed - review and confirm",
-                detail={
-                    "suggested_customer_id": cid,
-                    "suggested_invoice_ids": [
-                        a.invoice_id for a in alloc_result.allocations
-                    ],
-                    "suggested_rule_id": str(rule["rule_id"]) if rule else None,
-                },
-            )
+            await _commit(outcome, cid, rule, alloc_result)
             continue
 
         # 0 of the pool's candidates produced any match at all.
