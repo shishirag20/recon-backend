@@ -8,6 +8,7 @@ module and the `IDENTIFICATION_RULES` registry since `dup-utr` is, in every
 other respect, an identification-adjacent rule (same `RuleContext`, same
 `IdentificationResult` return type).
 """
+
 from __future__ import annotations
 
 from typing import Awaitable, Callable
@@ -19,7 +20,9 @@ from app.reconciliation.rules import IdentificationResult, RuleContext
 RuleFn = Callable[[dict, RuleContext, dict], Awaitable[IdentificationResult]]
 
 
-async def dup_utr_check(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def dup_utr_check(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """Rejects a bank_txn whose `bank_reference` either collides with another
     PENDING row in this same run (checked in Python - the whole candidate set
     is already loaded into `ctx.duplicate_refs_in_run` by the engine before
@@ -29,16 +32,29 @@ async def dup_utr_check(bank_txn: dict, ctx: RuleContext, config: dict) -> Ident
     reference = bank_txn.get("bank_reference")
     if not reference:
         return IdentificationResult()
-    if reference in ctx.duplicate_refs_in_run:
-        return IdentificationResult(reject=True, reason=f"duplicate bank_reference {reference!r} in this run")
-    if await ctx.dao.bank_reference_already_matched(ctx.entity_id, reference, bank_txn["bank_txn_id"]):
-        return IdentificationResult(reject=True, reason=f"bank_reference {reference!r} already MATCHED in a prior run")
+    if bank_txn["bank_txn_id"] in ctx.duplicate_bank_txn_ids:
+        return IdentificationResult(
+            reject=True, reason=f"duplicate bank_reference {reference!r} in this run"
+        )
+    if await ctx.dao.bank_reference_already_matched(
+        ctx.entity_id, reference, bank_txn["bank_txn_id"]
+    ):
+        return IdentificationResult(
+            reject=True,
+            reason=f"bank_reference {reference!r} already MATCHED in a prior run",
+        )
     return IdentificationResult()
 
 
-async def utr_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def utr_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.1a - bank_reference or document_number exactly equals a customer's expected_remittances.utr_number."""
-    refs = [r for r in [bank_txn.get("bank_reference"), bank_txn.get("document_number")] if r]
+    refs = [
+        r
+        for r in [bank_txn.get("bank_reference"), bank_txn.get("document_number")]
+        if r
+    ]
     if not refs:
         return IdentificationResult()
     for remittance in ctx.expected_remittances:
@@ -47,11 +63,19 @@ async def utr_match(bank_txn: dict, ctx: RuleContext, config: dict) -> Identific
         expected_utr = remittance["utr_number"].strip().upper()
         for ref in refs:
             if ref.strip().upper() == expected_utr:
-                return IdentificationResult(customer_id=str(remittance["customer_id"]), reason="expected_remittances.utr_number exact match")
+                dup_res = await dup_utr_check(bank_txn, ctx, config)
+                if dup_res.reject:
+                    return dup_res
+                return IdentificationResult(
+                    customer_id=str(remittance["customer_id"]),
+                    reason="expected_remittances.utr_number exact match",
+                )
     return IdentificationResult()
 
 
-async def bank_account_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def bank_account_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.2a - payer's account number AND IFSC both exactly match a registered
     customer_bank_accounts row. Both fields required - an account-number-only
     match (no IFSC, or a differing one) is deliberately left for 1.1b's
@@ -61,60 +85,98 @@ async def bank_account_match(bank_txn: dict, ctx: RuleContext, config: dict) -> 
     if not account_no or not ifsc:
         return IdentificationResult()
     for acct in ctx.bank_accounts:
-        if (acct["bank_account_no"] or "").strip() == account_no and (acct["ifsc_code"] or "").strip().upper() == ifsc.upper():
-            return IdentificationResult(customer_id=str(acct["customer_id"]), reason="customer_bank_accounts exact account+IFSC match")
+        if (acct["bank_account_no"] or "").strip() == account_no and (
+            acct["ifsc_code"] or ""
+        ).strip().upper() == ifsc.upper():
+            return IdentificationResult(
+                customer_id=str(acct["customer_id"]),
+                reason="customer_bank_accounts exact account+IFSC match",
+            )
     return IdentificationResult()
 
 
-async def vpa_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def vpa_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.3a - a UPI VPA extracted from narration matches customers.vpa_handle."""
     vpa = extract.extract_vpa(bank_txn.get("narration") or "")
     if not vpa:
         return IdentificationResult()
     for customer in ctx.customers:
-        if customer["vpa_handle"] and customer["vpa_handle"].strip().lower() == vpa.strip().lower():
-            return IdentificationResult(customer_id=str(customer["customer_id"]), reason=f"VPA {vpa!r} in narration matches customers.vpa_handle")
+        if (
+            customer["vpa_handle"]
+            and customer["vpa_handle"].strip().lower() == vpa.strip().lower()
+        ):
+            return IdentificationResult(
+                customer_id=str(customer["customer_id"]),
+                reason=f"VPA {vpa!r} in narration matches customers.vpa_handle",
+            )
     return IdentificationResult()
 
 
-async def reference_code_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def reference_code_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.4a - a known customer code found as a substring of narration.
     Checks `customers.customer_code` directly (the primary natural key, per
     app/datahub/canonical.py's customer-resolution order) and
     `customer_reference_codes.code_value` (the ERP-alternate-code fallback)."""
     narration = bank_txn.get("narration") or ""
     for customer in ctx.customers:
-        if customer["customer_code"] and extract.contains_substring(narration, customer["customer_code"]):
-            return IdentificationResult(customer_id=str(customer["customer_id"]), reason=f"customer_code {customer['customer_code']!r} in narration")
+        if customer["customer_code"] and extract.contains_substring(
+            narration, customer["customer_code"]
+        ):
+            return IdentificationResult(
+                customer_id=str(customer["customer_id"]),
+                reason=f"customer_code {customer['customer_code']!r} in narration",
+            )
     for ref in ctx.reference_codes:
         if extract.contains_substring(narration, ref["code_value"]):
-            return IdentificationResult(customer_id=str(ref["customer_id"]), reason=f"reference code {ref['code_value']!r} in narration")
+            return IdentificationResult(
+                customer_id=str(ref["customer_id"]),
+                reason=f"reference code {ref['code_value']!r} in narration",
+            )
     return IdentificationResult()
 
 
-async def gstin_pan_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def gstin_pan_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.5a - a GSTIN (preferred) or PAN extracted from narration matches customers.gstin/.pan."""
     narration = bank_txn.get("narration") or ""
     gstin = extract.extract_gstin(narration)
     if gstin:
         for customer in ctx.customers:
             if customer["gstin"] and customer["gstin"].strip().upper() == gstin:
-                return IdentificationResult(customer_id=str(customer["customer_id"]), reason=f"GSTIN {gstin!r} in narration")
+                return IdentificationResult(
+                    customer_id=str(customer["customer_id"]),
+                    reason=f"GSTIN {gstin!r} in narration",
+                )
     pan = extract.extract_pan(narration)
     if pan:
         for customer in ctx.customers:
             if customer["pan"] and customer["pan"].strip().upper() == pan:
-                return IdentificationResult(customer_id=str(customer["customer_id"]), reason=f"PAN {pan!r} in narration")
+                return IdentificationResult(
+                    customer_id=str(customer["customer_id"]),
+                    reason=f"PAN {pan!r} in narration",
+                )
     return IdentificationResult()
 
 
-async def fuzzy_name_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def fuzzy_name_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.6a - trigram similarity between the payer name and customers.company_name."""
     payer_name = bank_txn.get("payer_name")
     if not payer_name:
         return IdentificationResult()
     min_similarity = config.get("min_similarity", 0.85)
-    match = await fuzzy.best_fuzzy_match(ctx.conn, entity_id=ctx.entity_id, probe_name=payer_name, min_similarity=min_similarity)
+    match = await fuzzy.best_fuzzy_match(
+        ctx.conn,
+        entity_id=ctx.entity_id,
+        probe_name=payer_name,
+        min_similarity=min_similarity,
+    )
     if match:
         return IdentificationResult(
             customer_id=str(match["customer_id"]),
@@ -123,7 +185,9 @@ async def fuzzy_name_match(bank_txn: dict, ctx: RuleContext, config: dict) -> Id
     return IdentificationResult()
 
 
-async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def generic_field_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """Config-driven Phase 0/1a rule (`kind="field-match"`) - see
     matchers.find_matches for what `config` needs. Stops at the first
     match, same "first-match-wins, no ambiguity check" behavior the
@@ -139,7 +203,9 @@ async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) ->
     )
 
 
-async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
+async def document_number_match(
+    bank_txn: dict, ctx: RuleContext, config: dict
+) -> IdentificationResult:
     """1.7a - last resort in the CUSTOMER_LOCK cascade, only reached if
     nothing richer (UTR, account+IFSC, VPA, customer-code, GSTIN/PAN,
     fuzzy-name) found anything. For a remittance with none of that data -
@@ -159,7 +225,9 @@ async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) 
     cross-check (Phase 1c) independently performs after this cascade runs;
     if this rule is what locked the payment, that cross-check will find the
     same invoice and record agreement rather than raise a mismatch."""
-    match = narration_invoice_owner(bank_txn.get("narration") or "", ctx.all_open_invoices)
+    match = narration_invoice_owner(
+        bank_txn.get("narration") or "", ctx.all_open_invoices
+    )
     if match is None or match["customer_id"] is None:
         # Either no invoice reference found, or it was found but that
         # invoice itself has no customer yet either (migration 0031) - this
@@ -173,7 +241,9 @@ async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) 
     )
 
 
-def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> dict | None:
+def narration_invoice_owner(
+    narration: str, all_open_invoices: list[dict]
+) -> dict | None:
     """The "Invoice Number in Narration" cross-check (kind
     `invoice-number-in-narration`). Deliberately NOT in `IDENTIFICATION_RULES`
     - it doesn't compete in the first-match-wins CUSTOMER_LOCK loop, it's
@@ -197,7 +267,9 @@ def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> di
         matched_number = None
         if extract.contains_substring(narration, inv["invoice_number"]):
             matched_number = inv["invoice_number"]
-        elif inv.get("document_number") and extract.contains_substring(narration, inv["document_number"]):
+        elif inv.get("document_number") and extract.contains_substring(
+            narration, inv["document_number"]
+        ):
             matched_number = inv["document_number"]
         if matched_number is not None:
             return {
@@ -206,7 +278,9 @@ def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> di
                 # engine.py's mismatch check treats a real customer_id that
                 # disagrees with Phase 1a's lock very differently from "this
                 # invoice doesn't have one yet to disagree with."
-                "customer_id": str(inv["customer_id"]) if inv["customer_id"] is not None else None,
+                "customer_id": (
+                    str(inv["customer_id"]) if inv["customer_id"] is not None else None
+                ),
                 "invoice_id": str(inv["invoice_id"]),
                 "invoice_number": inv["invoice_number"],
                 "matched_number": matched_number,

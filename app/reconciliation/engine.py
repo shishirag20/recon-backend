@@ -12,6 +12,7 @@ M4 - see the milestone map in app/reconciliation/router.py.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
 
 import asyncpg
 
@@ -128,12 +129,23 @@ async def run_phase_1(
         key=lambda r: r["priority"],
     )
 
-    bank_inflows = await dao.list_candidate_bank_inflows(entity_id, period_start, period_end)
+    bank_inflows = await dao.list_candidate_bank_inflows(
+        entity_id, period_start, period_end
+    )
     ref_counts = Counter(
         b["bank_reference"] for b in bank_inflows if b["bank_reference"]
     )
-    duplicate_refs_in_run = {ref for ref, count in ref_counts.items() if count > 1}
-
+    # duplicate_refs_in_run = {ref for ref, count in ref_counts.items() if count > 1}
+    duplicate_bank_txn_ids: set[str] = set()
+    seen_refs_in_run: set[str] = set()
+    for b in bank_inflows:
+        ref = b["bank_reference"]
+        if not ref:
+            continue
+        if ref in seen_refs_in_run:
+            duplicate_bank_txn_ids.add(b["bank_txn_id"])
+        else:
+            seen_refs_in_run.add(ref)
     all_open_invoices = await dao.load_open_invoices(entity_id)
     customer_master = await dao.load_customer_master(entity_id)
     cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
@@ -146,7 +158,7 @@ async def run_phase_1(
         bank_accounts=await dao.load_customer_bank_accounts(entity_id),
         reference_codes=await dao.load_customer_reference_codes(entity_id),
         expected_remittances=await dao.load_expected_remittances(entity_id),
-        duplicate_refs_in_run=duplicate_refs_in_run,
+        duplicate_bank_txn_ids=duplicate_bank_txn_ids,
         all_open_invoices=all_open_invoices,
     )
 
@@ -198,10 +210,32 @@ async def run_phase_1(
             rule_fn = IDENTIFICATION_RULES.get(rule["kind"])
             if rule_fn is None:
                 continue  # an unregistered kind - config error, not a crash
-            result = await rule_fn(bank_txn, ctx, rule["config"])
+            rule_cfg = json.loads(rule["config"]) if isinstance(rule["config"], str) else (rule["config"] or {})
+            result = await rule_fn(bank_txn, ctx, rule_cfg)
             if result.matched:
                 fired_rule = rule
                 break
+
+        if result is not None and result.reject:
+            bank_ref = bank_txn.get("bank_reference") or "N/A"
+            amt_fmt = f"₹{amount_minor / 100:,.2f}"
+            reason = (
+                result.reason
+                or f"Duplicate payment {amt_fmt} with reference '{bank_ref}' in this run"
+            )
+            await dao.insert_exception(
+                run_id=run_id,
+                exception_type="DUPLICATE",
+                bank_txn_id=bank_txn_id,
+                customer_id=None,
+                discrepancy_minor=amount_minor,
+                reason_code=reason,
+                detail=json.dumps({"bank_reference": bank_ref, "amount_minor": amount_minor}),
+            )
+            await dao.mark_bank_statement_status(bank_txn_id, "EXCEPTION")
+            exception_minor += amount_minor
+            counts["duplicate"] += 1
+            continue
 
         # Phase 1b (CANDIDATE_POOL) - only reached if 1a locked nothing.
         candidates: list[str] = []
@@ -210,7 +244,8 @@ async def run_phase_1(
                 rule_fn = POOLING_RULES.get(rule["kind"])
                 if rule_fn is None:
                     continue
-                candidates = await rule_fn(bank_txn, ctx, rule["config"])
+                rule_cfg = json.loads(rule["config"]) if isinstance(rule["config"], str) else (rule["config"] or {})
+                candidates = await rule_fn(bank_txn, ctx, rule_cfg)
                 if candidates:
                     break
 
@@ -336,7 +371,7 @@ async def run_phase_1(
                 customer_id=None,
                 total_received_minor=amount_minor,
                 locked_by_rule_id=None,
-                candidate_pool=candidates,
+                candidate_pool=json.dumps(candidates),
             )
             outcomes.append(
                 {
@@ -567,8 +602,9 @@ async def run_phase_2(
         still_open: list[str] = []
         shortfall_total_minor = 0
         posted_allocations: list[dict] = []
+        rule_cfg = json.loads(rule["config"]) if isinstance(rule.get("config"), str) else (rule.get("config") or {}) if rule else {}
         gap_role = (
-            (rule["config"].get("gl_role") or GAP_ROLE_BY_RULE_KIND.get(rule["kind"]))
+            (rule_cfg.get("gl_role") or GAP_ROLE_BY_RULE_KIND.get(rule["kind"]))
             if rule
             else None
         )
@@ -1006,12 +1042,13 @@ async def run_phase_2(
                     rule_fn = ALLOCATION_RULES.get(rule["kind"])
                     if rule_fn is None:
                         continue
+                    rule_cfg = json.loads(rule["config"]) if isinstance(rule["config"], str) else (rule["config"] or {})
                     alloc_result = await rule_fn(
                         {"total_received_minor": amount},
                         bank_txn,
                         candidate_id,
                         ctx,
-                        rule["config"],
+                        rule_cfg,
                     )
                     if alloc_result.matched:
                         fired_rule = rule
@@ -1176,6 +1213,7 @@ async def run_phase_2(
             rule_fn = ALLOCATION_RULES.get(rule["kind"])
             if rule_fn is None or not remaining:
                 continue
+            rule_cfg = json.loads(rule["config"]) if isinstance(rule["config"], str) else (rule["config"] or {})
             still_remaining = []
             for item in remaining:
                 bank_txn = item["bank_txn"]
@@ -1185,7 +1223,7 @@ async def run_phase_2(
                     bank_txn,
                     customer_id,
                     ctx,
-                    rule["config"],
+                    rule_cfg,
                 )
                 if alloc_result.ambiguous:
                     cust_name = cust_name_map.get(customer_id) or "Customer"

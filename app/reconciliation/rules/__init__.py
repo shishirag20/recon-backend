@@ -10,6 +10,7 @@ see app/reconciliation/engine.py for the loop that drives this.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 
 import asyncpg
 
@@ -31,6 +32,7 @@ class RuleContext:
     reference_codes: list[dict]
     expected_remittances: list[dict]
     duplicate_refs_in_run: set[str] = field(default_factory=set)
+    duplicate_bank_txn_ids: set[str] = field(default_factory=set)
     # Every open invoice for this entity, across every customer - not scoped
     # to whichever customer a rule is currently evaluating, unlike everything
     # else on this context. Only used by the "Invoice Number in Narration"
@@ -132,7 +134,8 @@ def get_threshold_minor(rules: list[dict], phase: str) -> int:
     it back to unconditional."""
     for rule in rules:
         if rule["phase"] == phase and rule["enabled"] and rule["kind"] == "threshold":
-            cfg = rule.get("config") or {}
+            raw_cfg = rule.get("config") or {}
+            cfg = json.loads(raw_cfg) if isinstance(raw_cfg, str) else raw_cfg
             val = cfg.get("amount", {}).get("value_minor")
             if val is None:
                 val = cfg.get("value_minor") or cfg.get("threshold") or 0

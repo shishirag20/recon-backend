@@ -21,6 +21,7 @@ writes land in M3 - see the milestone map in router.py.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import date
 
@@ -30,11 +31,20 @@ from app.reconciliation.constants import GL_ROLE_DEFAULTS
 
 
 def _row(record: asyncpg.Record | None) -> dict | None:
-    return dict(record) if record is not None else None
+    if record is None:
+        return None
+    d = dict(record)
+    for field in ("detail", "raw", "config"):
+        if field in d and isinstance(d[field], str):
+            try:
+                d[field] = json.loads(d[field])
+            except Exception:
+                pass
+    return d
 
 
 def _rows(records: list[asyncpg.Record]) -> list[dict]:
-    return [dict(r) for r in records]
+    return [res for r in records if (res := _row(r)) is not None]
 
 
 class ReconciliationDAO:
@@ -448,11 +458,12 @@ class ReconciliationDAO:
         bank_txn_id: str | None,
         customer_id: str | None,
         reason_code: str | None,
-        detail: dict | None,
+        detail: dict | str | None,
         match_group_id: str | None = None,
         invoice_id: str | None = None,
         discrepancy_minor: int | None = None,
     ) -> dict:
+        detail_str = json.dumps(detail) if isinstance(detail, (dict, list)) else detail
         row = await self.conn.fetchrow(
             "INSERT INTO reconciliation_exceptions "
             "(exception_id, run_id, exception_type, bank_txn_id, customer_id, invoice_id, discrepancy_minor, reason_code, status, detail, match_group_id) "
@@ -465,7 +476,7 @@ class ReconciliationDAO:
             invoice_id,
             discrepancy_minor,
             reason_code,
-            detail,
+            detail_str,
             match_group_id,
         )
         return _row(row)
