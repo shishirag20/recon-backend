@@ -162,6 +162,7 @@ class AllocationOut(BaseModel):
     payment_id: UUID
     payment_amount_minor: int | None = Field(description="The payment's own total received (payments.total_received_minor) - what the bank transaction actually brought in, which may exceed or fall short of allocated_minor (overpayment/short-pay/fee cases).")
     bank_txn_id: UUID | None
+    document_number: str | None = Field(default=None, description="The document number / Bank Txn ID from source file (bank_statements.document_number).")
     bank_reference: str | None = Field(description="The real bank reference/UTR from the source file (bank_statements.bank_reference) - bank_txn_id is the internal generated row UUID.")
     allocated_minor: int = Field(description="How much of this payment was actually applied to this invoice - may differ from both invoice_amount_minor and payment_amount_minor.")
 
@@ -256,3 +257,14 @@ class ResolveSuspenseRequest(BaseModel):
     customer_id: UUID = Field(description="The confirmed identity for this payment - from the exception's own suggestion, its candidate pool, or picked manually.")
     invoice_ids: list[UUID] = Field(default_factory=list, description="This customer's open invoices to apply the payment's cash against, in the order to fill them. Empty means leave it fully unapplied/on-account for this customer.")
     note: str | None = Field(default=None, description="Optional reviewer note - stored as the match's reason (if any) and the exception's resolution_notes.")
+
+
+class ExceptionResolveRequest(BaseModel):
+    exception_id: UUID = Field(description="ID of the exception to resolve")
+    status: str | None = Field(default=None, description="OPEN | INVESTIGATING | RESOLVED | AUTO_RESOLVED | DEFERRED | WRITTEN_OFF | ADJUSTED | CARRIED_FORWARD")
+    resolution_outcome: str | None = Field(default=None, description="WRITEOFF | KEEPOPEN | DISPUTE | JOURNAL | ON_ACCOUNT | MANUAL_MATCH")
+    resolution_notes: str | None = Field(default=None, description="Audit/resolution notes")
+    payment_ids: list[UUID] | None = Field(default=None, description="Open/unapplied payments to apply against a NO_PAYMENT exception's invoice")
+    customer_id: UUID | None = Field(default=None, description="Confirmed customer ID for SUSPENSE / MULTIPLE_INVOICE_MATCH exceptions")
+    invoice_ids: list[UUID] | None = Field(default=None, description="Open invoices to apply payment cash against")
+    note: str | None = Field(default=None, description="Optional note (alias for resolution_notes)")

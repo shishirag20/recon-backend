@@ -394,6 +394,14 @@ async def exact_balance_match(
         return AllocationOutcome(
             ambiguous=True,
             ambiguous_invoice_ids=[inv["invoice_id"] for inv, _ in exacts],
+            ambiguous_invoices=[
+                {
+                    "invoice_id": inv["invoice_id"],
+                    "invoice_number": inv.get("invoice_number", inv["invoice_id"]),
+                    "balance_due_minor": inv.get("balance_due_minor", 0),
+                }
+                for inv, _ in exacts
+            ],
             reason=f"{len(exacts)} invoices tie on {_rupees(amount)}",
         )
 

@@ -37,13 +37,17 @@ async def dup_utr_check(bank_txn: dict, ctx: RuleContext, config: dict) -> Ident
 
 
 async def utr_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
-    """1.1a - bank_reference exactly equals a customer's expected_remittances.utr_number."""
-    reference = bank_txn.get("bank_reference")
-    if not reference:
+    """1.1a - bank_reference or document_number exactly equals a customer's expected_remittances.utr_number."""
+    refs = [r for r in [bank_txn.get("bank_reference"), bank_txn.get("document_number")] if r]
+    if not refs:
         return IdentificationResult()
     for remittance in ctx.expected_remittances:
-        if remittance["utr_number"] and remittance["utr_number"].strip().upper() == reference.strip().upper():
-            return IdentificationResult(customer_id=str(remittance["customer_id"]), reason="expected_remittances.utr_number exact match")
+        if not remittance.get("utr_number"):
+            continue
+        expected_utr = remittance["utr_number"].strip().upper()
+        for ref in refs:
+            if ref.strip().upper() == expected_utr:
+                return IdentificationResult(customer_id=str(remittance["customer_id"]), reason="expected_remittances.utr_number exact match")
     return IdentificationResult()
 
 

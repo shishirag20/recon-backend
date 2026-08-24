@@ -28,7 +28,18 @@ TRANSFORMS = (
     "FILL_DOWN",
 )
 
-_DEFAULT_DATE_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y")
+_DEFAULT_DATE_FORMATS = (
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%d/%m/%y",
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%m-%d-%Y",
+    "%m-%d-%y",
+    "%d-%m-%Y",
+    "%d-%m-%y",
+    "%Y/%m/%d",
+)
 
 # A boolean-typed canonical column (is_bank_charge is the only one today)
 # needs a real Python bool, not the string a source file spells it as -

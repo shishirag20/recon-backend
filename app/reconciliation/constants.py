@@ -46,6 +46,9 @@ class ReconciliationErrors:
     NOT_A_SUSPENSE_EXCEPTION = (
         "Only a SUSPENSE exception (with a bank_txn_id) can be resolved this way"
     )
+    NOT_A_MULTIPLE_MATCH_EXCEPTION = (
+        "Only a MULTIPLE_INVOICE_MATCH exception (with a bank_txn_id) can be resolved this way"
+    )
     SUSPENSE_PAYMENT_NOT_FOUND = (
         "No payment found for this exception's bank transaction"
     )

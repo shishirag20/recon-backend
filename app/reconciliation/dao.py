@@ -333,7 +333,7 @@ class ReconciliationDAO:
         )
         return _row(row)
 
-    async def list_candidate_bank_inflows(self, entity_id: str) -> list[dict]:
+    async def list_candidate_bank_inflows(self, entity_id: str, period_start=None, period_end=None) -> list[dict]:
         """Unreconciled credit inflows for this entity - the rows Phase 1
         attempts to identify a paying customer for. Excludes `is_bank_charge`
         rows entirely; the engine routes those straight to GL posting (M3),
@@ -341,12 +341,16 @@ class ReconciliationDAO:
         even though Phase 1 doesn't use it - Phase 2's fee-tolerance-match
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
-            "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
+            "SELECT bank_txn_id, transaction_date, bank_reference, document_number, narration, payer_name, "
             "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, dr_cr "
             "FROM bank_statements "
             "WHERE entity_id = $1 AND recon_status = 'PENDING' AND is_bank_charge = false "
+            "AND ($2::date IS NULL OR transaction_date >= $2) "
+            "AND ($3::date IS NULL OR transaction_date <= $3) "
             "ORDER BY transaction_date, bank_txn_id",
             entity_id,
+            period_start,
+            period_end,
         )
         return _rows(rows)
 
@@ -476,12 +480,9 @@ class ReconciliationDAO:
         )
 
     # -- Phase 2 working set (open invoices, open memos) ----------------------------
-    async def load_open_invoices(self, entity_id: str, period_end) -> list[dict]:
-        """Every not-yet-PAID invoice for this entity issued at or before
-        `period_end` - the 2.0a period-cutoff guardrail is baked into this
-        query (it applies identically ahead of every allocation rule, so
-        there's no reason to re-check it per rule). Filters on `issue_date`,
-        not `due_date`: an invoice issued within the period is legitimately
+    async def load_open_invoices(self, entity_id: str) -> list[dict]:
+        """Every not-yet-PAID invoice for this entity.
+        Filters on `issue_date`, not `due_date`: an invoice issued within the period is legitimately
         payable even if its due date falls later (e.g. Net-30 terms push
         `due_date` into the next month) - filtering on `due_date` would wrongly
         exclude every not-yet-due invoice from a run that's supposed to cover
@@ -494,10 +495,8 @@ class ReconciliationDAO:
             "SELECT invoice_id, customer_id, invoice_number, document_number, issue_date, due_date, "
             "total_amount_minor, balance_due_minor, allowed_tds_minor, tds_rate_pct, status "
             "FROM invoices WHERE entity_id = $1 AND status != 'PAID' "
-            "AND ($2::date IS NULL OR issue_date <= $2) "
             "ORDER BY customer_id, due_date, invoice_id",
             entity_id,
-            period_end,
         )
         return _rows(rows)
 
@@ -802,7 +801,7 @@ class ReconciliationDAO:
             "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'invoice_number', inv.invoice_number, "
             "  'invoice_amount_minor', inv.total_amount_minor, "
             "  'payment_id', a.payment_id, 'payment_amount_minor', p.total_received_minor, "
-            "  'bank_txn_id', a.bank_txn_id, 'bank_reference', bs.bank_reference, "
+            "  'bank_txn_id', a.bank_txn_id, 'document_number', COALESCE(bs.document_number, bs.raw->>'bank_txn_id'), 'bank_reference', bs.bank_reference, "
             "  'allocated_minor', a.allocated_minor"
             ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
             "FROM match_groups m "

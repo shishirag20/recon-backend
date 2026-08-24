@@ -33,6 +33,7 @@ from app.reconciliation.schema import (
     DefinitionCreate,
     DefinitionOut,
     ExceptionOut,
+    ExceptionResolveRequest,
     ExceptionUpdate,
     InvoiceSummaryOut,
     MatcherCatalogResponse,
@@ -179,9 +180,12 @@ async def update_rule(
     """`config` is a full replacement, not a merge - submit the rule's
     complete config, not just the keys you're changing."""
     return await service.update_rule(
-        str(definition_id), str(rule_id), enabled=payload.enabled, confidence=payload.confidence, config=payload.config
+        str(definition_id),
+        str(rule_id),
+        enabled=payload.enabled,
+        confidence=payload.confidence,
+        config=payload.config,
     )
-
 
 
 @router.post(
@@ -190,7 +194,11 @@ async def update_rule(
     status_code=status.HTTP_201_CREATED,
     summary="Add a new rule to a definition's catalog",
 )
-async def create_rule(definition_id: UUID, payload: RuleCreate, service: ReconciliationService = Depends(get_service)):
+async def create_rule(
+    definition_id: UUID,
+    payload: RuleCreate,
+    service: ReconciliationService = Depends(get_service),
+):
     """`kind="field-match"` composes a new CUSTOMER_LOCK/CANDIDATE_POOL rule
     from an existing matcher (`config.matcher`) and field pair
     (`config.bank_field`/`config.source`/`config.source_field`) - no code
@@ -199,8 +207,13 @@ async def create_rule(definition_id: UUID, payload: RuleCreate, service: Reconci
     404s here rather than silently being skipped at run time. Rules are
     never deleted, only disabled via `PATCH .../rules/{rule_id}`."""
     return await service.create_rule(
-        str(definition_id), phase=payload.phase, kind=payload.kind, name=payload.name,
-        priority=payload.priority, confidence=payload.confidence, config=payload.config,
+        str(definition_id),
+        phase=payload.phase,
+        kind=payload.kind,
+        name=payload.name,
+        priority=payload.priority,
+        confidence=payload.confidence,
+        config=payload.config,
     )
 
 
@@ -308,44 +321,59 @@ async def retry_run(
 
 
 # -- match_groups / reconciliation_exceptions (M3, run results) --------------------
-@router.get("/runs/{run_id}/matches", response_model=list[MatchGroupOut], summary="List a run's match groups")
-async def list_matches(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+@router.get(
+    "/runs/{run_id}/matches",
+    response_model=list[MatchGroupOut],
+    summary="List a run's match groups",
+)
+async def list_matches(
+    run_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     """Every match group Phase 2 committed for this run, each with its
     nested `allocations` - the invoices it settled money against."""
     return await service.list_matches(str(run_id))
 
 
-@router.get("/runs/{run_id}/exceptions", response_model=list[ExceptionOut], summary="List a run's exceptions")
-async def list_exceptions(run_id: UUID, status_filter: str | None = None, service: ReconciliationService = Depends(get_service)):
+@router.get(
+    "/runs/{run_id}/exceptions",
+    response_model=list[ExceptionOut],
+    summary="List a run's exceptions",
+)
+async def list_exceptions(
+    run_id: UUID,
+    status_filter: str | None = None,
+    service: ReconciliationService = Depends(get_service),
+):
     """Optionally filter by `status_filter` (one of `EXCEPTION_STATUSES`,
     e.g. `OPEN`). Includes GL_VARIANCE exceptions raised by the M3 control
     proof, not just Phase 1/2 exceptions."""
     return await service.list_exceptions(str(run_id), status_=status_filter)
 
 
-@router.patch("/exceptions/{exception_id}", response_model=ExceptionOut, summary="Resolve or annotate an exception")
-async def update_exception(exception_id: UUID, payload: ExceptionUpdate, service: ReconciliationService = Depends(get_service)):
-    """`resolved_at` is stamped automatically the moment `status` moves away
-    from `OPEN`/`INVESTIGATING` - not settable directly. TODO(recon.exception.resolve):
-    gate behind that permission once app/auth/ is real; `resolver_id` is
-    `None` until then."""
-    return await service.update_exception(
-        str(exception_id), status_=payload.status, resolution_outcome=payload.resolution_outcome,
-        resolution_notes=payload.resolution_notes,
-    )
-
-
-@router.get("/runs/{run_id}/payments", response_model=list[PaymentOut], summary="List a run's open/unapplied payments")
-async def list_open_payments(run_id: UUID, service: ReconciliationService = Depends(get_service)):
+@router.get(
+    "/runs/{run_id}/payments",
+    response_model=list[PaymentOut],
+    summary="List a run's open/unapplied payments",
+)
+async def list_open_payments(
+    run_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     """Payments with real leftover cash (`unapplied_minor > 0`) for this
     run's entity - the candidate pool the No-Payment-Received resolution
     panel offers a reviewer to manually match against an open invoice."""
     return await service.list_open_payments(str(run_id))
 
 
-@router.get("/runs/{run_id}/open-invoices", response_model=list[InvoiceSummaryOut], summary="List a run's open invoices, optionally searched")
+@router.get(
+    "/runs/{run_id}/open-invoices",
+    response_model=list[InvoiceSummaryOut],
+    summary="List a run's open invoices, optionally searched",
+)
 async def list_open_invoices(
-    run_id: UUID, search: str | None = None, limit: int = 50, service: ReconciliationService = Depends(get_service)
+    run_id: UUID,
+    search: str | None = None,
+    limit: int = 50,
+    service: ReconciliationService = Depends(get_service),
 ):
     """Every open invoice for this run's entity, across every customer -
     the Suspense resolution panel's "match to a different invoice" fallback
@@ -354,27 +382,14 @@ async def list_open_invoices(
     return await service.list_open_invoices(str(run_id), search=search, limit=limit)
 
 
-@router.post(
-    "/exceptions/{exception_id}/resolve-no-payment", response_model=ExceptionOut,
-    summary="Manually match a NO_PAYMENT exception's invoice to one or more open payments",
-)
-async def resolve_no_payment(exception_id: UUID, payload: ResolveNoPaymentRequest, service: ReconciliationService = Depends(get_service)):
-    """Only valid for a `NO_PAYMENT` exception. Applies the selected
-    payments' unapplied cash to the exception's invoice (in the order
-    given), writes a real `MANUAL` match_group + allocations, and
-    cross-resolves any of those payments' own open Suspense exceptions.
-    TODO(recon.exception.resolve): gate behind that permission once
-    app/auth/ is real, same as PATCH /exceptions/{id}."""
-    return await service.resolve_no_payment(
-        str(exception_id), payment_ids=[str(pid) for pid in payload.payment_ids], note=payload.note,
-    )
-
-
 @router.get(
-    "/customers/{customer_id}/open-invoices", response_model=list[InvoiceSummaryOut],
+    "/customers/{customer_id}/open-invoices",
+    response_model=list[InvoiceSummaryOut],
     summary="List a customer's open invoices",
 )
-async def list_open_invoices_for_customer(customer_id: UUID, service: ReconciliationService = Depends(get_service)):
+async def list_open_invoices_for_customer(
+    customer_id: UUID, service: ReconciliationService = Depends(get_service)
+):
     """The Suspense resolution panel's invoice picker, once a candidate
     customer is selected (from the exception's own suggestion, its
     candidate pool, or picked manually)."""
@@ -382,17 +397,13 @@ async def list_open_invoices_for_customer(customer_id: UUID, service: Reconcilia
 
 
 @router.post(
-    "/exceptions/{exception_id}/resolve-suspense", response_model=ExceptionOut,
-    summary="Manually match a SUSPENSE exception's payment to a customer and (optionally) invoices",
+    "/exceptions/resolve",
+    response_model=ExceptionOut,
+    summary="Unified endpoint to resolve any exception using exception_id in request body",
 )
-async def resolve_suspense(exception_id: UUID, payload: ResolveSuspenseRequest, service: ReconciliationService = Depends(get_service)):
-    """Only valid for a `SUSPENSE` exception. Confirms `customer_id` as the
-    payment's identity (locking it if not already), applies its cash across
-    `invoice_ids` in the order given (empty leaves it fully unapplied/
-    on-account for that customer), and resolves the exception.
-    TODO(recon.exception.resolve): gate behind that permission once
-    app/auth/ is real, same as PATCH /exceptions/{id}."""
-    return await service.resolve_suspense(
-        str(exception_id), customer_id=str(payload.customer_id),
-        invoice_ids=[str(iid) for iid in payload.invoice_ids], note=payload.note,
-    )
+async def resolve_exception_unified(
+    payload: ExceptionResolveRequest,
+    service: ReconciliationService = Depends(get_service),
+):
+    """Unified exception resolution endpoint. Dispatches based on exception_type from DB using exception_id passed in request body."""
+    return await service.resolve_exception_unified(payload)

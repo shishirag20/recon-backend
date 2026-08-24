@@ -116,6 +116,7 @@ class AllocationOutcome:
     reason: str = ""
     ambiguous: bool = False
     ambiguous_invoice_ids: list[str] = field(default_factory=list)
+    ambiguous_invoices: list[dict] = field(default_factory=list)
 
     @property
     def matched(self) -> bool:

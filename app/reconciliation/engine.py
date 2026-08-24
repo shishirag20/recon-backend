@@ -101,6 +101,7 @@ async def run_phase_1(
     """
     entity_id = str(run_context["entity_id"])
     definition_id = str(run_context["definition_id"])
+    period_start = run_context.get("period_start")
     period_end = run_context.get("period_end")
 
     rules = await dao.list_rules(definition_id)
@@ -127,13 +128,13 @@ async def run_phase_1(
         key=lambda r: r["priority"],
     )
 
-    bank_inflows = await dao.list_candidate_bank_inflows(entity_id)
+    bank_inflows = await dao.list_candidate_bank_inflows(entity_id, period_start, period_end)
     ref_counts = Counter(
         b["bank_reference"] for b in bank_inflows if b["bank_reference"]
     )
     duplicate_refs_in_run = {ref for ref, count in ref_counts.items() if count > 1}
 
-    all_open_invoices = await dao.load_open_invoices(entity_id, period_end)
+    all_open_invoices = await dao.load_open_invoices(entity_id)
     customer_master = await dao.load_customer_master(entity_id)
     cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
 
@@ -473,7 +474,7 @@ async def run_phase_2(
     short_pay_tolerance_minor = get_threshold_minor(rules, PHASE_SHORT_PAY)
     unapplied_tolerance_minor = get_threshold_minor(rules, PHASE_UNAPPLIED)
 
-    invoices = await dao.load_open_invoices(entity_id, period_end)
+    invoices = await dao.load_open_invoices(entity_id)
     customer_master = await dao.load_customer_master(entity_id)
     cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
     invoices_by_customer: dict[str, list[dict]] = defaultdict(list)
@@ -1136,6 +1137,7 @@ async def run_phase_2(
                     reason_code=reason,
                     detail={
                         "invoice_ids": alloc_result.ambiguous_invoice_ids,
+                        "invoices": alloc_result.ambiguous_invoices,
                         "amount_minor": amount,
                         "customer_name": cust_name,
                     },
@@ -1203,6 +1205,7 @@ async def run_phase_2(
                         reason_code=reason,
                         detail={
                             "invoice_ids": alloc_result.ambiguous_invoice_ids,
+                            "invoices": alloc_result.ambiguous_invoices,
                             "amount_minor": amount,
                             "customer_name": cust_name,
                         },
