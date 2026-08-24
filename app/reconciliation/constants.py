@@ -199,9 +199,14 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # match at all - e.g. a remittance with no rich payer data on the bank
     # side, only a narration. Only fires if the referenced invoice already
     # has its own customer_id (from ERP ingestion) - see
-    # app/reconciliation/rules/identification.py::document_number_match.
+    # app/reconciliation/rules/identification.py::document_number_match. Note
+    # this `config` is display-only (Rules Studio's "Compares" chip) - the
+    # implementation doesn't read it at all, it always checks both fields via
+    # narration_invoice_owner()/_matched_number(); `match_fields` (plural,
+    # not `match_field`) must list both or the UI undersells what's actually
+    # checked (2026-08 fix - was previously just "invoice_number").
     (PHASE_CUSTOMER_LOCK, "document-number-narration", "Document Number in Narration Match", 7, 85,
-     {"source": "invoices", "match_field": "invoice_number", "location": "narration"}),
+     {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 1b - CANDIDATE_POOL (only reached if Phase 1a locked nothing)
     (PHASE_CANDIDATE_POOL, "account-suffix", "Masked Account Suffix Match", 1, 60,
@@ -220,9 +225,12 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # UI); disagreement raises a CUSTOMER_INVOICE_MISMATCH exception instead
     # of letting the lock stand unquestioned; and if 1a/1b found nobody at
     # all, it seeds a single-candidate pool as a last-resort suggestion. See
-    # engine.py::run_phase_1.
+    # engine.py::run_phase_1. `match_fields` (plural) is genuinely read by
+    # narration_invoice_owner() (2026-08 fix, was previously ignored) - lists
+    # which invoice field(s) to check narration against, in order.
     (PHASE_NARRATION_CHECK, "invoice-number-in-narration", "Invoice Number in Narration", 1, 100,
-     {"description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?"}),
+     {"description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?",
+      "source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool).
     # tds-match/bank-fee/write-off/overpayment used to be standalone rules
@@ -234,7 +242,7 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # later-priority fallback pass (2026-08 note - see engine.py's
     # `_commit_direct_match` and allocation.py's rule docstrings).
     (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
-     {"match_field": "invoice_number", "location": "narration"}),
+     {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
     (PHASE_ALLOCATION, "invoice-suffix", "Truncated Invoice Number Match", 2, 90,
      {"match_field": "invoice_number", "mode": "suffix", "min_length": 4}),
     (PHASE_ALLOCATION, "exact-amount", "Exact Amount Match", 3, 95,
@@ -243,6 +251,22 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
      {"amount": {"mode": "subset_sum"}, "order_by": "due_date", "max_invoices": 10}),
     (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 5, 100,
      {"mode": "partial", "allow_short_pay": True}),
+    # Not dispatched through ALLOCATION_RULES like the five above - it never
+    # competes in the customer-scoped, per-payment cascade, since by
+    # definition no customer was ever identified (payment side or invoice
+    # side - migration 0031) for it to be scoped to. Exists as a catalog row
+    # purely so engine.py's no-customer direct-match path
+    # (`_commit_direct_match`, gated on this row's `enabled` at the top of
+    # `run_phase_2`) has a real rule_id/name/confidence to attach to its
+    # match_groups, instead of `rule_id=None` forcing the frontend to guess
+    # what happened (2026-08 fix). Same evidence/mechanism as the
+    # CUSTOMER_LOCK phase's "document-number-narration" rule - see that
+    # row's comment - just applied without a customer to lock. Named
+    # distinctly from that rule (and from "invoice-number-in-narration") on
+    # purpose - all three used to collide on nearly-identical display names,
+    # which is exactly what made "Resolved Via" confusing (2026-08 fix).
+    (PHASE_ALLOCATION, "direct-invoice-match", "Direct Invoice Match", 6, 85,
+     {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 3.0/3.1/3.2 - SHORT_PAY / UNAPPLIED / GL_CHECK: one `threshold`
     # rule per phase, actually read by the engine (engine.py::run_phase_2 for

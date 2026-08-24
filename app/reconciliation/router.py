@@ -165,7 +165,7 @@ async def update_rule(
     """`config` is a full replacement, not a merge - submit the rule's
     complete config, not just the keys you're changing."""
     return await service.update_rule(
-        str(definition_id), str(rule_id), enabled=payload.enabled, config=payload.config
+        str(definition_id), str(rule_id), enabled=payload.enabled, name=payload.name, config=payload.config
     )
 
 

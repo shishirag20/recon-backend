@@ -28,7 +28,16 @@ class RuleContext:
     bank_accounts: list[dict]
     reference_codes: list[dict]
     expected_remittances: list[dict]
-    duplicate_refs_in_run: set[str] = field(default_factory=set)
+    # bank_txn_ids (not bank_reference values) that are a *later* occurrence
+    # of a bank_reference repeated within this same run - the first
+    # occurrence of any given reference is deliberately left out of this set
+    # so it can still be identified/matched normally. Rejecting every row
+    # that shares a reference (keying this by reference value instead of
+    # bank_txn_id) used to reject the legitimate first payment too, not just
+    # the real duplicate (2026-08 fix) - dup-utr's own job is "reject an
+    # ALREADY-MATCHED reference," not "reject anyone who shares a reference
+    # with someone else in the batch."
+    duplicate_bank_txn_ids: set[str] = field(default_factory=set)
     # Every open invoice for this entity, across every customer - not scoped
     # to whichever customer a rule is currently evaluating, unlike everything
     # else on this context. Only used by the "Invoice Number in Narration"

@@ -20,16 +20,22 @@ RuleFn = Callable[[dict, RuleContext, dict], Awaitable[IdentificationResult]]
 
 
 async def dup_utr_check(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:
-    """Rejects a bank_txn whose `bank_reference` either collides with another
-    PENDING row in this same run (checked in Python - the whole candidate set
-    is already loaded into `ctx.duplicate_refs_in_run` by the engine before
-    any rule runs) or already belongs to a row `recon_status='MATCHED'` from
-    a prior run (checked here, since that's a live DB fact this rule alone
-    needs)."""
+    """Rejects a bank_txn whose `bank_reference` either repeats a PENDING row
+    already accounted for earlier in this same run (checked in Python - the
+    engine precomputes which specific bank_txn_ids are non-first occurrences
+    into `ctx.duplicate_bank_txn_ids` before any rule runs - see
+    engine.py::run_phase_1) or already belongs to a row
+    `recon_status='MATCHED'` from a prior run (checked here, since that's a
+    live DB fact this rule alone needs). Only the *later* occurrence(s) of a
+    repeated reference are rejected - the first is left alone to identify/
+    match normally, matching this rule's own name ("reject an ALREADY-
+    matched reference"), not "reject everyone who shares one" (2026-08 fix -
+    two genuinely distinct payments that happen to reuse a reference used to
+    both get rejected, including the legitimate first one)."""
     reference = bank_txn.get("bank_reference")
     if not reference:
         return IdentificationResult()
-    if reference in ctx.duplicate_refs_in_run:
+    if bank_txn["bank_txn_id"] in ctx.duplicate_bank_txn_ids:
         return IdentificationResult(reject=True, reason=f"duplicate bank_reference {reference!r} in this run")
     if await ctx.dao.bank_reference_already_matched(ctx.entity_id, reference, bank_txn["bank_txn_id"]):
         return IdentificationResult(reject=True, reason=f"bank_reference {reference!r} already MATCHED in a prior run")
@@ -154,8 +160,12 @@ async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) 
     Reuses narration_invoice_owner() - the same search the NARRATION_CHECK
     cross-check (Phase 1c) independently performs after this cascade runs;
     if this rule is what locked the payment, that cross-check will find the
-    same invoice and record agreement rather than raise a mismatch."""
-    match = narration_invoice_owner(bank_txn.get("narration") or "", ctx.all_open_invoices)
+    same invoice and record agreement rather than raise a mismatch.
+    `config['match_fields']` (Rules Studio's "Compares" picker) genuinely
+    selects which field(s) to check - see narration_invoice_owner."""
+    match = narration_invoice_owner(
+        bank_txn.get("narration") or "", ctx.all_open_invoices, fields=config.get("match_fields")
+    )
     if match is None or match["customer_id"] is None:
         # Either no invoice reference found, or it was found but that
         # invoice itself has no customer yet either (migration 0031) - this
@@ -169,7 +179,12 @@ async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) 
     )
 
 
-def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> dict | None:
+DEFAULT_NARRATION_MATCH_FIELDS = ("invoice_number", "document_number")
+
+
+def narration_invoice_owner(
+    narration: str, all_open_invoices: list[dict], fields: list[str] | tuple[str, ...] | None = None
+) -> dict | None:
     """The "Invoice Number in Narration" cross-check (kind
     `invoice-number-in-narration`). Deliberately NOT in `IDENTIFICATION_RULES`
     - it doesn't compete in the first-match-wins CUSTOMER_LOCK loop, it's
@@ -182,19 +197,22 @@ def narration_invoice_owner(narration: str, all_open_invoices: list[dict]) -> di
     is to catch a narration referencing a *different* customer's invoice than
     the one Phase 1a is about to lock.
 
-    Checks both invoice_number and document_number (migration 0033) - some
-    ERP exports label the customer-facing reference "Document Number" rather
-    than "Invoice Number" (see CMR_BOOK_DATA.csv), or carry both as
-    genuinely different values. Either one appearing in narration is
-    equally strong evidence of which invoice this is."""
+    Checks both invoice_number and document_number (migration 0033) by
+    default - some ERP exports label the customer-facing reference "Document
+    Number" rather than "Invoice Number" (see CMR_BOOK_DATA.csv), or carry
+    both as genuinely different values. `fields` (from the calling rule's own
+    `config['match_fields']`, e.g. `invoice-number-in-narration`'s Rules
+    Studio "Compares" picker) can narrow this to just one - genuinely
+    respected here now, not just displayed (2026-08 fix)."""
     if not narration:
         return None
     for inv in all_open_invoices:
         matched_number = None
-        if extract.contains_substring(narration, inv["invoice_number"]):
-            matched_number = inv["invoice_number"]
-        elif inv.get("document_number") and extract.contains_substring(narration, inv["document_number"]):
-            matched_number = inv["document_number"]
+        for field in fields or DEFAULT_NARRATION_MATCH_FIELDS:
+            value = inv.get(field)
+            if value and extract.contains_substring(narration, value):
+                matched_number = value
+                break
         if matched_number is not None:
             return {
                 # None (migration 0031, an invoice ingested without a

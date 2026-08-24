@@ -146,14 +146,16 @@ class ReconciliationDAO:
         return _row(row)
 
     async def update_rule(
-        self, rule_id: str, *, enabled: bool | None, config: dict | None
+        self, rule_id: str, *, enabled: bool | None, name: str | None = None, config: dict | None
     ) -> dict | None:
         row = await self.conn.fetchrow(
-            "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), config = COALESCE($3::jsonb, config) "
+            "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), "
+            "name = COALESCE($3, name), config = COALESCE($4::jsonb, config) "
             "WHERE rule_id = $1 "
             "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
             rule_id,
             enabled,
+            name,
             config,
         )
         return _row(row)
@@ -334,7 +336,8 @@ class ReconciliationDAO:
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
             "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
-            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor "
+            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, "
+            "raw->>'bank_txn_id' AS bank_txn_source_id "
             "FROM bank_statements "
             "WHERE entity_id = $1 AND recon_status = 'PENDING' AND dr_cr = 'CREDIT' AND is_bank_charge = false "
             "ORDER BY transaction_date, bank_txn_id",
@@ -795,6 +798,7 @@ class ReconciliationDAO:
             "  'invoice_amount_minor', inv.total_amount_minor, "
             "  'payment_id', a.payment_id, 'payment_amount_minor', p.total_received_minor, "
             "  'bank_txn_id', a.bank_txn_id, 'bank_reference', bs.bank_reference, "
+            "  'bank_txn_source_id', bs.raw->>'bank_txn_id', "
             "  'allocated_minor', a.allocated_minor"
             ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
             "FROM match_groups m "
@@ -825,6 +829,7 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.raw->>'bank_txn_id' AS bank_txn_source_id, "
             "bs.payer_name, "
             "bs.narration, "
             "COALESCE("
@@ -864,6 +869,7 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.raw->>'bank_txn_id' AS bank_txn_source_id, "
             "bs.payer_name, "
             "bs.narration, "
             "COALESCE("

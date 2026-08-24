@@ -120,6 +120,7 @@ class ReconciliationService:
         rule_id: str,
         *,
         enabled: bool | None,
+        name: str | None = None,
         config: dict | None,
     ):
         await self.get_definition(definition_id)
@@ -130,7 +131,7 @@ class ReconciliationService:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, ReconciliationErrors.RULE_NOT_FOUND
             )
-        return await self.dao.update_rule(rule_id, enabled=enabled, config=config)
+        return await self.dao.update_rule(rule_id, enabled=enabled, name=name, config=config)
 
     def list_matcher_catalog(self) -> dict:
         """Static reference data (no DB) for the `kind="field-match"`

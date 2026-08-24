@@ -65,14 +65,20 @@ async def _promote_unresolved_invoice(ctx: AllocationContext, inv: dict, custome
     ctx.invoices_by_customer.setdefault(customer_id, []).append(inv)
 
 
-def _matched_number(narration: str, inv: dict) -> str | None:
-    """invoice_number or document_number (migration 0033), whichever
-    actually appears in narration - either is equally strong evidence of
-    which invoice this is (see narration_invoice_owner's docstring)."""
-    if extract.contains_substring(narration, inv["invoice_number"]):
-        return inv["invoice_number"]
-    if inv.get("document_number") and extract.contains_substring(narration, inv["document_number"]):
-        return inv["document_number"]
+DEFAULT_NARRATION_MATCH_FIELDS = ("invoice_number", "document_number")
+
+
+def _matched_number(narration: str, inv: dict, fields: list[str] | tuple[str, ...] | None = None) -> str | None:
+    """Whichever of `fields` (default: invoice_number, then document_number
+    - migration 0033) actually appears in narration first - either is
+    equally strong evidence of which invoice this is (see
+    narration_invoice_owner's docstring). `fields` comes from the calling
+    rule's own `config['match_fields']` (Rules Studio's "Compares" picker) -
+    genuinely respected here, not just displayed (2026-08 fix)."""
+    for field in fields or DEFAULT_NARRATION_MATCH_FIELDS:
+        value = inv.get(field)
+        if value and extract.contains_substring(narration, value):
+            return value
     return None
 
 
@@ -232,12 +238,13 @@ async def invoice_number_match(payment: dict, bank_txn: dict, customer_id: str, 
     invoice's customer_id rather than leaving it permanently orphaned."""
     narration = bank_txn.get("narration") or ""
     amount = payment["total_received_minor"]
+    fields = config.get("match_fields")
     for inv in _open_invoices(ctx, customer_id):
-        matched = _matched_number(narration, inv)
+        matched = _matched_number(narration, inv, fields)
         if matched is not None:
             return _settled_outcome(inv, amount, bank_txn, f"{matched!r} in narration")
     for inv in ctx.unresolved_invoices:
-        matched = _matched_number(narration, inv)
+        matched = _matched_number(narration, inv, fields)
         if matched is not None:
             await _promote_unresolved_invoice(ctx, inv, customer_id)
             return _settled_outcome(

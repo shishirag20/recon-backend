@@ -49,6 +49,7 @@ class RuleOut(BaseModel):
 
 class RuleUpdate(BaseModel):
     enabled: bool | None = None
+    name: str | None = None
     config: dict | None = Field(default=None, description="Full replacement of the rule's config, not a merge.")
 
 
@@ -144,6 +145,10 @@ class AllocationOut(BaseModel):
     payment_amount_minor: int | None = Field(description="The payment's own total received (payments.total_received_minor) - what the bank transaction actually brought in, which may exceed or fall short of allocated_minor (overpayment/short-pay/fee cases).")
     bank_txn_id: UUID | None
     bank_reference: str | None = Field(description="The real bank reference/UTR from the source file (bank_statements.bank_reference) - bank_txn_id is the internal generated row UUID.")
+    bank_txn_source_id: str | None = Field(
+        default=None,
+        description="The source file's own transaction id column (e.g. 'BANK-017'), if the upload had one - pulled from bank_statements.raw, since it's typically not a mapped canonical field. Null if the source file didn't have this column.",
+    )
     allocated_minor: int = Field(description="How much of this payment was actually applied to this invoice - may differ from both invoice_amount_minor and payment_amount_minor.")
 
 
@@ -181,6 +186,10 @@ class ExceptionOut(BaseModel):
     customer_code: str | None = None
     invoice_number: str | None = None
     bank_reference: str | None = None
+    bank_txn_source_id: str | None = Field(
+        default=None,
+        description="The source file's own transaction id column (e.g. 'BANK-001'), if the upload had one - pulled from bank_statements.raw, since it's typically not a mapped canonical field. Null if the source file didn't have this column.",
+    )
     payer_name: str | None = Field(default=None, description="Raw payer name from the bank row, for a SUSPENSE exception's payment-details block.")
     narration: str | None = Field(default=None, description="Raw bank narration, same use as payer_name.")
     discrepancy_minor: int | None = None
