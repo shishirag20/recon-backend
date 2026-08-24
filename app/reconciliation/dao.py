@@ -238,6 +238,52 @@ class ReconciliationDAO:
         )
         return _row(row)
 
+    # DEV-ONLY: wipes every run/match/exception/GL posting for a definition
+    # and resets invoices/bank_statements back to their pre-reconciliation
+    # state, so the same source data can be re-run from scratch while
+    # iterating on rules/mappings. Not meant to survive past dev - grep
+    # "DEV-ONLY" to find every piece of this if/when it's time to remove it.
+    async def reset_definition(self, definition_id: str, entity_id: str) -> None:
+        async with self.conn.transaction():
+            await self.conn.execute(
+                "DELETE FROM reconciliation_exceptions WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            # match_groups -> invoice_allocations cascades (ON DELETE CASCADE);
+            # gl_journal_entries -> gl_journal_lines cascades too. Order here
+            # only matters for invoice_allocations.gl_journal_id, a plain FK
+            # (no cascade) - deleting match_groups first removes the
+            # referencing rows before gl_journal_entries is touched.
+            await self.conn.execute(
+                "DELETE FROM match_groups WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM gl_journal_entries WHERE run_id IN "
+                "(SELECT run_id FROM reconciliation_runs WHERE definition_id = $1)",
+                definition_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM payments WHERE bank_txn_id IN "
+                "(SELECT bank_txn_id FROM bank_statements WHERE entity_id = $1)",
+                entity_id,
+            )
+            await self.conn.execute(
+                "DELETE FROM reconciliation_runs WHERE definition_id = $1", definition_id
+            )
+            await self.conn.execute(
+                "UPDATE invoices SET balance_due_minor = total_amount_minor, status = 'OPEN' "
+                "WHERE entity_id = $1",
+                entity_id,
+            )
+            await self.conn.execute(
+                "UPDATE bank_statements SET recon_status = 'PENDING', gl_posted = false "
+                "WHERE entity_id = $1",
+                entity_id,
+            )
+
     async def get_run(self, run_id: str) -> dict | None:
         row = await self.conn.fetchrow(
             f"SELECT {self._RUN_COLUMNS} FROM reconciliation_runs WHERE run_id = $1",
@@ -357,23 +403,29 @@ class ReconciliationDAO:
         total_received_minor: int,
         locked_by_rule_id: str | None,
         candidate_pool: list[str] | None,
+        narration_crosscheck_rule_id: str | None = None,
     ) -> dict:
         """`unapplied_minor` starts equal to the full received amount -
         nothing's been allocated to an invoice yet; Phase 2 (M2) decrements
         it as allocations land. Exactly one of `locked_by_rule_id` (Phase 1a
         lock) or `candidate_pool` (Phase 1b pool) should be set; both NULL
-        means Phase 1 found nothing at all (Suspense)."""
+        means Phase 1 found nothing at all (Suspense). `narration_crosscheck_rule_id`
+        is set only when the "Invoice Number in Narration" cross-check found a
+        narration-referenced invoice AND it agreed with `customer_id` - a
+        disagreement raises CUSTOMER_INVOICE_MISMATCH instead and never calls
+        this with a locked customer_id at all."""
         row = await self.conn.fetchrow(
             "INSERT INTO payments (payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor, "
-            "locked_by_rule_id, candidate_pool) "
-            "VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5::jsonb) "
+            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5::jsonb, $6) "
             "RETURNING payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor, "
-            "locked_by_rule_id, candidate_pool",
+            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id",
             bank_txn_id,
             customer_id,
             total_received_minor,
             locked_by_rule_id,
             candidate_pool,
+            narration_crosscheck_rule_id,
         )
         return _row(row)
 
@@ -432,7 +484,7 @@ class ReconciliationDAO:
         a pre-populated `allowed_tds_minor` - the ingestion mapping has no
         way to derive that product today (see docs/reconciliation.md §8)."""
         rows = await self.conn.fetch(
-            "SELECT invoice_id, customer_id, invoice_number, issue_date, due_date, "
+            "SELECT invoice_id, customer_id, invoice_number, document_number, issue_date, due_date, "
             "total_amount_minor, balance_due_minor, allowed_tds_minor, tds_rate_pct, status "
             "FROM invoices WHERE entity_id = $1 AND status != 'PAID' "
             "AND ($2::date IS NULL OR issue_date <= $2) "
@@ -511,6 +563,21 @@ class ReconciliationDAO:
             "RETURNING invoice_id, balance_due_minor, status",
             invoice_id,
             amount_minor,
+        )
+        return _row(row)
+
+    async def link_invoice_customer(self, invoice_id: str, customer_id: str) -> dict:
+        """Backfills customer_id on an invoice ingested without one
+        (migration 0031), once a narration-based invoice-number match ties it
+        to a real payment's already-identified customer. Only ever called
+        against a row that's currently NULL there - see
+        allocation.py's _promote_unresolved_invoice."""
+        row = await self.conn.fetchrow(
+            "UPDATE invoices SET customer_id = $2, updated_at = now() "
+            "WHERE invoice_id = $1 "
+            "RETURNING invoice_id, customer_id",
+            invoice_id,
+            customer_id,
         )
         return _row(row)
 
@@ -710,14 +777,20 @@ class ReconciliationDAO:
         (CUSTOMER_LOCK) rule that identified the payment's customer in the
         first place - pulled from `payments` via the group's first
         allocation, since every allocation in one match group shares the
-        same payment. Both are surfaced together so the UI can show the
-        full "how did this get matched" story (identification + allocation),
-        not just the allocation half."""
+        same payment. `narration_crosscheck_rule_id` is the "Invoice Number
+        in Narration" cross-check, set only when it found a narration
+        reference and confirmed the lock - a third, independent check, not
+        just the two that "win" something. All three are surfaced together
+        so the UI can show the full "how did this get matched" story, not
+        just the pieces that produced the final match."""
         rows = await self.conn.fetch(
             "SELECT m.match_group_id, m.run_id, m.match_type, m.rule_id, m.confidence, m.status, m.reason, m.created_at, "
             "(SELECT p.locked_by_rule_id FROM payments p "
             "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
             "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS locked_by_rule_id, "
+            "(SELECT p.narration_crosscheck_rule_id FROM payments p "
+            "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
+            "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS narration_crosscheck_rule_id, "
             "COALESCE(json_agg(json_build_object("
             "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'invoice_number', inv.invoice_number, "
             "  'invoice_amount_minor', inv.total_amount_minor, "

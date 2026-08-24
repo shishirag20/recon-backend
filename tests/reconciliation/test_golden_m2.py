@@ -152,6 +152,20 @@ async def golden(conn):
     bank["018"] = await _seed_bank_txn(conn, entity_id, ref="UTR-UNK-018", payer="Unknown Remitter XYZ", narration="MISC TRANSFER UNRECOGNIZED", amount_minor=99900, txn_date="2026-07-21")
     bank["019"] = await _seed_bank_txn(conn, entity_id, ref="UTR-ADV-7001", payer="Acme Industries Pvt Ltd", narration="NEFT PAYMENT ACME", amount_minor=1000000, txn_date="2026-07-02")
 
+    # "Invoice Number in Narration" cross-check cases - not part of the
+    # original truebalance fixture, added for this rule specifically.
+    # 021: locks to Nimbus via UPI (same signal as bank["005"]), but the
+    # narration references INV-2026-102 - a real invoice, just Bright
+    # Textiles' rather than Nimbus's. Should raise CUSTOMER_INVOICE_MISMATCH,
+    # never lock to either customer.
+    bank["021"] = await _seed_bank_txn(conn, entity_id, ref="UTR-NIM-021", payer="Nimbus Traders", narration="UPI/nimbus@okhdfc/PAYMENT INV-2026-102", amount_minor=500000, txn_date="2026-07-16")
+    # 022: no Phase 1a rule fires (payer name doesn't fuzzy-match anyone, no
+    # account info, no customer code in narration) and no pooling rule fires
+    # either - but the narration references Solace's real INV-2026-109.
+    # Should seed candidate_pool=[solace] rather than falling straight to a
+    # suggestion-less Suspense.
+    bank["022"] = await _seed_bank_txn(conn, entity_id, ref="UTR-XYZ-022", payer="Totally Unrelated Payer Co", narration="SETTLEMENT REF INV-2026-109", amount_minor=999999, txn_date="2026-07-18")
+
     return {"entity_id": entity_id, "customers": cust, "invoices": inv, "bank": bank}
 
 
@@ -440,3 +454,74 @@ class TestPhase2AllocationOrdering:
 
         alloc2 = await conn.fetchrow("SELECT invoice_id FROM invoice_allocations WHERE payment_id = $1", pay2["payment_id"])
         assert str(alloc2["invoice_id"]) == inv_a, "payment2 must be the one that settled INV-A"
+
+
+class TestNarrationInvoiceCrosscheck:
+    """The "Invoice Number in Narration" cross-check (CUSTOMER_LOCK, kind
+    invoice-number-in-narration): independently resolves which customer owns
+    whatever invoice number the narration references (searched across every
+    customer, not just whoever Phase 1a locks) and reconciles that against
+    Phase 1a's own result."""
+
+    async def test_agreement_is_recorded_not_just_silently_passed(self, conn, golden):
+        """bank['005'] locks to Nimbus via UPI, and its narration references
+        INV-2026-105 - Nimbus's own invoice. No conflict, so it should still
+        lock and allocate exactly as before - but the cross-check having
+        agreed should be recorded on the payment, not silently dropped."""
+        await _run_full_reconciliation(conn, golden["entity_id"])
+        payment = await _payment_for(conn, golden["bank"]["005"])
+        assert str(payment["customer_id"]) == golden["customers"]["nimbus"]
+        assert payment["narration_crosscheck_rule_id"] is not None, \
+            "narration referenced the locked customer's own invoice - the cross-check should have confirmed it"
+        rule = await conn.fetchrow(
+            "SELECT kind FROM reconciliation_rules WHERE rule_id = $1", payment["narration_crosscheck_rule_id"]
+        )
+        assert rule["kind"] == "invoice-number-in-narration"
+        # And the match itself is untouched - still a real, clean allocation.
+        assert await _exceptions_for(conn, golden["bank"]["005"]) == []
+
+    async def test_conflicting_narration_invoice_raises_exception_not_a_wrong_match(self, conn, golden):
+        """bank['021'] locks to Nimbus via UPI - the exact same strong signal
+        as bank['005'] - but its narration references INV-2026-102, which is
+        Bright Textiles' invoice, not Nimbus's. Neither customer should get
+        a committed match; a human has to resolve the disagreement."""
+        await _run_full_reconciliation(conn, golden["entity_id"])
+        payment = await _payment_for(conn, golden["bank"]["021"])
+        assert payment is not None, "money is still tracked even though nobody locked"
+        assert payment["customer_id"] is None
+        assert payment["candidate_pool"] is None
+
+        exceptions = await _exceptions_for(conn, golden["bank"]["021"])
+        assert len(exceptions) == 1
+        exc = exceptions[0]
+        assert exc["exception_type"] == "CUSTOMER_INVOICE_MISMATCH"
+        assert exc["detail"]["locked_customer_id"] == golden["customers"]["nimbus"]
+        assert exc["detail"]["locked_via_rule"] == "upi"
+        assert exc["detail"]["narration_customer_id"] == golden["customers"]["bright"]
+        assert exc["detail"]["narration_invoice_id"] == golden["invoices"]["102"]
+        assert exc["detail"]["narration_invoice_number"] == "INV-2026-102"
+
+        # This payment itself never allocated to anything - not INV-2026-102
+        # (Bright's, referenced in narration) and not any Nimbus invoice.
+        alloc = await conn.fetchrow(
+            "SELECT 1 FROM invoice_allocations WHERE payment_id = $1", payment["payment_id"]
+        )
+        assert alloc is None
+
+    async def test_unresolved_lock_falls_back_to_narration_suggestion(self, conn, golden):
+        """bank['022']: no Phase 1a rule fires (payer name matches nobody, no
+        account info, no customer code in narration) and no Phase 1b pooling
+        rule fires either - but the narration references Solace's real
+        INV-2026-109. Should seed candidate_pool with Solace rather than
+        falling straight to a suggestion-less Suspense."""
+        await _run_full_reconciliation(conn, golden["entity_id"])
+        payment = await _payment_for(conn, golden["bank"]["022"])
+        assert payment["customer_id"] is None, "a narration hint alone must never auto-lock"
+        assert payment["candidate_pool"] == [golden["customers"]["solace"]]
+
+        # Pass A (Phase 2) still never auto-commits a pool, however clean -
+        # this always lands in Suspense/Double-Collision for a human, same as
+        # every other pooled payment.
+        exceptions = await _exceptions_for(conn, golden["bank"]["022"])
+        assert len(exceptions) == 1
+        assert exceptions[0]["exception_type"] in ("SUSPENSE", "DOUBLE_COLLISION")

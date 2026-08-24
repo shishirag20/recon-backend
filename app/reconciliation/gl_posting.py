@@ -72,7 +72,7 @@ async def post_run(
         ]
         await dao.insert_journal(
             entity_id=entity_id, run_id=run_id, posting_date=period_end, source_type="CASH_RECEIPT",
-            memo="Suspense receipt - no customer identified", lines=lines,
+            memo=rec.get("memo") or "Suspense receipt - no customer identified", lines=lines,
         )
         journal_count += 1
         posted_minor += rec["unapplied_minor"]

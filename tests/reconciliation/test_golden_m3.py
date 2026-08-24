@@ -108,18 +108,20 @@ class TestGLPostingScenarios:
         assert lines[("AR_CONTROL", "CREDIT")] == 600_000
         assert lines[("BANK_CHARGES", "DEBIT")] == 2_000
 
-    async def test_small_residual_118_gap_posts_to_bank_charges_not_write_off(self, conn, golden):
-        """INV-118's 200-minor-unit residual is within both bank-fee's
-        and write-off's tolerance (both default 500, no differentiator here
-        since BANK-014 has no explicit_fee_minor) - bank-fee wins on
-        priority (60 vs write-off's 70), so the gap posts to BANK_CHARGES,
-        not WRITE_OFF. Documented, not treated as a bug: see docs/reconciliation.md."""
+    async def test_small_residual_118_gap_posts_to_write_off_not_bank_charges(self, conn, golden):
+        """INV-118's 200-minor-unit residual has no explicit_fee_minor on
+        BANK-014 - bank-fee no longer has a generic tolerance fallback (it
+        only ever matches a residual against the bank row's own declared
+        fee), so an unexplained gap like this one is correctly left for
+        write-off instead. Previously bank-fee's now-removed fallback beat
+        write-off on priority regardless of whether the gap was ever
+        actually explained as a fee - see the allocation.py fix."""
         await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
         journal_id = await _journal_for_invoice(conn, golden["invoices"]["118"])
         lines = await _journal_lines_by_role(conn, journal_id, golden["entity_id"])
         assert lines[("CASH_CONTROL", "DEBIT")] == 299_800
         assert lines[("AR_CONTROL", "CREDIT")] == 300_000
-        assert lines[("BANK_CHARGES", "DEBIT")] == 200
+        assert lines[("WRITE_OFF", "DEBIT")] == 200
 
     async def test_overpay_103_posts_cash_ar_and_on_account_advance(self, conn, golden):
         await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)

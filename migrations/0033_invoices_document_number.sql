@@ -1,0 +1,12 @@
+-- A second, independent invoice identifier alongside invoice_number.
+--
+-- Some ERP exports label the customer-facing reference "Document Number"
+-- rather than "Invoice Number" (see CMR_BOOK_DATA.csv's Document_Number /
+-- Contra_Invoice_Number columns), or carry both as genuinely different
+-- values - an internal document/voucher reference distinct from the
+-- invoice number a customer would actually reference when paying. Narration
+-- matching (app/reconciliation/rules/identification.py's
+-- narration_invoice_owner, used by both the document-number-narration
+-- identification rule and the NARRATION_CHECK cross-check, plus Phase 2's
+-- invoice_number_match/truncated_suffix_match) now checks both fields.
+ALTER TABLE invoices ADD COLUMN document_number TEXT;

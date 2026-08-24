@@ -204,6 +204,19 @@ class ReconciliationService:
             period_end=period_end,
         )
 
+    # DEV-ONLY: see ReconciliationDAO.reset_definition. Grep "DEV-ONLY" to
+    # find every piece of this (this method, the router endpoint, the DAO
+    # method) if/when it's time to remove it.
+    async def rerun(self, definition_id: str, *, period_start, period_end):
+        definition = await self.get_definition(definition_id)  # 404s if missing
+        await self.dao.reset_definition(definition_id, definition["entity_id"])
+        return await self.dao.insert_run(
+            definition_id=definition_id,
+            run_no=new_run_no(),
+            period_start=period_start,
+            period_end=period_end,
+        )
+
     async def get_run(self, run_id: str):
         row = await self.dao.get_run(run_id)
         if row is None:

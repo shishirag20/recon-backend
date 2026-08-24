@@ -36,7 +36,7 @@ KNOWN_FIELDS = {
         "explicit_fee_minor", "is_bank_charge", "contra_reference",
     },
     "INVOICE": {
-        "customer_code", "invoice_number", "issue_date", "due_date", "currency",
+        "customer_code", "invoice_number", "document_number", "issue_date", "due_date", "currency",
         "total_amount_minor", "balance_due_minor",
         "tds_rate_pct", "allowed_tds_minor", "status",
     },
@@ -69,7 +69,7 @@ EDITABLE_FIELDS = {
         "explicit_fee_minor", "is_bank_charge", "contra_reference", "valid",
     },
     "INVOICE": {
-        "invoice_number", "issue_date", "due_date", "currency",
+        "invoice_number", "document_number", "issue_date", "due_date", "currency",
         "total_amount_minor", "total_home_minor", "balance_due_minor",
         "tds_rate_pct", "allowed_tds_minor", "status", "valid",
     },
@@ -259,13 +259,25 @@ async def insert_invoice_row(
         canonical["currency"] = effective_home
 
     customer_code = canonical.get("customer_code")
-    if not customer_code:
-        raise RowRejected("missing required field(s): customer_code")
-    customer_id = await _resolve_customer_id(conn, entity_id=entity_id, customer_code=customer_code)
+    customer_id = await _resolve_customer_id(conn, entity_id=entity_id, customer_code=customer_code) if customer_code else None
     if customer_id is None:
-        raise RowRejected(
-            f"no customer found with customer_code={customer_code!r} "
-            "(checked customers.customer_code and customer_reference_codes) for this entity"
+        # Not a reject, in either case - customer_code missing/unmapped
+        # (deliberately, e.g. mapped to "-") and customer_code present but
+        # not yet in the customer master are the same outcome: the invoice
+        # is still ingested, unlinked. Reconciliation resolves it later via a
+        # narration-based invoice-number match (or a human), backfilling
+        # customer_id at that point. See migration 0031.
+        # Mutates the caller's list in place (append, not `issues = issues +
+        # [...]`) - ingestion_worker.py's own error_count/row status check
+        # reads the same list object after this call returns, and a rebind
+        # here would be invisible to it, silently reporting a clean SUCCESS
+        # for a row that actually landed without a customer link.
+        issues.append(
+            f"unresolved customer_code={customer_code!r} "
+            "(checked customers.customer_code and customer_reference_codes) for this entity - "
+            "invoice ingested without a customer link"
+            if customer_code else
+            "no customer_code supplied - invoice ingested without a customer link"
         )
 
     _apply_home_currency_default(
@@ -281,6 +293,7 @@ async def insert_invoice_row(
         "source_job_id": source_job_id,
         "customer_id": customer_id,
         "invoice_number": canonical["invoice_number"],
+        "document_number": canonical.get("document_number"),
         "issue_date": canonical["issue_date"],
         "due_date": canonical["due_date"],
         "currency": canonical["currency"],

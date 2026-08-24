@@ -105,42 +105,32 @@ class DataHubDAO:
         return _row(row)
 
     # -- field_mappings --------------------------------------------------------
-    async def get_latest_version(self, stream: str) -> int:
-        row = await self.conn.fetchrow(
-            "SELECT COALESCE(MAX(version), 0) AS v FROM field_mappings WHERE stream = $1",
-            stream,
-        )
-        return row["v"]
-
     async def get_active_mappings(self, stream: str) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT DISTINCT ON (source_field, canonical_field) mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active "
-            "FROM field_mappings "
-            "WHERE stream = $1 AND is_active = true "
-            "AND version = (SELECT COALESCE(MAX(version), 0) FROM field_mappings WHERE stream = $1 AND is_active = true) "
-            "ORDER BY source_field, canonical_field, version DESC",
+            "SELECT mapping_id, stream, source_field, canonical_field, transform, transform_param, is_active "
+            "FROM field_mappings WHERE stream = $1 AND is_active = true",
             stream,
         )
         return _rows(rows)
 
-    async def insert_mapping_version(
-        self, stream: str, mappings: list[dict]
-    ) -> list[dict]:
+    async def save_mapping(self, stream: str, mappings: list[dict]) -> list[dict]:
+        """Replaces this stream's entire mapping set - a true replace, not a
+        merge: anything not in `mappings` is gone after this call, including
+        a row someone explicitly wants removed (no version history means no
+        version field_mappings.version left; this is the only representation
+        of the mapping there is). One DELETE + INSERT in a single
+        transaction - no separate deactivate-then-insert steps, so there's
+        no window for a concurrent save to interleave into a mixed state."""
         async with self.conn.transaction():
-            await self.conn.execute(
-                "UPDATE field_mappings SET is_active = false WHERE stream = $1 AND is_active = true",
-                stream,
-            )
-            next_version = await self.get_latest_version(stream) + 1
+            await self.conn.execute("DELETE FROM field_mappings WHERE stream = $1", stream)
             rows = []
             for m in mappings:
                 row = await self.conn.fetchrow(
                     "INSERT INTO field_mappings "
-                    "(mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active) "
-                    "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, true) "
-                    "RETURNING mapping_id, stream, version, source_field, canonical_field, transform, transform_param, is_active",
+                    "(mapping_id, stream, source_field, canonical_field, transform, transform_param, is_active) "
+                    "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true) "
+                    "RETURNING mapping_id, stream, source_field, canonical_field, transform, transform_param, is_active",
                     stream,
-                    next_version,
                     m["source_field"],
                     m["canonical_field"],
                     m["transform"],

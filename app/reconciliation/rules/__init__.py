@@ -29,6 +29,13 @@ class RuleContext:
     reference_codes: list[dict]
     expected_remittances: list[dict]
     duplicate_refs_in_run: set[str] = field(default_factory=set)
+    # Every open invoice for this entity, across every customer - not scoped
+    # to whichever customer a rule is currently evaluating, unlike everything
+    # else on this context. Only used by the "Invoice Number in Narration"
+    # cross-check, which needs to search entity-wide by design (a narration
+    # can reference a real invoice belonging to a customer other than the one
+    # actually being identified - that's the mismatch it exists to catch).
+    all_open_invoices: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +66,15 @@ class AllocationContext:
     conn: asyncpg.Connection
     invoices_by_customer: dict[str, list[dict]]
     memos_by_customer: dict[str, list[dict]] = field(default_factory=dict)
+    # Entity-wide, not scoped to any customer - invoices ingested without a
+    # resolvable customer_code (migration 0031). Only invoice_number_match/
+    # truncated_suffix_match search this, and only after that customer's own
+    # invoices come up empty: a literal invoice-number match in narration is
+    # self-sufficient evidence, unlike balance-based rules (subset-sum etc.),
+    # which would be unsafe to run across an unbounded, unrelated pool. A hit
+    # here promotes the invoice into invoices_by_customer and backfills its
+    # customer_id - see allocation.py's _promote_unresolved_invoice.
+    unresolved_invoices: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -68,12 +84,17 @@ class InvoiceAllocation:
     `close_full=True` means the invoice's balance should go to zero
     regardless of `cash_minor` being less than its original balance - the
     gap is being explicitly absorbed (a bank fee, a dust write-off, TDS
-    withheld at source), not left owing. The gap itself isn't posted
-    anywhere yet in M2 - that's gl_posting.py's job in M3; this just decides
-    the invoice is *done*."""
+    withheld at source), not left owing. `gap_role` (a GL_ROLE_* constant)
+    says where that gap posts - set per-allocation by whichever rule
+    identified this invoice (allocation.py::resolve_invoice_settlement),
+    since a single subset-sum combo can now mix a raw-balance invoice with a
+    TDS-adjusted one, each needing its own destination. The gap itself isn't
+    posted anywhere yet in M2 - that's gl_posting.py's job in M3; this just
+    decides the invoice is *done* and where its gap belongs."""
     invoice_id: str
     cash_minor: int
     close_full: bool = False
+    gap_role: str | None = None
 
 
 @dataclass

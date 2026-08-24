@@ -22,7 +22,7 @@ from app.datahub.schema import (
     DataSourceOut,
     DataSourceUpdate,
     FieldMappingOut,
-    FieldMappingVersionCreate,
+    FieldMappingSet,
     IngestionJobOut,
     MappingPreviewRequest,
     MappingPreviewResponse,
@@ -51,7 +51,7 @@ def get_service(conn: asyncpg.Connection = Depends(get_connection)) -> DataHubSe
 async def create_data_source(payload: DataSourceCreate, service: DataHubService = Depends(get_service)):
     """Registers a feed (bank connection, ERP export, gateway, or manual-upload
     bucket) for an entity. A data source must exist - and its `stream` must
-    have an active field mapping (see `POST /field-mappings/{stream}/versions`,
+    have an active field mapping (see `PUT /field-mappings/{stream}`,
     shared globally across every source/entity/org ingesting that stream) -
     before any file can be uploaded against it."""
     return await service.create_data_source(
@@ -94,25 +94,25 @@ async def get_active_field_mappings(stream: str, service: DataHubService = Depen
     return await service.get_active_mappings(stream)
 
 
-@router.post(
-    "/field-mappings/{stream}/versions",
+@router.put(
+    "/field-mappings/{stream}",
     response_model=list[FieldMappingOut],
-    status_code=status.HTTP_201_CREATED,
-    summary="Save a new field-mapping version for a stream",
+    summary="Replace a stream's entire field mapping",
 )
-async def create_field_mapping_version(
-    stream: str, payload: FieldMappingVersionCreate, service: DataHubService = Depends(get_service)
+async def replace_field_mapping(
+    stream: str, payload: FieldMappingSet, service: DataHubService = Depends(get_service)
 ):
-    """Replaces the stream's active mapping with a new version, atomically
-    (the previous version's rows are deactivated, not deleted). Submit the
-    full mapping set every time - this is not a partial update against the
-    previous version. Affects every data source that ingests this stream.
+    """Replaces the stream's mapping with exactly what's submitted - a true
+    replace, not a merge (no version history exists to fall back on - see
+    migration 0032). Submit the full mapping set every time: anything
+    omitted is removed, not preserved. Affects every data source that
+    ingests this stream.
 
     See the request schema's example for a realistic bank-statement mapping:
     it parses a date, trims two text fields, converts a decimal amount into
     integer minor units, and defaults a currency the source file doesn't
     provide."""
-    return await service.create_mapping_version(stream, [m.model_dump() for m in payload.mappings])
+    return await service.save_mapping(stream, [m.model_dump() for m in payload.mappings])
 
 
 @router.post(
