@@ -159,6 +159,13 @@ class ReconciliationDAO:
         )
         return _row(row)
 
+    async def delete_rule(self, rule_id: str) -> bool:
+        res = await self.conn.execute(
+            "DELETE FROM reconciliation_rules WHERE rule_id = $1",
+            rule_id,
+        )
+        return res == "DELETE 1"
+
     # -- gl_account_roles ----------------------------------------------------------
     async def seed_gl_account_roles(self, entity_id: str) -> list[dict]:
         """Idempotent: creates the baseline chart-of-accounts entry for every

@@ -135,6 +135,20 @@ class ReconciliationService:
             )
         return await self.dao.update_rule(rule_id, enabled=enabled, confidence=confidence, config=config)
 
+    async def delete_rule(self, definition_id: str, rule_id: str):
+        await self.get_definition(definition_id)
+        existing = await self.dao.get_rule(rule_id)
+        if existing is None or str(existing["definition_id"]) != definition_id:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, ReconciliationErrors.RULE_NOT_FOUND
+            )
+        try:
+            return await self.dao.delete_rule(rule_id)
+        except asyncpg.exceptions.ForeignKeyViolationError:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Cannot delete rule: it is referenced by existing matches or payments."
+            )
+
     def list_matcher_catalog(self) -> dict:
         """Static reference data (no DB) for the `kind="field-match"`
         picker - the frontend's source of truth for valid matcher/source/

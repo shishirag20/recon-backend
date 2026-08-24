@@ -972,7 +972,7 @@ async def run_phase_2(
             pending.append((outcome, outcome["customer_id"]))
             continue
 
-        candidates = outcome["candidate_pool"]
+        candidates = outcome.get("candidate_pool") or []
         bank_txn = outcome["bank_txn"]
         amount = bank_txn["amount_minor"]
         per_candidate_matches: list[tuple[str, dict | None, object]] = (
@@ -1082,11 +1082,15 @@ async def run_phase_2(
             )
             continue
 
-        # 0 of the pool's candidates produced any match at all.
+        # 0 of the pool's candidates produced any match at all (or pool was empty).
         await _suspense(
             outcome,
-            reason_code=f"candidate pool of {len(candidates)} customers but none resolved by exact amount",
-            detail={"candidate_customer_ids": candidates},
+            reason_code=(
+                f"candidate pool of {len(candidates)} customers but none resolved by exact amount"
+                if candidates
+                else "payment could not be identified to any customer"
+            ),
+            detail={"candidate_customer_ids": candidates} if candidates else None,
         )
 
     # --- Pass B: rule-outer / payment-inner, grouped by resolved customer -

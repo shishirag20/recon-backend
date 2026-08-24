@@ -204,6 +204,21 @@ async def create_rule(definition_id: UUID, payload: RuleCreate, service: Reconci
     )
 
 
+@router.delete(
+    "/reconciliations/{definition_id}/rules/{rule_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a rule from a definition's catalog",
+)
+async def delete_rule(
+    definition_id: UUID,
+    rule_id: UUID,
+    service: ReconciliationService = Depends(get_service),
+):
+    """Deletes a rule. Returns 409 Conflict if the rule is referenced by
+    existing match groups or payments."""
+    await service.delete_rule(str(definition_id), str(rule_id))
+
+
 # -- reconciliation_runs --------------------------------------------------------
 @router.post(
     "/reconciliations/{definition_id}/runs",
