@@ -255,7 +255,7 @@ def _settled_outcome(
                 inv["invoice_id"],
                 settle.cash_minor,
                 close_full=settle.close_full,
-                gap_role=settle.gap_role,
+                gl_role=settle.gap_role,
             )
         ],
         match_type=match_type,
@@ -282,20 +282,28 @@ async def invoice_number_match(
     self-sufficient evidence of ownership, so a hit there backfills the
     invoice's customer_id rather than leaving it permanently orphaned."""
     narration = bank_txn.get("narration") or ""
-    amount = payment["total_received_minor"]
+    net_cash = payment["total_received_minor"]
+    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+    gross_amount = net_cash + explicit_fee
     for inv in _open_invoices(ctx, customer_id):
-        matched = _matched_number(narration, inv)
-        if matched is not None:
-            return _settled_outcome(inv, amount, bank_txn, f"{matched!r} in narration")
-    for inv in ctx.unresolved_invoices:
-        matched = _matched_number(narration, inv)
-        if matched is not None:
-            await _promote_unresolved_invoice(ctx, inv, customer_id)
-            return _settled_outcome(
-                inv,
-                amount,
-                bank_txn,
-                f"{matched!r} in narration (customer resolved via this match)",
+        if extract.contains_substring(narration, inv["invoice_number"]):
+            applied_gross = min(gross_amount, inv["balance_due_minor"])
+            applied_net = min(net_cash, applied_gross)
+            applied_fee = applied_gross - applied_net
+            match_type = (
+                "EXACT" if applied_gross == inv["balance_due_minor"] else "PARTIAL"
+            )
+            return AllocationOutcome(
+                allocations=[
+                    InvoiceAllocation(
+                        inv["invoice_id"],
+                        cash_minor=applied_net,
+                        fee_gap_minor=applied_fee,
+                        close_full=(match_type == "EXACT"),
+                    )
+                ],
+                match_type=match_type,
+                reason=f"invoice_number {inv['invoice_number']!r} in narration",
             )
     return AllocationOutcome()
 
@@ -308,27 +316,34 @@ async def truncated_suffix_match(
     config: dict,
 ) -> AllocationOutcome:
     """2.2 - only a 4+ digit numeric block from the tail of the invoice
-    number appears in narration (e.g. "1046" for INV-2026-1046). Also
-    searches ctx.unresolved_invoices once this customer's own invoices come
-    up empty - see invoice_number_match's docstring for why that's safe here
-    specifically (unlike the balance-based rules below)."""
+    number appears in narration (e.g. "1046" for INV-2026-1046)."""
+    if bank_txn.get("dr_cr") == "DEBIT":
+        return AllocationOutcome()
     min_length = config.get("min_length", 4)
     narration = bank_txn.get("narration") or ""
     blocks = extract.extract_numeric_blocks(narration, min_length=min_length)
-    amount = payment["total_received_minor"]
+    net_cash = payment["total_received_minor"]
+    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+    gross_amount = net_cash + explicit_fee
     for inv in _open_invoices(ctx, customer_id):
         if any(inv["invoice_number"].endswith(block) for block in blocks):
-            return _settled_outcome(
-                inv, amount, bank_txn, "invoice number suffix in narration"
+            applied_gross = min(gross_amount, inv["balance_due_minor"])
+            applied_net = min(net_cash, applied_gross)
+            applied_fee = applied_gross - applied_net
+            match_type = (
+                "EXACT" if applied_gross == inv["balance_due_minor"] else "PARTIAL"
             )
-    for inv in ctx.unresolved_invoices:
-        if any(inv["invoice_number"].endswith(block) for block in blocks):
-            await _promote_unresolved_invoice(ctx, inv, customer_id)
-            return _settled_outcome(
-                inv,
-                amount,
-                bank_txn,
-                "invoice number suffix in narration (customer resolved via this match)",
+            return AllocationOutcome(
+                allocations=[
+                    InvoiceAllocation(
+                        inv["invoice_id"],
+                        cash_minor=applied_net,
+                        fee_gap_minor=applied_fee,
+                        close_full=(match_type == "EXACT"),
+                    )
+                ],
+                match_type=match_type,
+                reason=f"invoice number suffix in narration",
             )
     return AllocationOutcome()
 
@@ -369,7 +384,7 @@ async def exact_balance_match(
                     inv["invoice_id"],
                     settle.cash_minor,
                     close_full=settle.close_full,
-                    gap_role=settle.gap_role,
+                    gl_role=settle.gap_role,
                 )
             ],
             match_type=match_type,
@@ -393,7 +408,7 @@ async def exact_balance_match(
                     inv["invoice_id"],
                     settle.cash_minor,
                     close_full=settle.close_full,
-                    gap_role=settle.gap_role,
+                    gl_role=settle.gap_role,
                 )
             ],
             match_type="TOLERANCE",
@@ -456,7 +471,7 @@ async def subset_sum_fifo(
                             inv["invoice_id"],
                             contrib,
                             close_full=True,
-                            gap_role=gap_role,
+                            gl_role=gap_role,
                         )
                         for inv, (contrib, gap_role) in zip(combo, picks)
                     ]
@@ -483,16 +498,186 @@ async def partial_pay(
     all, so apply the payment to the customer's oldest open invoice (by due
     date). Always leaves the invoice open (or the engine raises Short-Pay
     for the remainder) - this rule doesn't invent a full match."""
+    if bank_txn.get("dr_cr") == "DEBIT":
+        return AllocationOutcome()
     invoices = _open_invoices(ctx, customer_id)
     if not invoices:
         return AllocationOutcome()
     inv = invoices[0]  # already sorted oldest-due-first
-    cash = min(payment["total_received_minor"], inv["balance_due_minor"])
+    net_cash = payment["total_received_minor"]
+    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+    gross_amount = net_cash + explicit_fee
+
+    applied_gross = min(gross_amount, inv["balance_due_minor"])
+    applied_net = min(net_cash, applied_gross)
+    applied_fee = applied_gross - applied_net
+    match_type = "EXACT" if applied_gross == inv["balance_due_minor"] else "PARTIAL"
     return AllocationOutcome(
-        allocations=[InvoiceAllocation(inv["invoice_id"], cash)],
-        match_type="PARTIAL",
+        allocations=[
+            InvoiceAllocation(
+                inv["invoice_id"],
+                cash_minor=applied_net,
+                fee_gap_minor=applied_fee,
+                close_full=(match_type == "EXACT"),
+            )
+        ],
+        match_type=match_type,
         reason="universal partial-payment fallback (oldest open invoice)",
     )
+
+
+async def deduction_settlement_match(
+    payment: dict,
+    bank_txn: dict,
+    customer_id: str | None,
+    ctx: AllocationContext,
+    config: dict,
+) -> AllocationOutcome:
+    """Special pre-pass rule for DEBIT bank statement rows (Deductions).
+    Handles two fee scenarios:
+    1. Standalone Fees: If customer is unidentified, checks if narration contains
+       fee-related magic words. If so, books directly to Bank Fees GL.
+    2. Transactional Fees: If matched to a customer, checks if amount (+ any explicit fee)
+       exactly settles an open partial invoice.
+    """
+    if bank_txn.get("dr_cr") != "DEBIT":
+        return AllocationOutcome()
+
+    amount = abs(bank_txn["amount_minor"])
+    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+    gross_amount = amount + explicit_fee
+    gl_role = config.get("gl_role", "BANK_FEES")
+
+    # CASE 1: Standalone Fees (No Customer Identified)
+    if not customer_id:
+        magic_words = config.get(
+            "magic_words", ["FEE", "CHG", "SERV", "SVC", "WIRE", "MONTHLY", "ANALYSIS"]
+        )
+        narration = str(bank_txn.get("narration") or "").upper()
+
+        if any(w.upper() in narration for w in magic_words):
+            return AllocationOutcome(
+                allocations=[
+                    InvoiceAllocation(
+                        invoice_id=None,
+                        cash_minor=0,
+                        fee_gap_minor=gross_amount,
+                        close_full=True,
+                        gl_role=gl_role,
+                    )
+                ],
+                match_type="EXACT",
+                reason="Standalone deduction matched bank fee magic words",
+            )
+        return AllocationOutcome()
+
+    # CASE 2: Deduction Payment to Open Partial Match
+    ties = [
+        inv
+        for inv in _open_invoices(ctx, customer_id)
+        if inv["balance_due_minor"] == gross_amount
+    ]
+
+    if len(ties) == 1:
+        inv = ties[0]
+        return AllocationOutcome(
+            allocations=[
+                InvoiceAllocation(
+                    inv["invoice_id"],
+                    cash_minor=0,
+                    fee_gap_minor=gross_amount,
+                    close_full=True,
+                    gl_role=gl_role,
+                )
+            ],
+            match_type="EXACT",
+            reason="Deduction perfectly settled invoice balance",
+        )
+    if len(ties) > 1:
+        return AllocationOutcome(
+            ambiguous=True,
+            ambiguous_invoice_ids=[inv["invoice_id"] for inv in ties],
+            reason=f"{len(ties)} invoices tie on exact deduction balance {gross_amount}",
+        )
+
+    return AllocationOutcome()
+
+
+async def deduction_settlement_match(
+    payment: dict,
+    bank_txn: dict,
+    customer_id: str | None,
+    ctx: AllocationContext,
+    config: dict,
+) -> AllocationOutcome:
+    """Special pre-pass rule for DEBIT bank statement rows (Deductions).
+    Handles two fee scenarios:
+    1. Standalone Fees: If customer is unidentified, checks if narration contains
+       fee-related magic words. If so, books directly to Bank Fees GL.
+    2. Transactional Fees: If matched to a customer, checks if amount (+ any explicit fee)
+       exactly settles an open partial invoice.
+    """
+    if bank_txn.get("dr_cr") != "DEBIT":
+        return AllocationOutcome()
+
+    amount = abs(bank_txn["amount_minor"])
+    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
+    gross_amount = amount + explicit_fee
+    gl_role = config.get("gl_role", "BANK_FEES")
+
+    # CASE 1: Standalone Fees (No Customer Identified)
+    if not customer_id:
+        magic_words = config.get(
+            "magic_words", ["FEE", "CHG", "SERV", "SVC", "WIRE", "MONTHLY", "ANALYSIS"]
+        )
+        narration = str(bank_txn.get("narration") or "").upper()
+
+        if any(w.upper() in narration for w in magic_words):
+            return AllocationOutcome(
+                allocations=[
+                    InvoiceAllocation(
+                        invoice_id=None,
+                        cash_minor=0,
+                        fee_gap_minor=gross_amount,
+                        close_full=True,
+                        gl_role=gl_role,
+                    )
+                ],
+                match_type="EXACT",
+                reason="Standalone deduction matched bank fee magic words",
+            )
+        return AllocationOutcome()
+
+    # CASE 2: Deduction Payment to Open Partial Match
+    ties = [
+        inv
+        for inv in _open_invoices(ctx, customer_id)
+        if inv["balance_due_minor"] == gross_amount
+    ]
+
+    if len(ties) == 1:
+        inv = ties[0]
+        return AllocationOutcome(
+            allocations=[
+                InvoiceAllocation(
+                    inv["invoice_id"],
+                    cash_minor=0,
+                    fee_gap_minor=gross_amount,
+                    close_full=True,
+                    gl_role=gl_role,
+                )
+            ],
+            match_type="EXACT",
+            reason="Deduction perfectly settled invoice balance",
+        )
+    if len(ties) > 1:
+        return AllocationOutcome(
+            ambiguous=True,
+            ambiguous_invoice_ids=[inv["invoice_id"] for inv in ties],
+            reason=f"{len(ties)} invoices tie on exact deduction balance {gross_amount}",
+        )
+
+    return AllocationOutcome()
 
 
 ALLOCATION_RULES: dict[str, RuleFn] = {
@@ -501,4 +686,5 @@ ALLOCATION_RULES: dict[str, RuleFn] = {
     "exact-amount": exact_balance_match,
     "subset-sum": subset_sum_fifo,
     "partial-payment": partial_pay,
+    "deduction-settlement": deduction_settlement_match,
 }

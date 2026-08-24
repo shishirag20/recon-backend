@@ -6,6 +6,7 @@ config: dict) -> ...` registered by `kind` in its module's `*_RULES` dict and
 evaluated in `(phase, priority)` order (first-match-wins within a phase) -
 see app/reconciliation/engine.py for the loop that drives this.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ class RuleContext:
     across every bank_txn - this entity's customer master is small enough
     (tens to low hundreds of rows) that loading it all upfront and matching
     in Python is simpler and faster than a query per rule per row."""
+
     entity_id: str
     dao: ReconciliationDAO
     conn: asyncpg.Connection
@@ -44,6 +46,7 @@ class IdentificationResult:
     rule. `reject=True` (dup-utr only, Phase 0) means stop evaluating this
     bank_txn entirely - it's a duplicate, not a miss - rather than falling
     through to the next rule."""
+
     customer_id: str | None = None
     reject: bool = False
     reason: str = ""
@@ -61,6 +64,7 @@ class AllocationContext:
     once fully closed) - later payments in the same run see the updated
     state, matching the real DB writes the engine makes alongside it. Keyed
     by `str(customer_id)`."""
+
     entity_id: str
     dao: ReconciliationDAO
     conn: asyncpg.Connection
@@ -91,10 +95,12 @@ class InvoiceAllocation:
     TDS-adjusted one, each needing its own destination. The gap itself isn't
     posted anywhere yet in M2 - that's gl_posting.py's job in M3; this just
     decides the invoice is *done* and where its gap belongs."""
+
     invoice_id: str
     cash_minor: int
     close_full: bool = False
-    gap_role: str | None = None
+    fee_gap_minor: int = 0
+    gl_role: str | None = None
 
 
 @dataclass
@@ -104,6 +110,7 @@ class AllocationOutcome:
     invoice for *this same customer* (e.g. two identical-balance invoices)
     and deliberately didn't pick one - `ambiguous_invoice_ids` carries what
     it refused to choose between, for the exception's `detail`."""
+
     allocations: list[InvoiceAllocation] = field(default_factory=list)
     match_type: str = "EXACT"
     reason: str = ""

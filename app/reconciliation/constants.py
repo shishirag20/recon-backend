@@ -9,6 +9,7 @@ reconciliation_rules. DEFAULT_AR_RULE_KINDS below is just the set this
 module's own rule implementations (app/reconciliation/rules/*) recognize
 today; a future rule kind ships without a schema change.
 """
+
 from __future__ import annotations
 
 # -- Router / errors --------------------------------------------------------
@@ -32,12 +33,22 @@ class ReconciliationErrors:
         "config.source (one of SOURCE_KINDS), and config.source_field"
     )
     DUPLICATE_PRIORITY = "A rule already exists at this phase+priority"
-    NOT_A_NO_PAYMENT_EXCEPTION = "Only a NO_PAYMENT exception (with an invoice_id) can be resolved this way"
+    NOT_A_NO_PAYMENT_EXCEPTION = (
+        "Only a NO_PAYMENT exception (with an invoice_id) can be resolved this way"
+    )
     NO_PAYMENT_IDS_SELECTED = "payment_ids must include at least one payment"
-    INVOICE_NOT_OPEN = "This invoice has no remaining balance to apply a payment against"
-    PAYMENT_NOT_FOUND_OR_NOT_OPEN = "One or more payment_ids were not found or have no unapplied balance left"
-    NOT_A_SUSPENSE_EXCEPTION = "Only a SUSPENSE exception (with a bank_txn_id) can be resolved this way"
-    SUSPENSE_PAYMENT_NOT_FOUND = "No payment found for this exception's bank transaction"
+    INVOICE_NOT_OPEN = (
+        "This invoice has no remaining balance to apply a payment against"
+    )
+    PAYMENT_NOT_FOUND_OR_NOT_OPEN = (
+        "One or more payment_ids were not found or have no unapplied balance left"
+    )
+    NOT_A_SUSPENSE_EXCEPTION = (
+        "Only a SUSPENSE exception (with a bank_txn_id) can be resolved this way"
+    )
+    SUSPENSE_PAYMENT_NOT_FOUND = (
+        "No payment found for this exception's bank transaction"
+    )
     CUSTOMER_NOT_FOUND = "Customer not found"
     INVOICE_NOT_FOUND_FOR_CUSTOMER = "One or more invoice_ids were not found, not open, or don't belong to customer_id"
 
@@ -49,21 +60,30 @@ RECON_TYPES = ("AR", "AP", "BANK")  # only AR has an engine implementation today
 # Matches the phase vocabulary the original domain-schema plan fixed for this
 # column - see migrations/0012_domain_reconciliation_definitions.sql.
 PHASE_INTAKE_VALIDATION = "INTAKE_VALIDATION"
-PHASE_CUSTOMER_LOCK = "CUSTOMER_LOCK"        # Phase 1a in the proposal doc
-PHASE_CANDIDATE_POOL = "CANDIDATE_POOL"      # Phase 1b
+PHASE_CUSTOMER_LOCK = "CUSTOMER_LOCK"  # Phase 1a in the proposal doc
+PHASE_CANDIDATE_POOL = "CANDIDATE_POOL"  # Phase 1b
+PHASE_NARRATION_CROSS_CHECK = (
+    "NARRATION_CROSS_CHECK"  # Phase 1c - post-identification invoice narration audit
+)
 # Runs after both 1a and 1b have had their chance for a row, reconciled
 # against whichever (if either) actually identified a customer - not one of
 # the six CUSTOMER_LOCK rules, so it gets its own phase rather than
 # competing in that first-match-wins loop. See engine.py::run_phase_1.
 PHASE_NARRATION_CHECK = "NARRATION_CHECK"
-PHASE_ALLOCATION = "ALLOCATION"              # Phase 2
+PHASE_ALLOCATION = "ALLOCATION"  # Phase 2
 PHASE_SHORT_PAY = "SHORT_PAY"
 PHASE_UNAPPLIED = "UNAPPLIED"
 PHASE_GL_CHECK = "GL_CHECK"
 
 RECON_PHASES = (
-    PHASE_INTAKE_VALIDATION, PHASE_CUSTOMER_LOCK, PHASE_CANDIDATE_POOL,
-    PHASE_NARRATION_CHECK, PHASE_ALLOCATION, PHASE_SHORT_PAY, PHASE_UNAPPLIED, PHASE_GL_CHECK,
+    PHASE_INTAKE_VALIDATION,
+    PHASE_CUSTOMER_LOCK,
+    PHASE_CANDIDATE_POOL,
+    PHASE_NARRATION_CROSS_CHECK,
+    PHASE_ALLOCATION,
+    PHASE_SHORT_PAY,
+    PHASE_UNAPPLIED,
+    PHASE_GL_CHECK,
 )
 
 # -- reconciliation_runs.status lifecycle ------------------------------------
@@ -76,25 +96,61 @@ RUN_STATUS_CLOSED = "CLOSED"
 RUN_STATUS_FAILED = "FAILED"
 
 RUN_STATUSES = (
-    RUN_STATUS_DRAFT, RUN_STATUS_QUEUED, RUN_STATUS_RUNNING, RUN_STATUS_COMPUTED,
-    RUN_STATUS_APPROVED, RUN_STATUS_CLOSED, RUN_STATUS_FAILED,
+    RUN_STATUS_DRAFT,
+    RUN_STATUS_QUEUED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_COMPUTED,
+    RUN_STATUS_APPROVED,
+    RUN_STATUS_CLOSED,
+    RUN_STATUS_FAILED,
 )
 
 # -- match_groups -------------------------------------------------------------
-MATCH_TYPES = ("EXACT", "TOLERANCE", "PARTIAL", "SUBSET_SUM", "MANY_TO_ONE", "ONE_TO_MANY", "MANUAL")
+MATCH_TYPES = (
+    "EXACT",
+    "TOLERANCE",
+    "PARTIAL",
+    "SUBSET_SUM",
+    "MANY_TO_ONE",
+    "ONE_TO_MANY",
+    "MANUAL",
+)
 MATCH_STATUSES = ("AUTO_MATCHED", "SUGGESTED", "CONFIRMED", "REJECTED")
 
 # -- reconciliation_exceptions -------------------------------------------------
 EXCEPTION_TYPES = (
-    "SHORT_PAY", "OVERPAYMENT", "UNAPPLIED_CASH", "TIMING_DIFFERENCE", "GL_VARIANCE",
-    "DUPLICATE", "MULTIPLE_INVOICE_MATCH", "DOUBLE_COLLISION", "SUSPENSE", "BANK_CHARGE",
-    "GATEWAY_VARIANCE", "NO_PAYMENT", "CUSTOMER_INVOICE_MISMATCH",
+    "SHORT_PAY",
+    "OVERPAYMENT",
+    "UNAPPLIED_CASH",
+    "TIMING_DIFFERENCE",
+    "GL_VARIANCE",
+    "DUPLICATE",
+    "MULTIPLE_INVOICE_MATCH",
+    "DOUBLE_COLLISION",
+    "SUSPENSE",
+    "BANK_CHARGE",
+    "GATEWAY_VARIANCE",
+    "NO_PAYMENT",
+    "CUSTOMER_INVOICE_MISMATCH",
 )
 EXCEPTION_STATUSES = (
-    "OPEN", "INVESTIGATING", "RESOLVED", "AUTO_RESOLVED", "DEFERRED",
-    "WRITTEN_OFF", "ADJUSTED", "CARRIED_FORWARD",
+    "OPEN",
+    "INVESTIGATING",
+    "RESOLVED",
+    "AUTO_RESOLVED",
+    "DEFERRED",
+    "WRITTEN_OFF",
+    "ADJUSTED",
+    "CARRIED_FORWARD",
 )
-EXCEPTION_RESOLUTION_OUTCOMES = ("WRITEOFF", "KEEPOPEN", "DISPUTE", "JOURNAL", "ON_ACCOUNT", "MANUAL_MATCH")
+EXCEPTION_RESOLUTION_OUTCOMES = (
+    "WRITEOFF",
+    "KEEPOPEN",
+    "DISPUTE",
+    "JOURNAL",
+    "ON_ACCOUNT",
+    "MANUAL_MATCH",
+)
 
 # -- gl_account_roles.role_code -----------------------------------------------
 # The fixed set of semantic accounts gl_posting.py resolves per entity - see
@@ -109,8 +165,14 @@ GL_ROLE_SUSPENSE = "SUSPENSE"
 GL_ROLE_FX_GAIN_LOSS = "FX_GAIN_LOSS"
 
 GL_ROLE_CODES = (
-    GL_ROLE_AR_CONTROL, GL_ROLE_CASH_CONTROL, GL_ROLE_BANK_CHARGES, GL_ROLE_TDS_RECEIVABLE,
-    GL_ROLE_WRITE_OFF, GL_ROLE_ON_ACCOUNT_ADVANCE, GL_ROLE_SUSPENSE, GL_ROLE_FX_GAIN_LOSS,
+    GL_ROLE_AR_CONTROL,
+    GL_ROLE_CASH_CONTROL,
+    GL_ROLE_BANK_CHARGES,
+    GL_ROLE_TDS_RECEIVABLE,
+    GL_ROLE_WRITE_OFF,
+    GL_ROLE_ON_ACCOUNT_ADVANCE,
+    GL_ROLE_SUSPENSE,
+    GL_ROLE_FX_GAIN_LOSS,
 )
 
 # Which GL role absorbs the gap when a settlement closes an invoice for less
@@ -127,7 +189,6 @@ GL_ROLE_CODES = (
 # gl_posting.py (M3, to actually post it).
 GAP_ROLE_BY_RULE_KIND: dict[str, str] = {
     "tds-match": GL_ROLE_TDS_RECEIVABLE,
-    "bank-fee": GL_ROLE_BANK_CHARGES,
     "write-off": GL_ROLE_WRITE_OFF,
 }
 
@@ -137,14 +198,24 @@ GAP_ROLE_BY_RULE_KIND: dict[str, str] = {
 # repoint a role at its actual chart-of-accounts code without any code change,
 # since gl_posting.py only ever looks up by role_code.
 GL_ROLE_DEFAULTS: dict[str, tuple[str, str, str, str]] = {
-    GL_ROLE_AR_CONTROL:         ("1200", "Accounts Receivable Control", "Balance Sheet", "DEBIT"),
-    GL_ROLE_CASH_CONTROL:       ("1100", "Cash / Bank Clearing",        "Balance Sheet", "DEBIT"),
-    GL_ROLE_BANK_CHARGES:       ("5100", "Bank Charges",                "Income Statement", "DEBIT"),
-    GL_ROLE_TDS_RECEIVABLE:     ("1250", "TDS Receivable",              "Balance Sheet", "DEBIT"),
-    GL_ROLE_WRITE_OFF:          ("5200", "Write-Off Expense",           "Income Statement", "DEBIT"),
-    GL_ROLE_ON_ACCOUNT_ADVANCE: ("2400", "Customer Advances (On-Account)", "Balance Sheet", "CREDIT"),
-    GL_ROLE_SUSPENSE:           ("2900", "Suspense",                    "Balance Sheet", "CREDIT"),
-    GL_ROLE_FX_GAIN_LOSS:       ("5300", "FX Gain / Loss",              "Income Statement", "DEBIT"),
+    GL_ROLE_AR_CONTROL: (
+        "1200",
+        "Accounts Receivable Control",
+        "Balance Sheet",
+        "DEBIT",
+    ),
+    GL_ROLE_CASH_CONTROL: ("1100", "Cash / Bank Clearing", "Balance Sheet", "DEBIT"),
+    GL_ROLE_BANK_CHARGES: ("5100", "Bank Charges", "Income Statement", "DEBIT"),
+    GL_ROLE_TDS_RECEIVABLE: ("1250", "TDS Receivable", "Balance Sheet", "DEBIT"),
+    GL_ROLE_WRITE_OFF: ("5200", "Write-Off Expense", "Income Statement", "DEBIT"),
+    GL_ROLE_ON_ACCOUNT_ADVANCE: (
+        "2400",
+        "Customer Advances (On-Account)",
+        "Balance Sheet",
+        "CREDIT",
+    ),
+    GL_ROLE_SUSPENSE: ("2900", "Suspense", "Balance Sheet", "CREDIT"),
+    GL_ROLE_FX_GAIN_LOSS: ("5300", "FX Gain / Loss", "Income Statement", "DEBIT"),
 }
 
 # -- Default AR rule catalog --------------------------------------------------
@@ -177,32 +248,99 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # finished, since nothing consumes their configurability today.
     #
     # Phase 1a - CUSTOMER_LOCK (lock the paying customer; first match wins)
-    (PHASE_CUSTOMER_LOCK, "expected-utr", "Pre-Advised UTR Match", 1, 98,
-     {"source": "expected_remittances", "match_field": "utr_number"}),
-    (PHASE_CUSTOMER_LOCK, "account-ifsc", "Payer Account & IFSC Match", 2, 97,
-     {"source": "customer_bank_accounts", "match_fields": ["bank_account_no", "ifsc_code"]}),
-    (PHASE_CUSTOMER_LOCK, "upi", "UPI Handle Match", 3, 95,
-     {"source": "customers", "match_field": "vpa_handle", "extract": "vpa"}),
-    (PHASE_CUSTOMER_LOCK, "customer-code", "Customer Code in Narration Match", 4, 90,
-     {"source": "customer_reference_codes", "extract": "narration_substring"}),
-    (PHASE_CUSTOMER_LOCK, "gstin-pan", "Tax ID & PAN Match", 5, 92,
-     {"source": "customers", "extract": ["gstin", "pan"]}),
-    (PHASE_CUSTOMER_LOCK, "fuzzy-name", "Company Name Match", 6, 85,
-     {"source": "customers", "match_field": "company_name", "min_similarity": 0.85}),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "expected-utr",
+        "Pre-Advised UTR Match",
+        1,
+        98,
+        {"source": "expected_remittances", "match_field": "utr_number"},
+    ),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "account-ifsc",
+        "Payer Account & IFSC Match",
+        2,
+        97,
+        {
+            "source": "customer_bank_accounts",
+            "match_fields": ["bank_account_no", "ifsc_code"],
+        },
+    ),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "upi",
+        "UPI Handle Match",
+        3,
+        95,
+        {"source": "customers", "match_field": "vpa_handle", "extract": "vpa"},
+    ),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "customer-code",
+        "Customer Code in Narration Match",
+        4,
+        90,
+        {"source": "customer_reference_codes", "extract": "narration_substring"},
+    ),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "gstin-pan",
+        "Tax ID & PAN Match",
+        5,
+        92,
+        {"source": "customers", "extract": ["gstin", "pan"]},
+    ),
+    (
+        PHASE_CUSTOMER_LOCK,
+        "fuzzy-name",
+        "Company Name Match",
+        6,
+        85,
+        {"source": "customers", "match_field": "company_name", "min_similarity": 0.85},
+    ),
     # Last resort: no UTR/account/VPA/customer-code/GSTIN/PAN/fuzzy-name
     # match at all - e.g. a remittance with no rich payer data on the bank
     # side, only a narration. Only fires if the referenced invoice already
     # has its own customer_id (from ERP ingestion) - see
     # app/reconciliation/rules/identification.py::document_number_match.
-    (PHASE_CUSTOMER_LOCK, "document-number-narration", "Document Number in Narration Match", 7, 85,
-     {"source": "invoices", "match_field": "invoice_number", "location": "narration"}),
-
+    (
+        PHASE_CUSTOMER_LOCK,
+        "document-number-narration",
+        "Document Number in Narration Match",
+        7,
+        85,
+        {
+            "source": "invoices",
+            "match_field": "invoice_number",
+            "location": "narration",
+        },
+    ),
     # Phase 1b - CANDIDATE_POOL (only reached if Phase 1a locked nothing)
-    (PHASE_CANDIDATE_POOL, "account-suffix", "Masked Account Suffix Match", 1, 60,
-     {"source": "customer_bank_accounts", "match_field": "bank_account_no", "mode": "suffix"}),
-    (PHASE_CANDIDATE_POOL, "narration-tokens", "Token-Based Narration Match", 2, 50,
-     {"source": "customers", "match_field": "company_name", "mode": "token_substring"}),
-
+    (
+        PHASE_CANDIDATE_POOL,
+        "account-suffix",
+        "Masked Account Suffix Match",
+        1,
+        60,
+        {
+            "source": "customer_bank_accounts",
+            "match_field": "bank_account_no",
+            "mode": "suffix",
+        },
+    ),
+    (
+        PHASE_CANDIDATE_POOL,
+        "narration-tokens",
+        "Token-Based Narration Match",
+        2,
+        50,
+        {
+            "source": "customers",
+            "match_field": "company_name",
+            "mode": "token_substring",
+        },
+    ),
     # Phase 1c - NARRATION_CHECK. Runs after both CUSTOMER_LOCK and
     # CANDIDATE_POOL have had their chance for a row - not a normal
     # first-match-wins rule itself, and never locks a customer on its own.
@@ -215,9 +353,31 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # of letting the lock stand unquestioned; and if 1a/1b found nobody at
     # all, it seeds a single-candidate pool as a last-resort suggestion. See
     # engine.py::run_phase_1.
-    (PHASE_NARRATION_CHECK, "invoice-number-in-narration", "Invoice Number in Narration", 1, 100,
-     {"description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?"}),
-
+    (
+        PHASE_NARRATION_CHECK,
+        "invoice-number-in-narration",
+        "Invoice Number in Narration",
+        1,
+        100,
+        {
+            "description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?"
+        },
+    ),
+    # Phase 1c - NARRATION_CROSS_CHECK (runs after Phase 1a and 1b for every row)
+    # Cross-checks the narration against real invoices independently of the customer
+    # already identified. A disagreement flags for review rather than auto-committing.
+    (
+        PHASE_NARRATION_CROSS_CHECK,
+        "narration-invoice-check",
+        "Invoice Number in Narration",
+        1,
+        100,
+        {
+            "match_field": "invoice_number",
+            "location": "narration",
+            "description": "Independently checks whether the transaction narration references a real invoice belonging to a different customer than the one Customer Identification / Candidate Pool already identified. Runs after both, for every row — a disagreement is flagged for review instead of letting the identified customer stand unquestioned.",
+        },
+    ),
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool).
     # tds-match/bank-fee/write-off/overpayment used to be standalone rules
     # here (priorities 4/6/7/8) - removed. Every rule below now runs the same
@@ -227,17 +387,81 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # invoice-suffix, exact-amount, and subset-sum alike, not as their own
     # later-priority fallback pass (2026-08 note - see engine.py's
     # `_commit_direct_match` and allocation.py's rule docstrings).
-    (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
-     {"match_field": "invoice_number", "location": "narration"}),
-    (PHASE_ALLOCATION, "invoice-suffix", "Truncated Invoice Number Match", 2, 90,
-     {"match_field": "invoice_number", "mode": "suffix", "min_length": 4}),
-    (PHASE_ALLOCATION, "exact-amount", "Exact Amount Match", 3, 95,
-     {"amount": {"mode": "exact", "field": "balance_due_minor"}, "tie_break": "ambiguous_exception"}),
-    (PHASE_ALLOCATION, "subset-sum", "Combined Invoice Match (Many-to-Many)", 4, 85,
-     {"amount": {"mode": "subset_sum"}, "order_by": "due_date", "max_invoices": 10}),
-    (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 5, 100,
-     {"mode": "partial", "allow_short_pay": True}),
+    (
+        PHASE_ALLOCATION,
+        "exact-invoice-num",
+        "Exact Invoice Number Match",
+        1,
+        98,
+        {
+            "match_field": "invoice_number",
+            "location": "narration",
+            "description": "Automatically matches a payment to an invoice by finding that invoice's exact number written in the bank transaction narration.",
+        },
+    ),
+    (
+        PHASE_ALLOCATION,
+        "invoice-suffix",
+        "Truncated Invoice Number Match",
+        2,
+        90,
+        {
+            "match_field": "invoice_number",
+            "mode": "suffix",
+            "min_length": 4,
+            "description": "Automatically matches a payment to an invoice by finding a shortened or masked numeric suffix (e.g. '1046' from 'INV-XXXX1046') in the bank narration.",
+        },
+    ),
+    (
+        PHASE_ALLOCATION,
+        "exact-amount",
+        "Exact Amount Match",
+        3,
+        95,
+        {
+            "amount": {"mode": "exact", "field": "balance_due_minor"},
+            "tie_break": "ambiguous_exception",
+            "description": "Automatically matches a payment to an open invoice when the payment amount exactly equals the invoice's outstanding balance.",
+        },
+    ),
 
+    (
+        PHASE_ALLOCATION,
+        "subset-sum",
+        "Combined Invoice Match (Many-to-Many)",
+        5,
+        85,
+        {
+            "amount": {"mode": "subset_sum"},
+            "order_by": "due_date",
+            "max_invoices": 10,
+            "description": "Automatically matches a single payment against a combination of several open invoices whose amounts add up to the payment received.",
+        },
+    ),
+
+    (
+        PHASE_ALLOCATION,
+        "partial-payment",
+        "Partial Payment Allocation",
+        9,
+        100,
+        {
+            "mode": "partial",
+            "allow_short_pay": True,
+            "description": "Universal fallback when no earlier rule matches: applies incoming cash to the customer's oldest open invoice to reduce its balance, leaving the residual shortfall open.",
+        },
+    ),
+    (
+        PHASE_ALLOCATION,
+        "deduction-settlement",
+        "Deduction Payment to Open Partial Match",
+        10,
+        100,
+        {
+            "magic_words": ["FEE", "CHG", "SERV", "SVC", "WIRE", "MONTHLY", "ANALYSIS"],
+            "description": "Handles standalone fees (identifying fees by keywords like FEE, CHG, WIRE) and transactional fees (deductions that match an open partial invoice balance).",
+        },
+    ),
     # Phase 3.0/3.1/3.2 - SHORT_PAY / UNAPPLIED / GL_CHECK: one `threshold`
     # rule per phase, actually read by the engine (engine.py::run_phase_2 for
     # the first two, gl_posting.py::post_run for the third) via
@@ -245,12 +469,30 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # guardrail rows above. Disabling or deleting a row here reverts that
     # phase's check to zero tolerance (today's original strict behavior),
     # not to "no check at all".
-    (PHASE_SHORT_PAY, "threshold", "Shortfall Tolerance", 1, 100,
-     {"amount": {"mode": "abs", "value_minor": 100}}),
-    (PHASE_UNAPPLIED, "threshold", "Unapplied Cash Threshold", 1, 100,
-     {"amount": {"mode": "abs", "value_minor": 0}}),
-    (PHASE_GL_CHECK, "threshold", "GL Control Variance Tolerance", 1, 100,
-     {"amount": {"mode": "abs", "value_minor": 0}}),
+    (
+        PHASE_SHORT_PAY,
+        "threshold",
+        "Shortfall Tolerance",
+        1,
+        100,
+        {"amount": {"mode": "abs", "value_minor": 100}},
+    ),
+    (
+        PHASE_UNAPPLIED,
+        "threshold",
+        "Unapplied Cash Threshold",
+        1,
+        100,
+        {"amount": {"mode": "abs", "value_minor": 0}},
+    ),
+    (
+        PHASE_GL_CHECK,
+        "threshold",
+        "GL Control Variance Tolerance",
+        1,
+        100,
+        {"amount": {"mode": "abs", "value_minor": 0}},
+    ),
 )
 
 
@@ -262,16 +504,28 @@ RULE_DATA_CATEGORIES = [
         "stream": "BANK",
         "description": "Bank statement transactions feed",
         "fields": [
-            {"key": "bank_reference", "label": "Bank Reference (UTR)", "type": "string"},
+            {
+                "key": "bank_reference",
+                "label": "Bank Reference (UTR)",
+                "type": "string",
+            },
             {"key": "narration", "label": "Transaction Narration", "type": "string"},
             {"key": "amount_minor", "label": "Transaction Amount", "type": "number"},
             {"key": "payer_name", "label": "Payer Name", "type": "string"},
-            {"key": "payer_account_no", "label": "Payer Account Number", "type": "string"},
+            {
+                "key": "payer_account_no",
+                "label": "Payer Account Number",
+                "type": "string",
+            },
             {"key": "payer_ifsc", "label": "Payer IFSC Code", "type": "string"},
             {"key": "bank_txn_id", "label": "Bank Transaction ID", "type": "string"},
             {"key": "post_date", "label": "Posting Date", "type": "date"},
             {"key": "value_date", "label": "Value Date", "type": "date"},
-            {"key": "payer_account_no, payer_ifsc", "label": "Payer Account & IFSC", "type": "string"},
+            {
+                "key": "payer_account_no, payer_ifsc",
+                "label": "Payer Account & IFSC",
+                "type": "string",
+            },
         ],
     },
     {
@@ -288,7 +542,11 @@ RULE_DATA_CATEGORIES = [
             {"key": "vpa_handle", "label": "UPI VPA Handle", "type": "string"},
             {"key": "gstin", "label": "GSTIN Tax ID", "type": "string"},
             {"key": "pan", "label": "PAN Number", "type": "string"},
-            {"key": "account_number, ifsc_code", "label": "Bank Account & IFSC", "type": "string"},
+            {
+                "key": "account_number, ifsc_code",
+                "label": "Bank Account & IFSC",
+                "type": "string",
+            },
         ],
     },
     {
@@ -298,11 +556,19 @@ RULE_DATA_CATEGORIES = [
         "description": "Pre-advised customer payment notices",
         "fields": [
             {"key": "utr_number", "label": "Expected UTR Number", "type": "string"},
-            {"key": "expected_amount_minor", "label": "Expected Remittance Amount", "type": "number"},
+            {
+                "key": "expected_amount_minor",
+                "label": "Expected Remittance Amount",
+                "type": "number",
+            },
             {"key": "customer_id", "label": "Customer ID", "type": "string"},
             {"key": "status", "label": "Remittance Status", "type": "string"},
             {"key": "reconciled", "label": "Reconciled Status", "type": "boolean"},
-            {"key": "expected_date", "label": "Expected Settlement Date", "type": "date"},
+            {
+                "key": "expected_date",
+                "label": "Expected Settlement Date",
+                "type": "date",
+            },
         ],
     },
     {
@@ -312,9 +578,21 @@ RULE_DATA_CATEGORIES = [
         "description": "Customer open sub-ledger and invoices",
         "fields": [
             {"key": "invoice_number", "label": "Invoice Number", "type": "string"},
-            {"key": "total_amount_minor", "label": "Invoice Total Amount", "type": "number"},
-            {"key": "balance_due_minor", "label": "Balance Due Amount", "type": "number"},
-            {"key": "allowed_tds_minor", "label": "Allowed TDS Deduction", "type": "number"},
+            {
+                "key": "total_amount_minor",
+                "label": "Invoice Total Amount",
+                "type": "number",
+            },
+            {
+                "key": "balance_due_minor",
+                "label": "Balance Due Amount",
+                "type": "number",
+            },
+            {
+                "key": "allowed_tds_minor",
+                "label": "Allowed TDS Deduction",
+                "type": "number",
+            },
             {"key": "customer_id", "label": "Customer ID", "type": "string"},
             {"key": "status", "label": "Invoice Status", "type": "string"},
             {"key": "due_date", "label": "Invoice Due Date", "type": "date"},
@@ -326,7 +604,11 @@ RULE_DATA_CATEGORIES = [
         "stream": "LEDGER",
         "description": "GL control accounts and trial balance figures",
         "fields": [
-            {"key": "control_account", "label": "Control Account Code", "type": "string"},
+            {
+                "key": "control_account",
+                "label": "Control Account Code",
+                "type": "string",
+            },
             {"key": "balance", "label": "Account Balance", "type": "number"},
             {"key": "variance", "label": "GL Variance Amount", "type": "number"},
         ],

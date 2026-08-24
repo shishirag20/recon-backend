@@ -99,6 +99,7 @@ async def post_run(
                 lines.append(_line(roles[GL_ROLE_ON_ACCOUNT_ADVANCE], "CREDIT", currency, rec["unapplied_minor"], business_partner_id=rec["customer_id"]))
             else:
                 lines.append(_line(roles[GL_ROLE_SUSPENSE], "CREDIT", currency, rec["unapplied_minor"]))
+        lines = [line for line in lines if line["amount_minor"] > 0]
         if not lines:
             continue  # nothing moved for this payment - never post an empty/unbalanced journal
         journal_id = await dao.insert_journal(

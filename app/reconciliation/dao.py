@@ -335,9 +335,9 @@ class ReconciliationDAO:
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
             "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
-            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor "
+            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, dr_cr "
             "FROM bank_statements "
-            "WHERE entity_id = $1 AND recon_status = 'PENDING' AND dr_cr = 'CREDIT' AND is_bank_charge = false "
+            "WHERE entity_id = $1 AND recon_status = 'PENDING' AND is_bank_charge = false "
             "ORDER BY transaction_date, bank_txn_id",
             entity_id,
         )
