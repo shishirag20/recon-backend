@@ -234,32 +234,25 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
 
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool).
     # tds-match/bank-fee/write-off used to be standalone rules here - removed
-    # (2026-08a). Every rule below now runs the same settlement check
+    # (2026-08a); every rule below runs the same settlement check
     # (allocation.py::resolve_invoice_settlement) against whichever
-    # invoice(s) it identifies: TDS/bank-fee/dust-write-off variance is
-    # handled inline by exact-invoice-num, invoice-suffix, exact-amount, and
-    # subset-sum alike, not as their own later-priority fallback pass (see
-    # engine.py's `_commit_direct_match` and allocation.py's rule
-    # docstrings). `overpayment` (below) stayed a standalone rule but moved
-    # to AFTER subset-sum (2026-08b) - it used to be folded into
-    # exact-amount, but that let a rough "closest invoice, excess on-account"
-    # guess grab a payment before subset-sum ever got a chance to check for
-    # an exact multi-invoice split, a strictly better explanation when one
-    # exists (e.g. a payment that doesn't match any single invoice but sums
-    # exactly across two of that customer's open invoices).
+    # invoice(s) it identifies instead. exact-amount/subset-sum/overpayment/
+    # partial-payment used to be four separate rules too - also removed
+    # (2026-08c), folded into the one rule below,
+    # sequential-amount-match: a deterministic oldest-due-first waterfall
+    # that closes as many invoices as the payment covers, absorbs TDS/fee/
+    # write-off variance per invoice along the way, and lets whatever's left
+    # over- or under-shoot naturally (excess carries to the next invoice or
+    # ends up on-account; a shortfall short-pays whichever invoice it ran
+    # out on) - see allocation.py's module docstring for why the four
+    # separate rules were replaced rather than just reordered.
     (PHASE_ALLOCATION, "exact-invoice-num", "Exact Invoice Number Match", 1, 98,
      {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
     (PHASE_ALLOCATION, "invoice-suffix", "Truncated Invoice Number Match", 2, 90,
      {"match_field": "invoice_number", "mode": "suffix", "min_length": 4}),
-    (PHASE_ALLOCATION, "exact-amount", "Exact Amount Match", 3, 95,
-     {"amount": {"mode": "exact", "field": "balance_due_minor"}, "tie_break": "ambiguous_exception"}),
-    (PHASE_ALLOCATION, "subset-sum", "Combined Invoice Match (Many-to-Many)", 4, 85,
-     {"amount": {"mode": "subset_sum"}, "order_by": "due_date", "max_invoices": 10}),
-    (PHASE_ALLOCATION, "overpayment", "Overpayment to On-Account Credit", 5, 100,
-     {"gl_role": GL_ROLE_ON_ACCOUNT_ADVANCE}),
-    (PHASE_ALLOCATION, "partial-payment", "Partial Payment Allocation", 6, 100,
-     {"mode": "partial", "allow_short_pay": True}),
-    # Not dispatched through ALLOCATION_RULES like the five above - it never
+    (PHASE_ALLOCATION, "sequential-amount-match", "Sequential Amount Match", 3, 90,
+     {"amount": {"mode": "sequential_waterfall"}, "order_by": "due_date"}),
+    # Not dispatched through ALLOCATION_RULES like the three above - it never
     # competes in the customer-scoped, per-payment cascade, since by
     # definition no customer was ever identified (payment side or invoice
     # side - migration 0031) for it to be scoped to. Exists as a catalog row
@@ -273,7 +266,7 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
     # distinctly from that rule (and from "invoice-number-in-narration") on
     # purpose - all three used to collide on nearly-identical display names,
     # which is exactly what made "Resolved Via" confusing (2026-08 fix).
-    (PHASE_ALLOCATION, "direct-invoice-match", "Direct Invoice Match", 7, 85,
+    (PHASE_ALLOCATION, "direct-invoice-match", "Direct Invoice Match", 4, 85,
      {"source": "invoices", "match_fields": ["invoice_number", "document_number"], "location": "narration"}),
 
     # Phase 3.0/3.1/3.2 - SHORT_PAY / UNAPPLIED / GL_CHECK: one `threshold`

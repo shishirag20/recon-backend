@@ -333,11 +333,18 @@ class ReconciliationDAO:
         rows entirely; the engine routes those straight to GL posting (M3),
         never through customer identification. Includes `explicit_fee_minor`
         even though Phase 1 doesn't use it - Phase 2's fee-tolerance-match
-        rule needs it and reuses this same row dict rather than re-querying."""
+        rule needs it and reuses this same row dict rather than re-querying.
+        Selects every column app/datahub/canonical.py's KNOWN_FIELDS["BANK"]
+        recognizes (2026-08 fix - used to be a narrower ad-hoc subset), so a
+        custom field-match rule's `bank_field` picker
+        (rules.matchers.BANK_FIELDS) can offer any of them and have it
+        actually work at runtime, not silently no-op on an unloaded key."""
         rows = await self.conn.fetch(
-            "SELECT bank_txn_id, transaction_date, bank_reference, narration, payer_name, "
-            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, "
-            "raw->>'bank_txn_id' AS bank_txn_source_id "
+            "SELECT bank_txn_id, transaction_date, value_date, bank_reference, document_number, "
+            "line_number, fiscal_year, fiscal_period, narration, payer_name, "
+            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, fx_rate, dr_cr, "
+            "explicit_fee_minor, is_bank_charge, contra_reference, "
+            "raw->>'bank_txn_id' AS bank_txn_source_id, raw "
             "FROM bank_statements "
             "WHERE entity_id = $1 AND recon_status = 'PENDING' AND dr_cr = 'CREDIT' AND is_bank_charge = false "
             "ORDER BY transaction_date, bank_txn_id",
@@ -346,8 +353,15 @@ class ReconciliationDAO:
         return _rows(rows)
 
     async def load_customer_master(self, entity_id: str) -> list[dict]:
+        """Selects every column app/datahub/canonical.py's
+        KNOWN_FIELDS["CUSTOMER"] recognizes as a real `customers` column -
+        all of it except bank_account_no/ifsc_code, which route to
+        customer_bank_accounts instead and were never customers columns to
+        begin with (2026-08 fix - used to be a narrower ad-hoc subset, same
+        reasoning as list_candidate_bank_inflows/load_open_invoices)."""
         rows = await self.conn.fetch(
-            "SELECT customer_id, company_name, customer_code, pan, gstin, vpa_handle "
+            "SELECT customer_id, company_name, customer_code, pan, gstin, vpa_handle, "
+            "payment_terms, credit_limit_minor, city, state, raw "
             "FROM customers WHERE entity_id = $1",
             entity_id,
         )
@@ -484,10 +498,18 @@ class ReconciliationDAO:
         tds-net-match can compute the effective TDS amount itself
         (`total_amount_minor * tds_rate_pct / 100`) rather than depending on
         a pre-populated `allowed_tds_minor` - the ingestion mapping has no
-        way to derive that product today (see docs/reconciliation.md §8)."""
+        way to derive that product today (see docs/reconciliation.md §8).
+        Selects every column app/datahub/canonical.py's
+        KNOWN_FIELDS["INVOICE"] recognizes as a real invoices column (all of
+        it except customer_code, which isn't one - it's a lookup key
+        resolved into customer_id at ingestion time, see EDITABLE_FIELDS'
+        own comment on that) - 2026-08 fix, same reasoning as
+        list_candidate_bank_inflows above: a field-match rule's
+        `source_field` picker for source="invoices" should offer fields
+        that actually work at runtime, not a narrower ad-hoc subset."""
         rows = await self.conn.fetch(
             "SELECT invoice_id, customer_id, invoice_number, document_number, issue_date, due_date, "
-            "total_amount_minor, balance_due_minor, allowed_tds_minor, tds_rate_pct, status "
+            "currency, total_amount_minor, balance_due_minor, allowed_tds_minor, tds_rate_pct, status, raw "
             "FROM invoices WHERE entity_id = $1 AND status != 'PAID' "
             "AND ($2::date IS NULL OR issue_date <= $2) "
             "ORDER BY customer_id, due_date, invoice_id",
@@ -495,6 +517,30 @@ class ReconciliationDAO:
             period_end,
         )
         return _rows(rows)
+
+    # Ingestion (app/workers/ingestion_worker.py) stashes every uploaded
+    # column that didn't map to a KNOWN_FIELDS canonical field into this
+    # JSONB column, keyed by the source file's own (unnormalized) header -
+    # e.g. "Business Partner Code". Only the three ingested streams have it;
+    # customer_bank_accounts/customer_reference_codes/expected_remittances
+    # aren't ingestion targets and were never given one.
+    _RAW_KEY_TABLES = {"BANK": "bank_statements", "INVOICE": "invoices", "CUSTOMER": "customers"}
+
+    async def list_raw_field_keys(self, entity_id: str, stream: str) -> list[str]:
+        """Distinct keys actually present in `stream`'s `raw` JSONB across
+        this entity's rows - live, per-upload discovery rather than a static
+        list, since every uploaded file can leave a different set of
+        unmapped columns behind (2026-08 - backs the matcher catalog's
+        raw:<key> field options, see matchers.py)."""
+        table = self._RAW_KEY_TABLES.get(stream)
+        if table is None:
+            return []
+        rows = await self.conn.fetch(
+            f"SELECT DISTINCT jsonb_object_keys(raw) AS k FROM {table} "
+            f"WHERE entity_id = $1 AND raw IS NOT NULL",
+            entity_id,
+        )
+        return sorted({r["k"] for r in rows})
 
     async def load_open_memos(self, entity_id: str) -> list[dict]:
         rows = await self.conn.fetch(

@@ -130,15 +130,24 @@ async def generic_field_match(bank_txn: dict, ctx: RuleContext, config: dict) ->
     matchers.find_matches for what `config` needs. Stops at the first
     match, same "first-match-wins, no ambiguity check" behavior the
     existing simple rules (utr_match, vpa_match, ...) already have - it's
-    not a new policy, just generalized."""
+    not a new policy, just generalized.
+
+    `source="invoices"` (2026-08 fix) is the one case a match's own
+    `customer_id` can be None - an invoice ingested without a resolvable
+    customer_code (migration 0031). Skipped, not taken as-is: `str(None)`
+    would otherwise silently lock the payment to the literal string
+    "None" instead of a real customer_id. Keeps searching `found` rather
+    than giving up entirely - the first candidate happening to be
+    customer-less doesn't mean a later one in the same list isn't real."""
     found = await matchers.find_matches(bank_txn, ctx, config)
-    if not found:
-        return IdentificationResult()
-    match = found[0]
-    return IdentificationResult(
-        customer_id=str(match["customer_id"]),
-        reason=f"field-match ({config.get('matcher')}): {config.get('bank_field')} ~ {config.get('source')}.{config.get('source_field')}",
-    )
+    for match in found:
+        if match["customer_id"] is None:
+            continue
+        return IdentificationResult(
+            customer_id=str(match["customer_id"]),
+            reason=f"field-match ({config.get('matcher')}): {config.get('bank_field')} ~ {config.get('source')}.{config.get('source_field')}",
+        )
+    return IdentificationResult()
 
 
 async def document_number_match(bank_txn: dict, ctx: RuleContext, config: dict) -> IdentificationResult:

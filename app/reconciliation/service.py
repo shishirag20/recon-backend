@@ -133,15 +133,39 @@ class ReconciliationService:
             )
         return await self.dao.update_rule(rule_id, enabled=enabled, name=name, config=config)
 
-    def list_matcher_catalog(self) -> dict:
-        """Static reference data (no DB) for the `kind="field-match"`
-        picker - the frontend's source of truth for valid matcher/source/
-        bank_field values, so it never hardcodes a list that can drift from
-        what rules.matchers.find_matches actually accepts."""
+    # source name -> ReconciliationDAO.list_raw_field_keys' stream key.
+    # customer_bank_accounts/customer_reference_codes/expected_remittances
+    # aren't ingestion targets (see list_raw_field_keys) so they're absent
+    # here on purpose - no raw:<key> options are offered for them.
+    _SOURCE_TO_RAW_STREAM = {"customers": "CUSTOMER", "invoices": "INVOICE"}
+
+    async def list_matcher_catalog(self, entity_id: str | None = None) -> dict:
+        """Reference data for the `kind="field-match"` picker - the
+        frontend's source of truth for valid matcher/source/bank_field
+        values, so it never hardcodes a list that can drift from what
+        rules.matchers.find_matches actually accepts.
+
+        matchers/BANK_FIELDS' fixed columns are always included; when
+        `entity_id` is given, also merges in `raw:<key>` options discovered
+        live from that entity's own uploaded data (2026-08 - every upload
+        can leave a different set of unmapped columns behind, e.g. a
+        "Business Partner Code" column with no canonical-field match; see
+        ReconciliationDAO.list_raw_field_keys)."""
+        bank_fields = list(matchers.BANK_FIELDS)
+        sources = [{"source": source, "fields": list(fields)} for source, fields in matchers.SOURCE_FIELDS.items()]
+        if entity_id is not None:
+            bank_raw_keys = await self.dao.list_raw_field_keys(entity_id, "BANK")
+            bank_fields += [f"raw:{k}" for k in bank_raw_keys]
+            for entry in sources:
+                stream = self._SOURCE_TO_RAW_STREAM.get(entry["source"])
+                if stream is None:
+                    continue
+                raw_keys = await self.dao.list_raw_field_keys(entity_id, stream)
+                entry["fields"] += [f"raw:{k}" for k in raw_keys]
         return {
             "matchers": matchers.MATCHER_CATALOG,
-            "sources": [{"source": source, "fields": fields} for source, fields in matchers.SOURCE_FIELDS.items()],
-            "bank_fields": matchers.BANK_FIELDS,
+            "sources": sources,
+            "bank_fields": bank_fields,
         }
 
     def list_algorithm_catalog(self) -> dict:
@@ -177,8 +201,15 @@ class ReconciliationService:
             if kind != "threshold":
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RULE_KIND)
         else:
-            registry = _REGISTRY_BY_PHASE[phase]
-            if kind not in registry:
+            # phase in RECON_PHASES doesn't imply phase in _REGISTRY_BY_PHASE
+            # - NARRATION_CHECK is a real phase with no per-kind registry at
+            # all (its one rule, invoice-number-in-narration, is called
+            # directly by engine.py, never dispatched through a kind lookup)
+            # - a bare `_REGISTRY_BY_PHASE[phase]` KeyError'd straight into
+            # an unhandled 500 for that phase instead of a clean 400
+            # (2026-08 fix).
+            registry = _REGISTRY_BY_PHASE.get(phase)
+            if registry is None or kind not in registry:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RULE_KIND)
 
         if kind == "field-match":

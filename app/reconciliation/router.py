@@ -104,11 +104,16 @@ async def list_definitions(
     response_model=MatcherCatalogResponse,
     summary="List available matchers/sources/bank_fields for kind='field-match' rules",
 )
-async def list_matchers(service: ReconciliationService = Depends(get_service)):
-    """Static reference data - not scoped to any definition. The frontend's
-    source of truth for the MATCHER/source/field pickers when creating a
-    `POST /reconciliations/{id}/rules` request with `kind="field-match"`."""
-    return service.list_matcher_catalog()
+async def list_matchers(
+    entity_id: UUID | None = None, service: ReconciliationService = Depends(get_service)
+):
+    """The frontend's source of truth for the MATCHER/source/field pickers
+    when creating a `POST /reconciliations/{id}/rules` request with
+    `kind="field-match"`. The fixed matcher/source/bank_field lists are
+    always static reference data; passing `entity_id` additionally merges
+    in `raw:<key>` field options discovered live from that entity's own
+    uploaded (and still-unmapped) columns (2026-08)."""
+    return await service.list_matcher_catalog(str(entity_id) if entity_id else None)
 
 
 # Same static-route-before-dynamic-route reasoning as /reconciliations/matchers.

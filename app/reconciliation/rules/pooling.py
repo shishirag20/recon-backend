@@ -52,10 +52,17 @@ async def generic_field_pool(bank_txn: dict, ctx: RuleContext, config: dict) -> 
     """Config-driven Phase 1b rule (`kind="field-match"`) - see
     matchers.find_matches. Unlike identification.py's generic_field_match,
     collects every match rather than stopping at the first - Phase 1b never
-    locks, by design (same as masked_account_pool/token_pool above)."""
+    locks, by design (same as masked_account_pool/token_pool above).
+
+    `source="invoices"` matches with no `customer_id` (migration 0031 - an
+    invoice ingested without a resolvable customer_code) are skipped, same
+    reasoning as generic_field_match's guard - a candidate pool is for
+    customer_ids, and `str(None)` isn't one."""
     found = await matchers.find_matches(bank_txn, ctx, config)
     candidates: list[str] = []
     for match in found:
+        if match["customer_id"] is None:
+            continue
         customer_id = str(match["customer_id"])
         if customer_id not in candidates:
             candidates.append(customer_id)

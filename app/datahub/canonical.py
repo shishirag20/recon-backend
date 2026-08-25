@@ -43,6 +43,13 @@ KNOWN_FIELDS = {
     "CUSTOMER": {
         "customer_code", "company_name", "pan", "gstin", "vpa_handle",
         "payment_terms", "credit_limit_minor", "city", "state",
+        # Not customers columns - these route to customer_bank_accounts
+        # instead (see insert_customer_row/_upsert_customer_bank_account).
+        # Recognized here so a mapping targeting them isn't flagged as
+        # unknown; deliberately absent from EDITABLE_FIELDS below, since
+        # that assumes a mapping target is a real column on the stream's
+        # own table, which these aren't.
+        "bank_account_no", "ifsc_code",
     },
 }
 
@@ -136,12 +143,15 @@ def _apply_home_currency_default(
         )
 
 
-async def _insert(conn: asyncpg.Connection, table: str, pk_column: str, values: dict) -> None:
+async def _insert(conn: asyncpg.Connection, table: str, pk_column: str, values: dict):
     columns = list(values.keys())
     placeholders = [f"${i}" for i in range(1, len(columns) + 1)]
-    sql = f"INSERT INTO {table} ({pk_column}, {', '.join(columns)}) VALUES (gen_random_uuid(), {', '.join(placeholders)})"
+    sql = (
+        f"INSERT INTO {table} ({pk_column}, {', '.join(columns)}) VALUES (gen_random_uuid(), {', '.join(placeholders)}) "
+        f"RETURNING {pk_column}"
+    )
     try:
-        await conn.execute(sql, *values.values())
+        return await conn.fetchval(sql, *values.values())
     except asyncpg.PostgresError as exc:
         raise RowRejected(str(exc)) from exc
 
@@ -213,7 +223,7 @@ async def insert_customer_row(
     home_currency: str, row_hash_value: str,  # both unused here, accepted for a uniform STREAM_INSERTERS call signature
 ) -> None:
     _require(canonical, ("customer_code", "company_name"))
-    await _insert(conn, "customers", "customer_id", {
+    customer_id = await _insert(conn, "customers", "customer_id", {
         "entity_id": entity_id,
         "source_job_id": source_job_id,
         "customer_code": _normalize_code(canonical["customer_code"]),
@@ -229,6 +239,44 @@ async def insert_customer_row(
         "valid": len(issues) == 0,
         "issues": issues or None,
     })
+    bank_account_no = canonical.get("bank_account_no")
+    if bank_account_no:
+        await _upsert_customer_bank_account(
+            conn, customer_id=customer_id, bank_account_no=bank_account_no, ifsc_code=canonical.get("ifsc_code"),
+        )
+
+
+async def _upsert_customer_bank_account(
+    conn: asyncpg.Connection, *, customer_id, bank_account_no: str, ifsc_code: str | None,
+) -> None:
+    """Bank details mapped on a CUSTOMER row route to customer_bank_accounts,
+    not a customers column - that's the table reconciliation's
+    identification cascade actually reads
+    (app/reconciliation/rules/identification.py::bank_account_match), not
+    customers.raw's unstructured jsonb, which the identification rules
+    never look at. Skips if this exact (customer, account, ifsc)
+    combination is already on file - customer_bank_accounts has no unique
+    constraint to lean on for ON CONFLICT, and re-ingesting the same
+    customer master file shouldn't pile up duplicate rows each time."""
+    account_no = str(bank_account_no).strip()
+    if not account_no:
+        return
+    ifsc = str(ifsc_code).strip() if ifsc_code else None
+    existing = await conn.fetchval(
+        "SELECT account_id FROM customer_bank_accounts WHERE customer_id = $1 AND bank_account_no = $2 "
+        "AND ifsc_code IS NOT DISTINCT FROM $3",
+        customer_id, account_no, ifsc,
+    )
+    if existing is not None:
+        return
+    is_first = await conn.fetchval(
+        "SELECT count(*) = 0 FROM customer_bank_accounts WHERE customer_id = $1", customer_id
+    )
+    await conn.execute(
+        "INSERT INTO customer_bank_accounts (account_id, customer_id, bank_account_no, ifsc_code, is_primary, status) "
+        "VALUES (gen_random_uuid(), $1, $2, $3, $4, 'ACTIVE')",
+        customer_id, account_no, ifsc, is_first,
+    )
 
 
 async def _resolve_customer_id(conn: asyncpg.Connection, *, entity_id, customer_code: str):
@@ -248,6 +296,34 @@ async def _resolve_customer_id(conn: asyncpg.Connection, *, entity_id, customer_
         entity_id, normalized,
     )
     return customer["customer_id"] if customer is not None else None
+
+
+async def _synthesize_invoice_number(conn: asyncpg.Connection, *, entity_id, document_number: str) -> str:
+    """Fallback for ERP exports (e.g. CMR_BOOK_DATA.csv) whose Document_Number
+    isn't guaranteed unique per entity - a multi-line accounting document can
+    produce more than one AR invoice line under the same document number (see
+    migration 0033's comment, and the hand-suffixed INV-2026-105A/105B already
+    present in that same file). invoice_number is NOT NULL + UNIQUE(entity_id,
+    invoice_number), so an unmapped invoice_number can't just be left blank or
+    set to document_number verbatim - this picks the next unused
+    `{document_number}-NNN` suffix for this entity instead, checking the real
+    invoices table (not just this job's rows), so it stays correct across
+    separate uploads of the same document number over time, not just within
+    one file. Zero-padded to 3 digits, matching the -001/-002/... convention
+    requested for this export."""
+    existing = await conn.fetch(
+        "SELECT invoice_number FROM invoices WHERE entity_id = $1 AND invoice_number LIKE $2 || '-%'",
+        entity_id, document_number,
+    )
+    used = set()
+    for row in existing:
+        suffix = row["invoice_number"][len(document_number) + 1:]
+        if suffix.isdigit():
+            used.add(int(suffix))
+    seq = 1
+    while seq in used:
+        seq += 1
+    return f"{document_number}-{seq:03d}"
 
 
 async def insert_invoice_row(
@@ -285,6 +361,10 @@ async def insert_invoice_row(
     )
     if canonical.get("balance_due_minor") is None:
         canonical["balance_due_minor"] = canonical.get("total_amount_minor")
+    if canonical.get("invoice_number") is None and canonical.get("document_number"):
+        canonical["invoice_number"] = await _synthesize_invoice_number(
+            conn, entity_id=entity_id, document_number=canonical["document_number"]
+        )
     _require(canonical, ("invoice_number", "issue_date", "due_date", "currency",
                           "total_amount_minor", "total_home_minor", "balance_due_minor"))
 

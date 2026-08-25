@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from app.datahub.canonical import KNOWN_FIELDS
 from app.reconciliation import extract, fuzzy
 from app.reconciliation.rules import RuleContext
 
@@ -73,41 +74,72 @@ MATCHER_CATALOG = [
     },
 ]
 
-# Only the four Phase-1 working-set lists RuleContext already loads once per
-# run - no new queries. Phase 2's `invoices` is deliberately not here; that
-# phase's AllocationContext/rules stay their own bespoke functions (see
-# module docstring and docs/reconciliation.md's scoping note).
+# The four Phase-1 working-set lists RuleContext already loads once per run
+# (no new queries), plus "invoices" (2026-08 fix - ctx.all_open_invoices was
+# already loaded for the narration cross-check, so this needed no new query
+# either). Phase 2's *allocation* rules still stay their own bespoke
+# functions - this is only about identifying/pooling a customer (or, for
+# "invoices" specifically, feeding engine.py's no-customer direct-match path
+# the same way the bespoke "Invoice Number in Narration" rule already does -
+# see generic_field_match's customer_id=None guard below for why that
+# distinction matters here).
 _SOURCE_ATTR = {
     "customers": "customers",
     "customer_bank_accounts": "bank_accounts",
     "customer_reference_codes": "reference_codes",
     "expected_remittances": "expected_remittances",
+    "invoices": "all_open_invoices",
 }
 SOURCE_KINDS = frozenset(_SOURCE_ATTR)
 
-# The exact columns each source's loader (app/reconciliation/dao.py) selects
-# - the only fields find_matches can actually read off a candidate row.
-# customer_id is excluded (never a meaningful source_field to match against).
+# customers/invoices are derived from app/datahub/canonical.py's
+# KNOWN_FIELDS - the same single source of truth the field-mapping UI's own
+# canonical-field picker uses (GET /field-mappings/{stream}/canonical-fields)
+# - rather than a second, separately-maintained list here that can drift
+# out of sync with it (2026-08 fix - that's what happened before: this
+# module's own static lists didn't track KNOWN_FIELDS at all). A couple of
+# KNOWN_FIELDS entries aren't real columns on the table find_matches
+# actually reads, so they're excluded explicitly:
+#   - INVOICE's customer_code isn't an invoices column - it's a lookup key
+#     resolved into customer_id at ingestion time (see EDITABLE_FIELDS'
+#     own comment on it, app/datahub/canonical.py).
+#   - CUSTOMER's bank_account_no/ifsc_code route to customer_bank_accounts
+#     instead - never customers columns to begin with (see
+#     insert_customer_row/_upsert_customer_bank_account).
+# customer_bank_accounts/customer_reference_codes/expected_remittances stay
+# their own fixed lists below - they're not ingested streams with a
+# KNOWN_FIELDS entry at all, just fixed relational tables whose columns
+# never vary by upload format the way BANK/INVOICE/CUSTOMER's do.
 SOURCE_FIELDS = {
-    "customers": ["company_name", "customer_code", "pan", "gstin", "vpa_handle"],
+    "customers": sorted(KNOWN_FIELDS["CUSTOMER"] - {"bank_account_no", "ifsc_code"}),
     "customer_bank_accounts": ["bank_account_no", "ifsc_code"],
     "customer_reference_codes": ["code_value", "code_type"],
     "expected_remittances": ["utr_number"],
+    "invoices": sorted(KNOWN_FIELDS["INVOICE"] - {"customer_code"}),
 }
 
-# The exact bank_statements columns list_candidate_bank_inflows selects,
-# plus the extract:* sentinels extract_bank_value understands - the only
-# valid values for config.bank_field.
-BANK_FIELDS = [
-    "bank_reference", "narration", "payer_name", "payer_account_no", "payer_ifsc",
-    "extract:vpa", "extract:gstin", "extract:pan",
+# KNOWN_FIELDS["BANK"] (every entry is a real bank_statements column, no
+# exclusions needed - unlike INVOICE/CUSTOMER above), plus bank_txn_source_id
+# (not a canonical field, but a real, useful one - the source file's own
+# transaction id column, pulled from bank_statements.raw) and the extract:*
+# sentinels extract_bank_value understands (computed from narration via
+# regex, not a stored column at all - can't come from KNOWN_FIELDS).
+BANK_FIELDS = sorted(KNOWN_FIELDS["BANK"]) + [
+    "bank_txn_source_id", "extract:vpa", "extract:gstin", "extract:pan",
 ]
 
 
 def extract_bank_value(bank_txn: dict, bank_field: str) -> str | None:
-    """`bank_field` is either a direct bank_statements column name, or an
+    """`bank_field` is a direct bank_statements column name, an
     `extract:vpa`/`extract:gstin`/`extract:pan` sentinel that regex-extracts
-    it from narration first (see extract.py)."""
+    it from narration first (see extract.py), or a `raw:<key>` sentinel
+    reading an unmapped ingestion column straight out of
+    bank_statements.raw (2026-08 - see find_matches' own raw: handling for
+    why this exists)."""
+    if bank_field.startswith("raw:"):
+        key = bank_field.split(":", 1)[1]
+        value = (bank_txn.get("raw") or {}).get(key)
+        return str(value) if value is not None else None
     if bank_field.startswith("extract:"):
         kind = bank_field.split(":", 1)[1]
         narration = bank_txn.get("narration") or ""
@@ -153,7 +185,20 @@ async def find_matches(bank_txn: dict, ctx: RuleContext, config: dict) -> list[d
     if matcher_fn is None:
         return []
     candidates = getattr(ctx, _SOURCE_ATTR.get(source, ""), [])
-    return [
-        cand for cand in candidates
-        if cand.get(source_field) and matcher_fn(bank_value, str(cand[source_field]), config)
-    ]
+    get_source_value = _raw_getter(source_field) if source_field.startswith("raw:") else lambda cand: cand.get(source_field)
+    matches = []
+    for cand in candidates:
+        value = get_source_value(cand)
+        if value and matcher_fn(bank_value, str(value), config):
+            matches.append(cand)
+    return matches
+
+
+def _raw_getter(source_field: str) -> Callable[[dict], object]:
+    """`source_field` is a `raw:<key>` sentinel - read an unmapped ingestion
+    column straight out of the candidate row's own `raw` JSONB (customers/
+    invoices only; customer_bank_accounts/customer_reference_codes/
+    expected_remittances rows have no `raw` column at all, so this just
+    finds nothing for them, same as any other missing field would)."""
+    key = source_field.split(":", 1)[1]
+    return lambda cand: (cand.get("raw") or {}).get(key)

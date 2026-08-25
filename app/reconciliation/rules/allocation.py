@@ -1,18 +1,26 @@
-"""Phase 2 (ALLOCATION) rules - the 5 rules from the plan's default AR rule
+"""Phase 2 (ALLOCATION) rules - the 3 rules from the plan's default AR rule
 catalog (constants.py), evaluated per (payment, candidate customer) pair in
 `(phase, priority)` order, first-match-wins, same pattern as
 identification.py/pooling.py.
 
-TDS/bank-fee/dust-write-off variance and overpayment used to be four
-separate standalone rules here (tds-match, bank-fee, write-off, overpayment)
-that only ever fired as their own late-priority fallback pass over the whole
-open-invoice set. They're gone now (2026-08 note) - every rule below runs
-the same settlement check (`resolve_invoice_settlement`) against whichever
-invoice(s) it identifies by number/suffix/amount/combo, so a narration match
-that's short by a withheld TDS amount, or a payment that overshoots a
-balance, is handled inline by whichever rule found the invoice, not by a
-separate rule several priorities later. See `resolve_invoice_settlement`'s
-docstring.
+TDS/bank-fee/dust-write-off variance used to be three separate standalone
+rules here (tds-match, bank-fee, write-off) that only ever fired as their
+own late-priority fallback pass over the whole open-invoice set. They're
+gone (2026-08a) - every rule below runs the same settlement check
+(`resolve_invoice_settlement`) against whichever invoice(s) it identifies,
+so a narration match that's short by a withheld TDS amount is handled
+inline by whichever rule found the invoice, not by a separate rule several
+priorities later.
+
+exact-amount/subset-sum/overpayment/partial-payment were later folded into
+one rule, `sequential_amount_match` (2026-08b) - see its own docstring for
+why a single deterministic oldest-due-first waterfall replaced all four:
+searching for a unique exact match, then a unique exact combination, then a
+closest-overpay guess, then a bare fallback, all as separate priorities
+turned out to just be four increasingly-desperate ways of answering the
+same question ("how does this amount distribute across this customer's
+open invoices"), each capable of stealing a payment from a later, better
+answer.
 
 The period-cutoff and memo-net-off checks the original plan called "Phase
 2.0a/2.0b guardrails" are NOT rule callables here, and no longer have a
@@ -29,7 +37,6 @@ which case it's in.
 """
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -172,12 +179,12 @@ class SettlementClose:
 
 def resolve_invoice_settlement(amount: int, inv: dict, bank_txn: dict) -> SettlementClose:
     """The one place every Phase 2 rule (exact-invoice-num, invoice-suffix,
-    exact-amount, subset-sum, and engine.py's no-customer direct-match) asks
+    sequential-amount-match, and engine.py's no-customer direct-match) asks
     "how does `amount` settle this invoice" - replaces tds-match/bank-fee/
-    write-off/overpayment as standalone catalog rules (2026-08 note). Checked
-    in priority order (TDS, then bank fee, then dust write-off, then
-    overpayment) so the first applicable variance wins, same ordering those
-    four rules used to have relative to each other."""
+    write-off as standalone catalog rules (2026-08a). Checked in priority
+    order (TDS, then bank fee, then dust write-off, then overpayment) so the
+    first applicable variance wins, same ordering those rules used to have
+    relative to each other."""
     balance = inv["balance_due_minor"]
     if amount == balance:
         return SettlementClose("EXACT", amount, False, "amount matches balance exactly")
@@ -258,7 +265,7 @@ async def truncated_suffix_match(payment: dict, bank_txn: dict, customer_id: str
     number appears in narration (e.g. "1046" for INV-2026-1046). Also
     searches ctx.unresolved_invoices once this customer's own invoices come
     up empty - see invoice_number_match's docstring for why that's safe here
-    specifically (unlike the balance-based rules below)."""
+    specifically (unlike the balance-based rule below)."""
     min_length = config.get("min_length", 4)
     narration = bank_txn.get("narration") or ""
     blocks = extract.extract_numeric_blocks(narration, min_length=min_length)
@@ -275,149 +282,66 @@ async def truncated_suffix_match(payment: dict, bank_txn: dict, customer_id: str
     return AllocationOutcome()
 
 
-async def exact_balance_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
-    """2.3 - the payment fully closes exactly one open invoice, at par or
-    via an absorbed TDS/bank-fee/dust-write-off variance (previously three
-    separate standalone rules - see module docstring). A tie between two+
-    invoices that would each close exactly (or via the same kind of
-    variance) is a deliberate refusal to guess (`ambiguous=True`) - the
-    engine turns that into a MULTIPLE_INVOICE_MATCH exception.
+async def sequential_amount_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
+    """2.3 - walks this customer's open invoices oldest-due-date-first,
+    applying the payment sequentially. At each invoice, `resolve_invoice_
+    settlement` is asked "how does whatever's left of the payment settle
+    this one" - its four-way answer already *is* the waterfall step:
+    EXACT/VARIANCE closes the invoice and consumes the rest of the payment
+    (loop ends), OVERPAID closes the invoice at its balance and carries the
+    excess into the next invoice (loop continues), PARTIAL consumes the
+    rest of the payment without closing the invoice (loop ends, engine
+    raises Short-Pay for the gap). No extra bookkeeping needed beyond
+    collecting each step's allocation - `_commit` already handles a
+    multi-invoice `AllocationOutcome` correctly (it was built for
+    subset-sum's combos).
 
-    Overpayment is NOT handled here (2026-08 fix) - it used to be, as a
-    fallback at the bottom of this same function, but that let a rough
-    "closest invoice, excess on-account" guess grab a payment before
-    subset-sum (later priority) ever got a chance to check whether it
-    actually splits exactly across 2+ invoices - a strictly better
-    explanation when one exists. Overpayment is its own rule now,
-    `overpay_fallback` (kind "overpayment"), deliberately placed after
-    subset-sum in the catalog so it's only tried once nothing more precise
-    - neither a single clean invoice nor an exact multi-invoice split -
-    explains the payment."""
+    Replaces exact-amount/subset-sum/overpayment/partial-payment (2026-08
+    consolidation) - see module docstring for why. Deliberately no
+    ambiguity/tie-break refusal here, unlike the old exact_balance_match:
+    since invoices are walked in a fixed order rather than searched for a
+    unique match, "which invoice does this amount belong to" always has one
+    deterministic answer - the oldest one it reaches - even on the rare
+    occasion a different invoice elsewhere in the list would also have
+    matched exactly on its own."""
     amount = payment["total_received_minor"]
-    closes = [(inv, resolve_invoice_settlement(amount, inv, bank_txn)) for inv in _open_invoices(ctx, customer_id)]
-
-    exacts = [(inv, s) for inv, s in closes if s.status in ("EXACT", "VARIANCE")]
-    if len(exacts) == 1:
-        inv, settle = exacts[0]
-        reason = "exact balance match" if settle.status == "EXACT" else settle.reason
-        match_type = "EXACT" if settle.status == "EXACT" else "TOLERANCE"
-        return AllocationOutcome(
-            allocations=[
-                InvoiceAllocation(inv["invoice_id"], settle.cash_minor, close_full=settle.close_full, gap_role=settle.gap_role)
-            ],
-            match_type=match_type,
-            reason=reason,
-        )
-    if len(exacts) > 1:
-        return AllocationOutcome(
-            ambiguous=True,
-            ambiguous_invoice_ids=[inv["invoice_id"] for inv, _ in exacts],
-            reason=f"{len(exacts)} invoices tie on {_rupees(amount)}",
-        )
-    return AllocationOutcome()
-
-
-async def overpay_fallback(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
-    """2.8 (after subset-sum, deliberately last-resort) - the payment
-    exceeds some open invoice's balance and nothing more precise explained
-    it: not a single exact/variance match (exact-amount, earlier priority),
-    not an exact multi-invoice split (subset-sum, earlier priority still).
-    Targets whichever invoice has the *smallest* excess (closest match)
-    rather than an arbitrary one - "which invoice is closest to being fully
-    settled" always has a deterministic answer, so this never needs an
-    ambiguity refusal the way exact_balance_match's ties do. The invoice
-    closes fully, the excess is left as on-account credit via the normal
-    payments.unapplied_minor bookkeeping - no separate exception, an
-    overpayment isn't a problem needing review."""
-    amount = payment["total_received_minor"]
-    closes = [(inv, resolve_invoice_settlement(amount, inv, bank_txn)) for inv in _open_invoices(ctx, customer_id)]
-    overpaid = [(inv, s) for inv, s in closes if s.status == "OVERPAID"]
-    if not overpaid:
+    invoices = _open_invoices(ctx, customer_id)  # already sorted oldest-due-first
+    if amount <= 0 or not invoices:
         return AllocationOutcome()
-    inv, settle = min(overpaid, key=lambda pair: amount - pair[0]["balance_due_minor"])
-    return AllocationOutcome(
-        allocations=[
+
+    allocations: list[InvoiceAllocation] = []
+    settles: list[SettlementClose] = []
+    remaining = amount
+    for inv in invoices:
+        if remaining <= 0:
+            break
+        settle = resolve_invoice_settlement(remaining, inv, bank_txn)
+        allocations.append(
             InvoiceAllocation(inv["invoice_id"], settle.cash_minor, close_full=settle.close_full, gap_role=settle.gap_role)
-        ],
-        match_type="TOLERANCE",
-        reason=settle.reason,
-    )
+        )
+        settles.append(settle)
+        remaining -= settle.cash_minor
 
-
-def _subset_sum_variants(inv: dict, bank_txn: dict) -> list[tuple[int, str | None]]:
-    """`(contribution_minor, gap_role)` options this one invoice can
-    contribute to a subset-sum combo's target total - its full balance
-    (`gap_role=None`), or (if applicable) its TDS/bank-fee-adjusted net
-    amount. Lets a combo containing e.g. one TDS-withheld invoice still sum
-    exactly to the payment, instead of subset-sum only ever seeing raw
-    balances - the example that prompted this: a remittance where one of
-    several invoices being paid together already had TDS deducted at
-    source."""
-    balance = inv["balance_due_minor"]
-    variants: list[tuple[int, str | None]] = [(balance, None)]
-
-    tds = _tds_net_amount(inv)
-    if tds is not None:
-        _, net_amount = tds
-        variants.append((net_amount, GAP_ROLE_BY_RULE_KIND["tds-match"]))
-
-    explicit_fee = bank_txn.get("explicit_fee_minor") or 0
-    if explicit_fee > 0:
-        variants.append((balance - explicit_fee, GAP_ROLE_BY_RULE_KIND["bank-fee"]))
-
-    return variants
-
-
-async def subset_sum_fifo(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
-    """2.4 - a combination of 2+ open invoices (oldest due date first, up to
-    `config['max_invoices']`) whose balances sum exactly to the payment. A
-    single-invoice exact match is exact-amount's job (earlier priority) -
-    this only searches combinations of size >= 2. Each invoice in a combo
-    can contribute either its raw balance or its TDS/bank-fee-adjusted
-    amount to the target sum (`_subset_sum_variants`), so a combo with one
-    TDS-withheld invoice still matches - bounded by `max_invoices` since the
-    per-invoice variant count multiplies the search."""
-    amount = payment["total_received_minor"]
-    max_invoices = config.get("max_invoices", 10)
-    invoices = _open_invoices(ctx, customer_id)[:max_invoices]  # already sorted by due_date
-    for size in range(2, len(invoices) + 1):
-        for combo in itertools.combinations(invoices, size):
-            variant_lists = [_subset_sum_variants(inv, bank_txn) for inv in combo]
-            for picks in itertools.product(*variant_lists):
-                if sum(contrib for contrib, _ in picks) == amount:
-                    allocations = [
-                        InvoiceAllocation(inv["invoice_id"], contrib, close_full=True, gap_role=gap_role)
-                        for inv, (contrib, gap_role) in zip(combo, picks)
-                    ]
-                    variance_count = sum(1 for _, gap_role in picks if gap_role)
-                    reason = f"{size} invoices sum exactly to the payment"
-                    if variance_count:
-                        reason += f" ({variance_count} with a TDS/fee variance absorbed)"
-                    return AllocationOutcome(allocations=allocations, match_type="SUBSET_SUM", reason=reason)
-    return AllocationOutcome()
-
-
-async def partial_pay(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
-    """2.5 - universal fallback: nothing else identified a target invoice at
-    all, so apply the payment to the customer's oldest open invoice (by due
-    date). Always leaves the invoice open (or the engine raises Short-Pay
-    for the remainder) - this rule doesn't invent a full match."""
-    invoices = _open_invoices(ctx, customer_id)
-    if not invoices:
+    if not allocations:
         return AllocationOutcome()
-    inv = invoices[0]  # already sorted oldest-due-first
-    cash = min(payment["total_received_minor"], inv["balance_due_minor"])
-    return AllocationOutcome(
-        allocations=[InvoiceAllocation(inv["invoice_id"], cash)],
-        match_type="PARTIAL", reason="universal partial-payment fallback (oldest open invoice)",
-    )
+
+    if len(allocations) == 1:
+        settle = settles[0]
+        reason = "exact balance match" if settle.status == "EXACT" else settle.reason
+        match_type = "EXACT" if settle.status == "EXACT" else ("PARTIAL" if settle.status == "PARTIAL" else "TOLERANCE")
+        return AllocationOutcome(allocations=allocations, match_type=match_type, reason=reason)
+
+    variance_count = sum(1 for s in settles if s.status == "VARIANCE")
+    reason = f"{len(allocations)} invoices settled sequentially, oldest-due first"
+    if variance_count:
+        reason += f" ({variance_count} with a TDS/fee/write-off variance absorbed)"
+    if settles[-1].status == "PARTIAL":
+        reason += ", last one short-paid"
+    return AllocationOutcome(allocations=allocations, match_type="ONE_TO_MANY", reason=reason)
 
 
 ALLOCATION_RULES: dict[str, RuleFn] = {
     "exact-invoice-num": invoice_number_match,
     "invoice-suffix": truncated_suffix_match,
-    "exact-amount": exact_balance_match,
-    "subset-sum": subset_sum_fifo,
-    "overpayment": overpay_fallback,
-    "partial-payment": partial_pay,
+    "sequential-amount-match": sequential_amount_match,
 }
