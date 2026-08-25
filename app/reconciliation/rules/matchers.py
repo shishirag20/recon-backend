@@ -153,6 +153,23 @@ def extract_bank_value(bank_txn: dict, bank_field: str) -> str | None:
     return bank_txn.get(bank_field)
 
 
+def get_source_value(cand: dict, source_field: str) -> object | None:
+    """The candidate row's own value for `source_field` - a direct column
+    when it's a plain field name, or an unmapped ingestion column read
+    straight out of `cand['raw']` when it's a `raw:<key>` sentinel (mirrors
+    extract_bank_value's own raw: handling on the bank side). Public (not
+    find_matches-private) so identification.py's narration_group_match
+    (2026-08d) can recover *which value* a find_matches hit actually
+    matched on - find_matches itself only returns the matching row, not the
+    value that made it match, and grouping several invoices under one
+    payment needs to know they all matched on the *same* value, not just
+    that each matched independently."""
+    if source_field.startswith("raw:"):
+        key = source_field.split(":", 1)[1]
+        return (cand.get("raw") or {}).get(key)
+    return cand.get(source_field)
+
+
 async def find_matches(bank_txn: dict, ctx: RuleContext, config: dict) -> list[dict]:
     """Every candidate row (from `config['source']`, already loaded on
     `ctx`) whose `config['source_field']` matches the bank_txn's
@@ -185,20 +202,9 @@ async def find_matches(bank_txn: dict, ctx: RuleContext, config: dict) -> list[d
     if matcher_fn is None:
         return []
     candidates = getattr(ctx, _SOURCE_ATTR.get(source, ""), [])
-    get_source_value = _raw_getter(source_field) if source_field.startswith("raw:") else lambda cand: cand.get(source_field)
     matches = []
     for cand in candidates:
-        value = get_source_value(cand)
+        value = get_source_value(cand, source_field)
         if value and matcher_fn(bank_value, str(value), config):
             matches.append(cand)
     return matches
-
-
-def _raw_getter(source_field: str) -> Callable[[dict], object]:
-    """`source_field` is a `raw:<key>` sentinel - read an unmapped ingestion
-    column straight out of the candidate row's own `raw` JSONB (customers/
-    invoices only; customer_bank_accounts/customer_reference_codes/
-    expected_remittances rows have no `raw` column at all, so this just
-    finds nothing for them, same as any other missing field would)."""
-    key = source_field.split(":", 1)[1]
-    return lambda cand: (cand.get("raw") or {}).get(key)

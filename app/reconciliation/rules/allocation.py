@@ -282,33 +282,20 @@ async def truncated_suffix_match(payment: dict, bank_txn: dict, customer_id: str
     return AllocationOutcome()
 
 
-async def sequential_amount_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
-    """2.3 - walks this customer's open invoices oldest-due-date-first,
-    applying the payment sequentially. At each invoice, `resolve_invoice_
-    settlement` is asked "how does whatever's left of the payment settle
-    this one" - its four-way answer already *is* the waterfall step:
-    EXACT/VARIANCE closes the invoice and consumes the rest of the payment
-    (loop ends), OVERPAID closes the invoice at its balance and carries the
+def sequential_waterfall(amount: int, invoices: list[dict], bank_txn: dict) -> tuple[list[InvoiceAllocation], list[SettlementClose]]:
+    """The actual waterfall step, pulled out of `sequential_amount_match` so
+    engine.py's no-customer group-match path (Sequential Narration Match)
+    can drive the identical algorithm across a narration-matched invoice
+    group instead of a customer's own invoice list (2026-08d) - this
+    function doesn't know or care where `invoices` came from, only that
+    it's ordered oldest-due-first. At each invoice, `resolve_invoice_
+    settlement` is asked "how does whatever's left of `amount` settle this
+    one" - its four-way answer already *is* the waterfall step: EXACT/
+    VARIANCE closes the invoice and consumes the rest of the amount (loop
+    ends), OVERPAID closes the invoice at its balance and carries the
     excess into the next invoice (loop continues), PARTIAL consumes the
-    rest of the payment without closing the invoice (loop ends, engine
-    raises Short-Pay for the gap). No extra bookkeeping needed beyond
-    collecting each step's allocation - `_commit` already handles a
-    multi-invoice `AllocationOutcome` correctly (it was built for
-    subset-sum's combos).
-
-    Replaces exact-amount/subset-sum/overpayment/partial-payment (2026-08
-    consolidation) - see module docstring for why. Deliberately no
-    ambiguity/tie-break refusal here, unlike the old exact_balance_match:
-    since invoices are walked in a fixed order rather than searched for a
-    unique match, "which invoice does this amount belong to" always has one
-    deterministic answer - the oldest one it reaches - even on the rare
-    occasion a different invoice elsewhere in the list would also have
-    matched exactly on its own."""
-    amount = payment["total_received_minor"]
-    invoices = _open_invoices(ctx, customer_id)  # already sorted oldest-due-first
-    if amount <= 0 or not invoices:
-        return AllocationOutcome()
-
+    rest without closing the invoice (loop ends, the caller raises
+    Short-Pay for the gap)."""
     allocations: list[InvoiceAllocation] = []
     settles: list[SettlementClose] = []
     remaining = amount
@@ -321,7 +308,15 @@ async def sequential_amount_match(payment: dict, bank_txn: dict, customer_id: st
         )
         settles.append(settle)
         remaining -= settle.cash_minor
+    return allocations, settles
 
+
+def waterfall_outcome(allocations: list[InvoiceAllocation], settles: list[SettlementClose]) -> AllocationOutcome:
+    """Shapes `sequential_waterfall`'s raw output into an `AllocationOutcome`
+    - shared so the customer-scoped rule below and engine.py's no-customer
+    group-match commit produce identically-worded reasons/match_types for
+    the same underlying settlement pattern, instead of two hand-written
+    copies of this reason-string logic drifting apart."""
     if not allocations:
         return AllocationOutcome()
 
@@ -338,6 +333,25 @@ async def sequential_amount_match(payment: dict, bank_txn: dict, customer_id: st
     if settles[-1].status == "PARTIAL":
         reason += ", last one short-paid"
     return AllocationOutcome(allocations=allocations, match_type="ONE_TO_MANY", reason=reason)
+
+
+async def sequential_amount_match(payment: dict, bank_txn: dict, customer_id: str, ctx: AllocationContext, config: dict) -> AllocationOutcome:
+    """2.3 - walks this customer's open invoices oldest-due-date-first,
+    applying the payment sequentially via `sequential_waterfall`. Replaces
+    exact-amount/subset-sum/overpayment/partial-payment (2026-08
+    consolidation) - see module docstring for why. Deliberately no
+    ambiguity/tie-break refusal here, unlike the old exact_balance_match:
+    since invoices are walked in a fixed order rather than searched for a
+    unique match, "which invoice does this amount belong to" always has one
+    deterministic answer - the oldest one it reaches - even on the rare
+    occasion a different invoice elsewhere in the list would also have
+    matched exactly on its own."""
+    amount = payment["total_received_minor"]
+    invoices = _open_invoices(ctx, customer_id)  # already sorted oldest-due-first
+    if amount <= 0 or not invoices:
+        return AllocationOutcome()
+    allocations, settles = sequential_waterfall(amount, invoices, bank_txn)
+    return waterfall_outcome(allocations, settles)
 
 
 ALLOCATION_RULES: dict[str, RuleFn] = {

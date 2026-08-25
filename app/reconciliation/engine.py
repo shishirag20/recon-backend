@@ -27,8 +27,8 @@ from app.reconciliation.constants import (
 )
 from app.reconciliation.dao import ReconciliationDAO
 from app.reconciliation.rules import AllocationContext, RuleContext, get_threshold_minor
-from app.reconciliation.rules.allocation import ALLOCATION_RULES, resolve_invoice_settlement
-from app.reconciliation.rules.identification import IDENTIFICATION_RULES, narration_invoice_owner
+from app.reconciliation.rules.allocation import ALLOCATION_RULES, resolve_invoice_settlement, sequential_waterfall, waterfall_outcome
+from app.reconciliation.rules.identification import IDENTIFICATION_RULES, narration_group_match, narration_invoice_owner
 from app.reconciliation.rules.pooling import POOLING_RULES
 
 
@@ -118,14 +118,21 @@ async def run_phase_1(
     )
     # Its own phase (NARRATION_CHECK), not CUSTOMER_LOCK - it runs after both
     # 1a and 1b have had their chance for a row, not inside either's
-    # first-match-wins loop. Exactly one enabled row is expected, same
-    # convention as the single `threshold` row per SHORT_PAY/UNAPPLIED/
-    # GL_CHECK phase.
+    # first-match-wins loop. Two kinds live here: `invoice-number-in-
+    # narration` (crosscheck_rule below - the single-invoice mismatch-
+    # detection role against an already-locked customer, unchanged since
+    # 2026-08) and `sequential-narration-match` (group_rules - 2026-08d,
+    # only ever consulted in the no-customer-anywhere branch further down,
+    # never in the mismatch check). crosscheck_rule is filtered to its own
+    # kind specifically so an enabled sequential-narration-match row at a
+    # lower priority number can never accidentally become "the" crosscheck
+    # rule and silently disable the mismatch check.
     crosscheck_rules = sorted(
         (r for r in rules if r["phase"] == PHASE_NARRATION_CHECK and r["enabled"]),
         key=lambda r: r["priority"],
     )
-    crosscheck_rule = crosscheck_rules[0] if crosscheck_rules else None
+    crosscheck_rule = next((r for r in crosscheck_rules if r["kind"] == "invoice-number-in-narration"), None)
+    group_rules = [r for r in crosscheck_rules if r["kind"] == "sequential-narration-match"]
     pooling_rules = sorted(
         (r for r in rules if r["phase"] == PHASE_CANDIDATE_POOL and r["enabled"]),
         key=lambda r: r["priority"],
@@ -361,13 +368,50 @@ async def run_phase_1(
 
         # Truly no customer anywhere - not on the payment side (Phase 1a/1b
         # found nobody), not on the invoice side either (narration_match's
-        # own customer_id is None, migration 0031). The invoice number/
-        # document number itself is still self-sufficient evidence of which
-        # invoice this is, even with no identity to attach it to - hand it
-        # to Phase 2 as a direct match instead of dropping straight to
-        # Suspense. customer_id stays NULL on the payment (there's nothing
-        # to backfill it with); run_phase_2's direct-match pass allocates
-        # against exactly this invoice, bypassing customer scoping entirely.
+        # own customer_id is None, migration 0031). Try every enabled
+        # sequential-narration-match rule first (priority order, first hit
+        # wins) - when a narration-matched field genuinely groups more than
+        # one open invoice (e.g. raw:Business_Partner_Code), that's a
+        # strictly richer answer than the single-invoice check below, so it
+        # gets first refusal (2026-08d). Falls through to the existing
+        # single-invoice check unchanged when no group rule is enabled or
+        # none of them find a clean (unambiguous) group.
+        group_match = None
+        firing_group_rule = None
+        for rule in group_rules:
+            group_match = await narration_group_match(bank_txn, ctx, rule["config"])
+            if group_match:
+                firing_group_rule = rule
+                break
+
+        if group_match:
+            payment = await dao.insert_payment(
+                bank_txn_id=bank_txn_id,
+                customer_id=None,
+                total_received_minor=amount_minor,
+                locked_by_rule_id=None,
+                candidate_pool=None,
+            )
+            outcomes.append(
+                {
+                    "payment_id": payment["payment_id"],
+                    "bank_txn": bank_txn,
+                    "customer_id": None,
+                    "candidate_pool": None,
+                    "direct_invoice_group": group_match["invoice_ids"],
+                    "direct_invoice_group_rule": firing_group_rule,
+                }
+            )
+            counts["direct_match"] += 1
+            continue
+
+        # The invoice number/document number itself is still self-sufficient
+        # evidence of which invoice this is, even with no identity to attach
+        # it to - hand it to Phase 2 as a direct match instead of dropping
+        # straight to Suspense. customer_id stays NULL on the payment
+        # (there's nothing to backfill it with); run_phase_2's direct-match
+        # pass allocates against exactly this invoice, bypassing customer
+        # scoping entirely.
         if narration_match:
             payment = await dao.insert_payment(
                 bank_txn_id=bank_txn_id,
@@ -916,6 +960,144 @@ async def run_phase_2(
             }
         )
 
+    async def _commit_direct_group_match(item: dict, invoices: list[dict], rule: dict) -> None:
+        """Writes a Sequential Narration Match for a payment with no
+        customer identified anywhere, same precondition as
+        `_commit_direct_match`, but for a GROUP of invoices sharing one
+        narration-matched field value (e.g. raw:Business_Partner_Code)
+        instead of a single invoice number (2026-08d). Runs the same
+        oldest-due-first waterfall `sequential_amount_match` uses
+        (`allocation.sequential_waterfall`) across the whole group, so one
+        payment can settle several customer-less invoices at once instead
+        of dumping its entire amount on just the first one. `invoices` is
+        already the *live* subset of `unresolved_invoices` matching this
+        outcome's group (some may have been closed by an earlier payment
+        this same run - already excluded by the caller); `rule` is the
+        specific `sequential-narration-match` NARRATION_CHECK row that
+        found this group, used for the match_group's rule_id/confidence -
+        unlike `_commit_direct_match` there's no separate ALLOCATION-phase
+        gate row for this path, the firing rule's own enabled state is the
+        only gate needed."""
+        payment_id = item["payment_id"]
+        bank_txn = item["bank_txn"]
+        bank_txn_id = bank_txn["bank_txn_id"]
+        amount = bank_txn["amount_minor"]
+
+        open_invoices = [inv for inv in invoices if inv["balance_due_minor"] > 0]
+        if amount <= 0 or not open_invoices:
+            await _unapplied(item, None)
+            return
+
+        allocations, settles = sequential_waterfall(amount, open_invoices, bank_txn)
+        if not allocations:
+            await _unapplied(item, None)
+            return
+
+        base = waterfall_outcome(allocations, settles)
+        labels = [inv.get("document_number") or inv["invoice_number"] for inv in open_invoices[: len(allocations)]]
+        if len(allocations) == 1:
+            reason = f"{labels[0]!r} in narration - no customer identified, {base.reason}"
+        else:
+            label_str = ", ".join(repr(label) for label in labels)
+            reason = f"{label_str} share the same narration reference - no customer identified, {base.reason}"
+
+        match_group = await dao.insert_match_group(
+            run_id=run_id,
+            match_type=base.match_type,
+            rule_id=rule["rule_id"],
+            confidence=rule["confidence"],
+            status="AUTO_MATCHED",
+            reason=reason,
+        )
+
+        cash_applied = 0
+        still_open: list[str] = []
+        shortfall_total_minor = 0
+        posted_allocations: list[dict] = []
+        for alloc in allocations:
+            if alloc.cash_minor <= 0:
+                continue
+            invoice = next(i for i in open_invoices if i["invoice_id"] == alloc.invoice_id)
+            close_amount = invoice["balance_due_minor"] if alloc.close_full else alloc.cash_minor
+            await dao.apply_invoice_allocation(alloc.invoice_id, close_amount)
+            await dao.insert_invoice_allocation(
+                match_group_id=match_group["match_group_id"],
+                invoice_id=alloc.invoice_id,
+                payment_id=payment_id,
+                bank_txn_id=bank_txn_id,
+                allocated_minor=alloc.cash_minor,
+            )
+            gap_minor = close_amount - alloc.cash_minor
+            posted_allocations.append(
+                {
+                    "invoice_id": alloc.invoice_id,
+                    "cash_minor": alloc.cash_minor,
+                    "gap_minor": gap_minor,
+                    "gap_role": alloc.gap_role if gap_minor > 0 else None,
+                }
+            )
+            invoice["balance_due_minor"] = max(0, invoice["balance_due_minor"] - close_amount)
+            touched_invoice_ids.add(alloc.invoice_id)
+            cash_applied += alloc.cash_minor
+            if invoice["balance_due_minor"] <= 0:
+                unresolved_invoices[:] = [
+                    i for i in unresolved_invoices if i["invoice_id"] != alloc.invoice_id
+                ]
+            else:
+                still_open.append(alloc.invoice_id)
+                shortfall_total_minor += invoice["balance_due_minor"]
+
+        await dao.apply_payment_allocation(payment_id, cash_applied)
+        leftover = amount - cash_applied
+
+        if still_open:
+            if shortfall_total_minor > short_pay_tolerance_minor:
+                inv_nums = [
+                    next((i["invoice_number"] for i in open_invoices if i["invoice_id"] == inv_id), inv_id[:8])
+                    for inv_id in still_open
+                ]
+                inv_str = ", ".join(inv_nums)
+                ref_str = _ref_str(bank_txn)
+                shortfall_fmt = f"₹{shortfall_total_minor / 100:,.2f}"
+                short_pay_reason = f"Unidentified payment short-paid {inv_str} by {shortfall_fmt}{ref_str}"
+                await dao.insert_exception(
+                    run_id=run_id,
+                    exception_type="SHORT_PAY",
+                    bank_txn_id=bank_txn_id,
+                    customer_id=None,
+                    discrepancy_minor=shortfall_total_minor,
+                    reason_code=short_pay_reason,
+                    detail={
+                        "invoice_ids": still_open,
+                        "shortfall_minor": shortfall_total_minor,
+                        "tolerance_minor": short_pay_tolerance_minor,
+                        "invoice_numbers": inv_nums,
+                    },
+                    match_group_id=match_group["match_group_id"],
+                )
+                money["exception"] += amount
+                counts["short_pay"] += 1
+            else:
+                money["matched"] += amount
+                counts["matched"] += 1
+            await dao.mark_bank_statement_status(bank_txn_id, "PARTIAL")
+        else:
+            await dao.mark_bank_statement_status(bank_txn_id, "MATCHED")
+            money["matched"] += amount
+            counts["matched"] += 1
+
+        money["unapplied"] += max(0, leftover)
+        payment_ledger_records.append(
+            {
+                "payment_id": payment_id,
+                "bank_txn_id": bank_txn_id,
+                "customer_id": None,
+                "currency": bank_txn["currency"],
+                "unapplied_minor": max(0, leftover),
+                "allocations": posted_allocations,
+            }
+        )
+
     # --- Pass A: pooled payments only (candidate_pool, from Phase 1b) - a
     # locked payment (outcome["customer_id"] already set by Phase 1a, an
     # independently confirmed identity) skips straight into `pending` for
@@ -925,6 +1107,23 @@ async def run_phase_2(
     # see run_phase_2's docstring), 0 matches -> Suspense with no suggestion.
     pending: list[tuple[dict, str]] = []  # (item, resolved_customer_id) for Pass B
     for outcome in outcomes:
+        if outcome.get("direct_invoice_group"):
+            # No customer anywhere - resolved by run_phase_1's
+            # sequential-narration-match group fallback (2026-08d). Bypasses
+            # Pass A/B's customer-scoped machinery entirely, same as
+            # direct_invoice_id below, but settles the whole group via the
+            # same oldest-due-first waterfall sequential_amount_match uses.
+            group_invoices = [
+                i for i in unresolved_invoices if i["invoice_id"] in outcome["direct_invoice_group"]
+            ]
+            if not group_invoices:
+                # Every invoice in the group was already closed by another
+                # payment earlier in this same run.
+                await _unapplied(outcome, None)
+            else:
+                await _commit_direct_group_match(outcome, group_invoices, outcome["direct_invoice_group_rule"])
+            continue
+
         if outcome.get("direct_invoice_id"):
             # No customer anywhere (payment or invoice) - resolved by
             # run_phase_1's direct-match fallback. Bypasses Pass A/B's
@@ -1149,8 +1348,16 @@ async def run_phase_2(
     # every run until a narration-based invoice-number match (or a human)
     # resolves the customer, at which point the invoice moves into the
     # normal invoices_by_customer working set and stops appearing here.
+    # Skips anything already in touched_invoice_ids (2026-08e fix) - a
+    # customer-less invoice that received a *partial* settlement this run
+    # (via _commit_direct_match/_commit_direct_group_match) already raises
+    # its own SHORT_PAY exception; without this guard it also fell through
+    # here and got a second, redundant "has no linked customer" exception
+    # for the exact same event, same reasoning as the No-Payment sweep
+    # above (which already checks touched_invoice_ids for the
+    # customer-locked case) - this sweep just never had the same guard.
     for inv in unresolved_invoices:
-        if inv["balance_due_minor"] <= 0:
+        if inv["balance_due_minor"] <= 0 or inv["invoice_id"] in touched_invoice_ids:
             continue
         bal_fmt = f"₹{inv['balance_due_minor'] / 100:,.2f}"
         reason = f"Invoice {inv['invoice_number']} ({bal_fmt}) has no linked customer - cannot be reconciled"

@@ -237,6 +237,63 @@ def narration_invoice_owner(
     return None
 
 
+async def narration_group_match(bank_txn: dict, ctx: RuleContext, config: dict) -> dict | None:
+    """The "Sequential Narration Match" identification helper (kind
+    `sequential-narration-match`). Like `narration_invoice_owner`, called
+    directly by `engine.py::run_phase_1` in the no-customer-anywhere
+    branch, not dispatched through `IDENTIFICATION_RULES`. Thin wrapper
+    around `matchers.find_matches` - that already collects every open
+    invoice whose `config['source_field']` matches the narration, not just
+    the first (2026-08 fix); this adds the one thing find_matches doesn't
+    do itself: deciding which of those matches are actually trustworthy
+    standalone evidence for THIS payment, so engine.py's no-customer path
+    can hand the safe subset to allocation.py's `sequential_waterfall`
+    instead of dumping the full payment on one invoice.
+
+    A matched invoice is kept only if its `source_field` value is unique
+    across *every currently open invoice* (`ctx.all_open_invoices`), not
+    just among this narration's matches (2026-08e fix - the original
+    version required the matches to collapse to exactly one distinct
+    value, which got this backwards both ways: a genuinely 1:1 field like
+    document_number/invoice_number naturally produces one DIFFERENT value
+    per invoice, so two independently-named invoices - the whole point of
+    a multi-invoice narration like "...INV-2026-111A INV-2026-111B..." -
+    used to look like two distinct values and get declined as "ambiguous";
+    meanwhile a field several invoices genuinely share, like
+    raw:Business_Partner_Code, always collapsed to exactly one bucket
+    containing every one of that customer's open invoices, which is
+    exactly the over-grouping bug this replaces).
+
+    This makes the policy fully generic - it needs no hardcoded knowledge
+    of which fields are "supposed to" be unique. A value that happens to be
+    unique among today's open invoices (whether that's inherent, like a
+    document number, or incidental, like a partner code this customer only
+    has one open invoice under right now) is trusted; a value several open
+    invoices currently share is not, because a single narration mention of
+    it is customer-level evidence at best, not proof this specific payment
+    covers all of that customer's invoices. Any rule pointed at a new field
+    in the future gets this same, correct behavior automatically - nothing
+    here needs to change per field."""
+    matches = await matchers.find_matches(bank_txn, ctx, config)
+    if not matches:
+        return None
+    source_field = config.get("source_field", "")
+    value_counts: dict[str, int] = {}
+    for inv in ctx.all_open_invoices:
+        value = matchers.get_source_value(inv, source_field)
+        if value is not None:
+            value_counts[str(value)] = value_counts.get(str(value), 0) + 1
+    group = [
+        cand
+        for cand in matches
+        if (value := matchers.get_source_value(cand, source_field)) is not None
+        and value_counts.get(str(value), 0) == 1
+    ]
+    if not group:
+        return None
+    return {"invoice_ids": [str(inv["invoice_id"]) for inv in group]}
+
+
 IDENTIFICATION_RULES: dict[str, RuleFn] = {
     "dup-utr": dup_utr_check,
     "expected-utr": utr_match,

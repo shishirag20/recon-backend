@@ -20,6 +20,7 @@ from app.reconciliation.constants import (
     PHASE_CUSTOMER_LOCK,
     PHASE_GL_CHECK,
     PHASE_INTAKE_VALIDATION,
+    PHASE_NARRATION_CHECK,
     PHASE_SHORT_PAY,
     PHASE_UNAPPLIED,
     ReconciliationErrors,
@@ -33,6 +34,16 @@ from app.reconciliation.rules import generic_functions, matchers
 from app.reconciliation.rules.matchers import MATCHER_KINDS, SOURCE_KINDS
 from app.reconciliation.rules.pooling import POOLING_RULES
 
+# NARRATION_CHECK's two kinds aren't dispatched through a per-kind registry
+# the way IDENTIFICATION_RULES/POOLING_RULES/ALLOCATION_RULES are -
+# engine.py calls narration_invoice_owner/narration_group_match directly,
+# not by kind lookup (see their own docstrings). This set exists purely so
+# `create_rule`/`update_rule` below can validate `kind` for this phase
+# instead of always 400ing (2026-08 fix - NARRATION_CHECK used to have no
+# registry entry at all, so no rule could ever be created here; 2026-08d
+# adds the second kind, sequential-narration-match).
+_NARRATION_CHECK_KINDS = frozenset({"invoice-number-in-narration", "sequential-narration-match"})
+
 # Which rule-dispatch registry validates `kind` for a given phase - the two
 # threshold-only phases (SHORT_PAY/UNAPPLIED/GL_CHECK aren't in here, they're
 # checked separately below) since they're read directly, not dispatched
@@ -42,8 +53,16 @@ _REGISTRY_BY_PHASE = {
     PHASE_CUSTOMER_LOCK: IDENTIFICATION_RULES,
     PHASE_CANDIDATE_POOL: POOLING_RULES,
     PHASE_ALLOCATION: ALLOCATION_RULES,
+    PHASE_NARRATION_CHECK: _NARRATION_CHECK_KINDS,
 }
 _THRESHOLD_ONLY_PHASES = frozenset({PHASE_SHORT_PAY, PHASE_UNAPPLIED, PHASE_GL_CHECK})
+
+# kind="field-match" (CUSTOMER_LOCK/CANDIDATE_POOL) and kind=
+# "sequential-narration-match" (NARRATION_CHECK, 2026-08d) share the exact
+# same config shape (matcher/bank_field/source/source_field - see
+# matchers.find_matches/narration_group_match), so the same validation
+# applies to both.
+_FIELD_MATCH_LIKE_KINDS = frozenset({"field-match", "sequential-narration-match"})
 
 
 def _validate_field_match_config(config: dict) -> None:
@@ -202,17 +221,16 @@ class ReconciliationService:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RULE_KIND)
         else:
             # phase in RECON_PHASES doesn't imply phase in _REGISTRY_BY_PHASE
-            # - NARRATION_CHECK is a real phase with no per-kind registry at
-            # all (its one rule, invoice-number-in-narration, is called
-            # directly by engine.py, never dispatched through a kind lookup)
             # - a bare `_REGISTRY_BY_PHASE[phase]` KeyError'd straight into
-            # an unhandled 500 for that phase instead of a clean 400
-            # (2026-08 fix).
+            # an unhandled 500 for any phase missing an entry instead of a
+            # clean 400 (2026-08 fix). NARRATION_CHECK's entry is a bare
+            # kind set (_NARRATION_CHECK_KINDS), not a dispatchable
+            # RuleFn registry like the others - see its own comment.
             registry = _REGISTRY_BY_PHASE.get(phase)
             if registry is None or kind not in registry:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, ReconciliationErrors.INVALID_RULE_KIND)
 
-        if kind == "field-match":
+        if kind in _FIELD_MATCH_LIKE_KINDS:
             _validate_field_match_config(config)
 
         try:
