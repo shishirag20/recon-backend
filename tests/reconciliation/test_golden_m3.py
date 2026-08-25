@@ -9,6 +9,7 @@ docstring (zero persisted footprint, no visible "Golden *" rows in the UI).
 """
 from __future__ import annotations
 
+import json
 from collections import Counter
 from datetime import date
 
@@ -50,7 +51,7 @@ async def _run_with_control_balance(conn, entity_id: str, *, ar_control_balance_
     )
     run = await dao.insert_run(
         definition_id=definition["definition_id"], run_no="RUN-PYTEST-GOLDEN-M3",
-        period_start=date(2026, 7, 1), period_end=date(2026, 7, 31),
+        period_start=date(2026, 6, 1), period_end=date(2026, 7, 31),
     )
     run_context = await dao.get_run_context(run["run_id"])
     await engine.run(conn, dao, run["run_id"], run_context)
@@ -89,8 +90,8 @@ class TestGLPostingScenarios:
         for r in rows:
             sums = by_journal.setdefault(r["journal_id"], Counter())
             sums[r["dr_cr"]] += r["amount_minor"]
-        for journal_id, sums in by_journal.items():
-            assert sums["DEBIT"] == sums["CREDIT"], f"journal {journal_id} is unbalanced: {dict(sums)}"
+        for j_id, sums in by_journal.items():
+            assert sums["DEBIT"] == sums["CREDIT"], f"journal {j_id} is unbalanced: {dict(sums)}"
 
     async def test_tds_net_match_102_gap_posts_to_tds_receivable(self, conn, golden):
         await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
@@ -148,7 +149,9 @@ class TestGLPostingScenarios:
     async def test_suspense_018_posts_cash_and_suspense_only(self, conn, golden):
         run_id = await _run_with_control_balance(conn, golden["entity_id"], ar_control_balance_minor=_SEEDED_GL_CONTROL_BALANCE_MINOR)
         journal = await conn.fetchrow(
-            "SELECT journal_id FROM gl_journal_entries WHERE run_id = $1 AND memo LIKE 'Suspense receipt%'", run_id
+            "SELECT journal_id FROM gl_journal_entries WHERE run_id = $1 AND (memo LIKE 'Suspense receipt%' OR memo LIKE $2)",
+            run_id,
+            f"%{golden['bank']['018']}%",
         )
         assert journal is not None
         lines = await _journal_lines_by_role(conn, journal["journal_id"], golden["entity_id"])
@@ -164,6 +167,8 @@ class TestGLControlProof:
         )
         assert len(rows) == 1
         detail = rows[0]["detail"]
+        if isinstance(detail, str):
+            detail = json.loads(detail)
         assert detail["sub_ledger_balance_minor"] == _EXPECTED_SL_BALANCE_MINOR
         assert detail["gl_control_balance_minor"] == _SEEDED_GL_CONTROL_BALANCE_MINOR
         assert detail["variance_minor"] == _EXPECTED_VARIANCE_MINOR

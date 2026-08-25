@@ -121,8 +121,15 @@ class ReconciliationDAO:
         return out
 
     async def insert_rule(
-        self, definition_id: str, *, phase: str, kind: str, name: str, priority: int,
-        confidence: int | None, config: dict,
+        self,
+        definition_id: str,
+        *,
+        phase: str,
+        kind: str,
+        name: str,
+        priority: int,
+        confidence: int | None,
+        config: dict,
     ) -> dict:
         """Adds one rule to an existing definition's catalog, post-creation
         - unlike insert_rules_bulk, which only ever runs once, at
@@ -135,7 +142,13 @@ class ReconciliationDAO:
             "(rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config) "
             "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true, $6, $7::jsonb) "
             "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
-            definition_id, phase, kind, name, priority, confidence, config,
+            definition_id,
+            phase,
+            kind,
+            name,
+            priority,
+            confidence,
+            config,
         )
         return _row(row)
 
@@ -156,15 +169,26 @@ class ReconciliationDAO:
         return _row(row)
 
     async def update_rule(
-        self, rule_id: str, *, enabled: bool | None, confidence: int | None = None, config: dict | None = None
+        self,
+        rule_id: str,
+        *,
+        enabled: bool | None,
+        confidence: int | None = None,
+        name: str | None = None,
+        config: dict | None = None,
     ) -> dict | None:
         row = await self.conn.fetchrow(
-            "UPDATE reconciliation_rules SET enabled = COALESCE($2, enabled), confidence = COALESCE($3, confidence), config = COALESCE($4::jsonb, config) "
+            "UPDATE reconciliation_rules SET "
+            "enabled = COALESCE($2, enabled), "
+            "confidence = COALESCE($3, confidence), "
+            "name = COALESCE($4, name), "
+            "config = COALESCE($5::jsonb, config) "
             "WHERE rule_id = $1 "
             "RETURNING rule_id, definition_id, phase, kind, name, priority, enabled, confidence, config",
             rule_id,
             enabled,
             confidence,
+            name,
             config,
         )
         return _row(row)
@@ -288,7 +312,8 @@ class ReconciliationDAO:
                 entity_id,
             )
             await self.conn.execute(
-                "DELETE FROM reconciliation_runs WHERE definition_id = $1", definition_id
+                "DELETE FROM reconciliation_runs WHERE definition_id = $1",
+                definition_id,
             )
             await self.conn.execute(
                 "UPDATE invoices SET balance_due_minor = total_amount_minor, status = 'OPEN' "
@@ -343,7 +368,9 @@ class ReconciliationDAO:
         )
         return _row(row)
 
-    async def list_candidate_bank_inflows(self, entity_id: str, period_start=None, period_end=None) -> list[dict]:
+    async def list_candidate_bank_inflows(
+        self, entity_id: str, period_start=None, period_end=None
+    ) -> list[dict]:
         """Unreconciled credit inflows for this entity - the rows Phase 1
         attempts to identify a paying customer for. Excludes `is_bank_charge`
         rows entirely; the engine routes those straight to GL posting (M3),
@@ -352,7 +379,8 @@ class ReconciliationDAO:
         rule needs it and reuses this same row dict rather than re-querying."""
         rows = await self.conn.fetch(
             "SELECT bank_txn_id, transaction_date, bank_reference, document_number, narration, payer_name, "
-            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, dr_cr "
+            "payer_account_no, payer_ifsc, amount_minor, amount_home_minor, currency, explicit_fee_minor, dr_cr, "
+            "raw->>'bank_txn_id' AS bank_txn_source_id "
             "FROM bank_statements "
             "WHERE entity_id = $1 AND recon_status = 'PENDING' AND is_bank_charge = false "
             "AND ($2::date IS NULL OR transaction_date >= $2) "
@@ -655,7 +683,9 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
-    async def list_open_invoices_for_entity(self, entity_id: str, search: str | None, limit: int) -> list[dict]:
+    async def list_open_invoices_for_entity(
+        self, entity_id: str, search: str | None, limit: int
+    ) -> list[dict]:
         """The Suspense resolution panel's "match to a different invoice"
         fallback - every open invoice across every customer, not scoped to
         one candidate (unlike list_open_invoices_for_customer above), so a
@@ -669,7 +699,9 @@ class ReconciliationDAO:
             "WHERE i.entity_id = $1 AND i.balance_due_minor > 0 "
             "AND ($2::text IS NULL OR i.invoice_number ILIKE '%' || $2 || '%' OR c.company_name ILIKE '%' || $2 || '%') "
             "ORDER BY i.due_date LIMIT $3",
-            entity_id, search, limit,
+            entity_id,
+            search,
+            limit,
         )
         return _rows(rows)
 
@@ -693,7 +725,9 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
-    async def auto_resolve_suspense_for_payment(self, payment_id: str, note: str | None) -> None:
+    async def auto_resolve_suspense_for_payment(
+        self, payment_id: str, note: str | None
+    ) -> None:
         """Cross-resolves a payment's own open Suspense exception once it
         gets manually matched from the invoice side - matches the
         prototype's "Automatically resolved via matched No Payment Received"
@@ -705,7 +739,8 @@ class ReconciliationDAO:
             "resolution_notes = COALESCE(resolution_notes, $2), resolved_at = now() "
             "WHERE bank_txn_id = (SELECT bank_txn_id FROM payments WHERE payment_id = $1) "
             "AND exception_type = 'SUSPENSE' AND status = 'OPEN'",
-            payment_id, note or "Automatically resolved via matched No Payment Received",
+            payment_id,
+            note or "Automatically resolved via matched No Payment Received",
         )
 
     async def lock_payment_customer(
@@ -723,7 +758,13 @@ class ReconciliationDAO:
 
     # -- M3: gl_journal_entries/gl_journal_lines/gl_control_balances -----------------
     async def insert_journal(
-        self, *, entity_id: str, run_id: str | None, posting_date, source_type: str, memo: str | None,
+        self,
+        *,
+        entity_id: str,
+        run_id: str | None,
+        posting_date,
+        source_type: str,
+        memo: str | None,
         lines: list[dict],
     ) -> str:
         """Inserts one gl_journal_entries header plus every line in `lines`
@@ -735,7 +776,11 @@ class ReconciliationDAO:
             journal = await self.conn.fetchrow(
                 "INSERT INTO gl_journal_entries (journal_id, entity_id, run_id, posting_date, source_type, memo) "
                 "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5) RETURNING journal_id",
-                entity_id, run_id, posting_date, source_type, memo,
+                entity_id,
+                run_id,
+                posting_date,
+                source_type,
+                memo,
             )
             journal_id = journal["journal_id"]
             for i, line in enumerate(lines, start=1):
@@ -743,18 +788,27 @@ class ReconciliationDAO:
                     "INSERT INTO gl_journal_lines "
                     "(line_id, journal_id, line_number, gl_account_id, dr_cr, currency, amount_minor, amount_home_minor, business_partner_id) "
                     "VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $6, $7)",
-                    journal_id, i, line["gl_account_id"], line["dr_cr"], line["currency"],
-                    line["amount_minor"], line.get("business_partner_id"),
+                    journal_id,
+                    i,
+                    line["gl_account_id"],
+                    line["dr_cr"],
+                    line["currency"],
+                    line["amount_minor"],
+                    line.get("business_partner_id"),
                 )
         return str(journal_id)
 
-    async def link_allocation_journal(self, invoice_id: str, payment_id: str, journal_id: str) -> None:
+    async def link_allocation_journal(
+        self, invoice_id: str, payment_id: str, journal_id: str
+    ) -> None:
         """Back-fills invoice_allocations.gl_journal_id once the JE that
         covers it has posted - lets a later query trace an allocation to its
         journal entry without re-deriving it."""
         await self.conn.execute(
             "UPDATE invoice_allocations SET gl_journal_id = $3 WHERE invoice_id = $1 AND payment_id = $2",
-            invoice_id, payment_id, journal_id,
+            invoice_id,
+            payment_id,
+            journal_id,
         )
 
     async def list_pending_bank_charges(self, entity_id: str) -> list[dict]:
@@ -779,11 +833,14 @@ class ReconciliationDAO:
         )
         return row["total"]
 
-    async def get_gl_control_balance(self, gl_account_id: str, period_date) -> dict | None:
+    async def get_gl_control_balance(
+        self, gl_account_id: str, period_date
+    ) -> dict | None:
         row = await self.conn.fetchrow(
             "SELECT balance_id, gl_account_id, period_date, control_balance_minor "
             "FROM gl_control_balances WHERE gl_account_id = $1 AND period_date = $2",
-            gl_account_id, period_date,
+            gl_account_id,
+            period_date,
         )
         return _row(row)
 
@@ -813,6 +870,7 @@ class ReconciliationDAO:
             "  'invoice_amount_minor', inv.total_amount_minor, "
             "  'payment_id', a.payment_id, 'payment_amount_minor', p.total_received_minor, "
             "  'bank_txn_id', a.bank_txn_id, 'document_number', COALESCE(bs.document_number, bs.raw->>'bank_txn_id'), 'bank_reference', bs.bank_reference, "
+            "  'bank_txn_source_id', bs.raw->>'bank_txn_id', "
             "  'allocated_minor', a.allocated_minor"
             ") ORDER BY a.allocated_at) FILTER (WHERE a.allocation_id IS NOT NULL), '[]') AS allocations "
             "FROM match_groups m "
@@ -825,7 +883,9 @@ class ReconciliationDAO:
         )
         return _rows(rows)
 
-    async def list_exceptions_for_run(self, run_id: str, status: str | None) -> list[dict]:
+    async def list_exceptions_for_run(
+        self, run_id: str, status: str | None
+    ) -> list[dict]:
         rows = await self.conn.fetch(
             "SELECT e.exception_id, e.run_id, e.exception_no, e.exception_type, e.bank_txn_id, e.invoice_id, e.customer_id, "
             "COALESCE("
@@ -843,6 +903,7 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.raw->>'bank_txn_id' AS bank_txn_source_id, "
             "bs.payer_name, "
             "bs.narration, "
             "COALESCE("
@@ -860,7 +921,8 @@ class ReconciliationDAO:
             "LEFT JOIN bank_statements bs ON bs.bank_txn_id = e.bank_txn_id "
             "WHERE e.run_id = $1 AND ($2::text IS NULL OR e.status = $2) "
             "ORDER BY e.created_at",
-            run_id, status,
+            run_id,
+            status,
         )
         return _rows(rows)
 
@@ -882,6 +944,7 @@ class ReconciliationDAO:
             "c.customer_code, "
             "inv.invoice_number, "
             "bs.bank_reference, "
+            "bs.raw->>'bank_txn_id' AS bank_txn_source_id, "
             "bs.payer_name, "
             "bs.narration, "
             "COALESCE("
@@ -903,8 +966,14 @@ class ReconciliationDAO:
         return _row(row)
 
     async def update_exception(
-        self, exception_id: str, *, status: str | None, resolution_outcome: str | None,
-        resolution_notes: str | None, resolver_id: str | None, match_group_id: str | None = None,
+        self,
+        exception_id: str,
+        *,
+        status: str | None,
+        resolution_outcome: str | None,
+        resolution_notes: str | None,
+        resolver_id: str | None,
+        match_group_id: str | None = None,
     ) -> dict | None:
         """`resolved_at` is stamped automatically the moment `status` moves
         away from `OPEN`/`INVESTIGATING` - the caller doesn't set it directly.
@@ -923,7 +992,12 @@ class ReconciliationDAO:
             "RETURNING exception_id, run_id, exception_no, exception_type, bank_txn_id, invoice_id, customer_id, "
             "discrepancy_minor, reason_code, status, resolution_outcome, resolver_id, resolution_notes, "
             "resolved_at, created_at, detail, match_group_id",
-            exception_id, status, resolution_outcome, resolution_notes, resolver_id, match_group_id,
+            exception_id,
+            status,
+            resolution_outcome,
+            resolution_notes,
+            resolver_id,
+            match_group_id,
         )
         return _row(row)
 

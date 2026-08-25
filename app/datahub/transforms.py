@@ -6,6 +6,7 @@ two operations (e.g. "flip sign, then convert to minor units") is handled by
 TO_MINOR_UNITS' own `negate` transform_param rather than composing transforms,
 since field_mappings intentionally has one transform column, not a pipeline.
 """
+
 from __future__ import annotations
 
 import re
@@ -112,11 +113,17 @@ def apply_transform(raw_value, transform: str, transform_param: str | None):
         # transaction row under it blank. By the time this function sees the
         # value it's never actually blank, so no cross-row state belongs
         # here - apply_transform stays a pure, single-value function.
-        formats = [f.strip() for f in transform_param.split(",")] if transform_param else list(_DEFAULT_DATE_FORMATS)
+        formats = (
+            [f.strip() for f in transform_param.split(",")]
+            if transform_param
+            else list(_DEFAULT_DATE_FORMATS)
+        )
         text = raw_value.strip()
         for fmt in formats:
             try:
-                return datetime.strptime(text, fmt).date()  # a real `date`, not a string - asyncpg needs the native type
+                return datetime.strptime(
+                    text, fmt
+                ).date()  # a real `date`, not a string - asyncpg needs the native type
             except ValueError:
                 continue
         raise ValueError(f"could not parse date {raw_value!r} with formats {formats}")
@@ -167,7 +174,11 @@ def apply_fill_down(rows: list[dict], mappings: list) -> list[dict]:
     called on any individual row - apply_mapping/apply_transform stay pure,
     single-row functions with no cross-row memory of their own. A no-op
     (returns `rows` unchanged) when no active mapping uses FILL_DOWN."""
-    fill_down_sources = {normalize_header(m["source_field"]) for m in mappings if m["transform"] == "FILL_DOWN"}
+    fill_down_sources = {
+        normalize_header(m["source_field"])
+        for m in mappings
+        if m["transform"] == "FILL_DOWN"
+    }
     if not fill_down_sources:
         return rows
     last_seen: dict[str, str] = {}
@@ -214,8 +225,14 @@ def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
         raw_value = normalized_raw.get(normalized_source)
         try:
             value = apply_transform(raw_value, m["transform"], m["transform_param"])
-            if canonical_field in _MONEY_CANONICAL_FIELDS and value is not None and not isinstance(value, int):
-                raise ValueError(f"{canonical_field} requires TO_MINOR_UNITS, got transform {m['transform']!r}")
+            if (
+                canonical_field in _MONEY_CANONICAL_FIELDS
+                and value is not None
+                and not isinstance(value, int)
+            ):
+                raise ValueError(
+                    f"{canonical_field} requires TO_MINOR_UNITS, got transform {m['transform']!r}"
+                )
             # First non-None value for this canonical_field wins. A later
             # synonym that's blank *for this row* (column exists, cell is
             # empty - e.g. Customers.csv's own `customer_code` column is
@@ -223,6 +240,8 @@ def apply_mapping(raw_row: dict, mappings: list) -> tuple[dict, list[str]]:
             # must not clobber a value an earlier synonym already found.
             if canonical.get(canonical_field) is None:
                 canonical[canonical_field] = value
-        except Exception as exc:  # noqa: BLE001 - a bad field is a data issue, not a worker crash
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - a bad field is a data issue, not a worker crash
             issues.append(f"{source_field} -> {canonical_field}: {exc}")
     return canonical, issues

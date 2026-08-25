@@ -11,6 +11,7 @@ pytest + rolled-back-transaction convention as the golden tests.
 """
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
@@ -55,7 +56,7 @@ class TestShortPayThreshold:
         await dao.insert_rules_bulk(definition["definition_id"], list(DEFAULT_AR_RULE_CATALOG))
         await dao.seed_gl_account_roles(golden["entity_id"])
         await _set_threshold(conn, definition["definition_id"], PHASE_SHORT_PAY, 170_000)
-        run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-THRESH-SP", period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+        run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-THRESH-SP", period_start=None, period_end=None)
         run_context = await dao.get_run_context(run["run_id"])
         await engine.run(conn, dao, run["run_id"], run_context)
 
@@ -134,7 +135,10 @@ class TestGlCheckThreshold:
 
         rows = await conn.fetch("SELECT * FROM reconciliation_exceptions WHERE run_id = $1 AND exception_type = 'GL_VARIANCE'", run["run_id"])
         assert len(rows) == 1
-        assert rows[0]["detail"]["variance_minor"] == 50
+        detail = rows[0]["detail"]
+        if isinstance(detail, str):
+            detail = json.loads(detail)
+        assert detail["variance_minor"] == 50
 
     async def test_small_variance_suppressed_above_tolerance(self, conn):
         entity_id, invoice_id, dao = await self._seed_open_invoice(conn, balance_minor=100_000, control_balance_minor=99_950)

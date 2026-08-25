@@ -41,6 +41,18 @@ from app.reconciliation.rules.identification import (
 from app.reconciliation.rules.pooling import POOLING_RULES
 
 
+def _ref_str(bank_txn: dict) -> str:
+    """" (ref XXX)" suffix for exception/short-pay reason text - prefers the
+    source file's own transaction id (bank_txn_source_id, e.g. 'BANK-001',
+    pulled from bank_statements.raw) over bank_reference (the UTR/reference
+    number), since that's what a user actually recognizes their row by when
+    scanning the exceptions list against their upload - bank_reference is
+    the internal reconciliation key, not what's printed on the row (2026-08
+    fix). Empty string if neither is present."""
+    ref = bank_txn.get("bank_txn_source_id") or bank_txn.get("bank_reference")
+    return f" (ref {ref})" if ref else ""
+
+
 async def run(
     conn: asyncpg.Connection, dao: ReconciliationDAO, run_id: str, run_context: dict
 ) -> dict:
@@ -129,23 +141,25 @@ async def run_phase_1(
         key=lambda r: r["priority"],
     )
 
+    # Ordered by (transaction_date, bank_txn_id) - list_candidate_bank_inflows's
+    # own ORDER BY - so "first occurrence" here is deterministic, even though
+    # bank_txn_id (a random UUID) has no real relationship to which payment
+    # actually arrived first; there's no reliable file/insertion order tracked
+    # today (line_number is only populated when a source file maps one).
     bank_inflows = await dao.list_candidate_bank_inflows(
         entity_id, period_start, period_end
     )
-    ref_counts = Counter(
-        b["bank_reference"] for b in bank_inflows if b["bank_reference"]
-    )
-    # duplicate_refs_in_run = {ref for ref, count in ref_counts.items() if count > 1}
+    seen_refs: dict[str, str] = {}
     duplicate_bank_txn_ids: set[str] = set()
-    seen_refs_in_run: set[str] = set()
     for b in bank_inflows:
         ref = b["bank_reference"]
         if not ref:
             continue
-        if ref in seen_refs_in_run:
+        if ref in seen_refs:
             duplicate_bank_txn_ids.add(b["bank_txn_id"])
+            duplicate_bank_txn_ids.add(seen_refs[ref])
         else:
-            seen_refs_in_run.add(ref)
+            seen_refs[ref] = b["bank_txn_id"]
     all_open_invoices = await dao.load_open_invoices(entity_id)
     customer_master = await dao.load_customer_master(entity_id)
     cust_name_map = {str(c["customer_id"]): c["company_name"] for c in customer_master}
@@ -184,7 +198,7 @@ async def run_phase_1(
                 break
 
         if intake_result is not None and intake_result.reject:
-            bank_ref = bank_txn.get("bank_reference") or "N/A"
+            bank_ref = bank_txn.get("bank_txn_source_id") or bank_txn.get("bank_reference") or "N/A"
             amt_fmt = f"₹{amount_minor / 100:,.2f}"
             reason = (
                 f"Duplicate payment {amt_fmt} with reference '{bank_ref}' in this run"
@@ -254,9 +268,16 @@ async def run_phase_1(
         # produced something. Searches every customer's open invoices (not
         # just whoever 1a/1b already identified) for one the narration
         # references.
+        crosscheck_cfg = (
+            json.loads(crosscheck_rule["config"])
+            if isinstance(crosscheck_rule["config"], str)
+            else (crosscheck_rule["config"] or {})
+        ) if crosscheck_rule is not None else {}
         narration_match = (
             narration_invoice_owner(
-                bank_txn.get("narration") or "", ctx.all_open_invoices
+                bank_txn.get("narration") or "",
+                ctx.all_open_invoices,
+                fields=crosscheck_cfg.get("match_fields"),
             )
             if crosscheck_rule is not None
             else None
@@ -354,9 +375,11 @@ async def run_phase_1(
             # Phase 1a locked nobody and the pooling rules found nothing
             # either - fall back to the cross-check's own candidate rather
             # than dropping straight to Suspense-with-no-suggestion. Still
-            # just a hint (single-candidate pool), never an auto-lock: Pass A
-            # in run_phase_2 always resolves a pool via Suspense/
-            # Double-Collision, never a silent commit.
+            # just a hint (single-candidate pool) at this point, not an
+            # identification-phase lock - but Pass A in run_phase_2 will
+            # commit it for real if it ends up as the pool's only candidate
+            # with a clean rule match (2026-08 change), same as any other
+            # single-candidate pool.
             # (The None guard matters now that document-number-narration
             # exists as a real rule above this: if it already tried and
             # declined - the referenced invoice has no customer either -
@@ -416,7 +439,7 @@ async def run_phase_1(
         # Neither phase found anything at all - Suspense. Still gets a
         # payments row (money tracked), but nothing for Phase 2 to do.
         payer = bank_txn.get("payer_name") or "Unidentified Remitter"
-        ref = bank_txn.get("bank_reference") or bank_txn_id[:8]
+        ref = bank_txn.get("bank_txn_source_id") or bank_txn.get("bank_reference") or bank_txn_id[:8]
         amt_fmt = f"₹{amount_minor / 100:,.2f}"
         reason = f"{amt_fmt} payment from {payer} (ref {ref}) could not be identified to any customer"
         payment = await dao.insert_payment(
@@ -469,12 +492,16 @@ async def run_phase_2(
 
     Pass A resolves every pooled (candidate_pool, Phase 1b) payment entirely
     on its own: try every candidate through all 9 rules, first-match-wins per
-    candidate. 2+ clean matches -> Double-Collision. Exactly 1 or 0 -> always
-    a Suspense exception (with the suggestion, if any, in `detail`) - a pool
-    is never auto-committed, no matter how clean the eventual invoice match,
-    since nothing independently confirmed the identity (matches the
-    prototype's own `exactAmountRule` probe: even a single clean hit only
-    ever becomes a `suggestedCustomerId` + Suspense, never a real match).
+    candidate. 2+ clean matches -> Double-Collision, a genuine ambiguity (the
+    same amount legitimately matches two different customers' invoices, and
+    nothing here can safely pick one). Exactly 1 clean match -> committed for
+    real via `_commit`, the same path Pass B uses (2026-08 change - a
+    single-candidate pool with a clean rule match used to always be
+    downgraded to a Suspense suggestion, never auto-committed, regardless of
+    how clean the match was; the prototype's own `exactAmountRule` probe did
+    the same, but that call was revisited - a unique candidate plus a
+    non-ambiguous rule match is no weaker a signal than most identification
+    rules already auto-lock on). 0 matches -> Suspense with no suggestion.
     Only a payment Phase 1a locked outright skips straight into Pass B.
 
     Pass B resolves WHICH INVOICE for every payment Phase 1a actually locked.
@@ -506,6 +533,14 @@ async def run_phase_2(
         (r for r in rules if r["phase"] == PHASE_ALLOCATION and r["enabled"]),
         key=lambda r: r["priority"],
     )
+    # Not in ALLOCATION_RULES (never dispatched through the per-customer
+    # cascade - see its catalog comment, constants.py) - it exists as a row
+    # purely so _commit_direct_match's match_groups get a real rule_id/
+    # confidence instead of always None, and so disabling it in Rules Studio
+    # actually stops the no-customer direct-match path from firing (gated at
+    # the Pass A dispatch below), instead of it running unconditionally with
+    # no way to turn it off.
+    direct_match_rule = next((r for r in rules if r["kind"] == "direct-invoice-match" and r["enabled"]), None)
     short_pay_tolerance_minor = get_threshold_minor(rules, PHASE_SHORT_PAY)
     unapplied_tolerance_minor = get_threshold_minor(rules, PHASE_UNAPPLIED)
 
@@ -662,7 +697,7 @@ async def run_phase_2(
                         "invoice_id": alloc.invoice_id,
                         "cash_minor": alloc.cash_minor,
                         "gap_minor": other_gap,
-                        "gap_role": gap_role if other_gap > 0 else None,
+                        "gap_role": (alloc.gl_role or gap_role) if other_gap > 0 else None,
                     }
                 )
             invoice["balance_due_minor"] = max(
@@ -707,11 +742,7 @@ async def run_phase_2(
                     for inv_id in still_open
                 ]
                 inv_str = ", ".join(inv_nums) if inv_nums else "invoice"
-                ref_str = (
-                    f" (ref {bank_txn.get('bank_reference')})"
-                    if bank_txn.get("bank_reference")
-                    else ""
-                )
+                ref_str = _ref_str(bank_txn)
                 shortfall_fmt = f"₹{shortfall_total_minor / 100:,.2f}"
                 reason = f"{cust_name} short-paid {inv_str} by {shortfall_fmt}{ref_str}"
                 await dao.insert_exception(
@@ -766,11 +797,7 @@ async def run_phase_2(
                 else (bank_txn.get("payer_name") or "Unidentified Remitter")
             )
             amt_fmt = f"₹{amount / 100:,.2f}"
-            ref_str = (
-                f" (ref {bank_txn.get('bank_reference')})"
-                if bank_txn.get("bank_reference")
-                else ""
-            )
+            ref_str = _ref_str(bank_txn)
             if customer_id is None:
                 await dao.insert_exception(
                     run_id=run_id,
@@ -893,8 +920,8 @@ async def run_phase_2(
                 if settle.status == "EXACT"
                 else ("PARTIAL" if settle.status == "PARTIAL" else "TOLERANCE")
             ),
-            rule_id=None,
-            confidence=None,
+            rule_id=direct_match_rule["rule_id"] if direct_match_rule else None,
+            confidence=direct_match_rule["confidence"] if direct_match_rule else None,
             status="AUTO_MATCHED",
             reason=reason,
         )
@@ -976,10 +1003,10 @@ async def run_phase_2(
     # --- Pass A: pooled payments only (candidate_pool, from Phase 1b) - a
     # locked payment (outcome["customer_id"] already set by Phase 1a, an
     # independently confirmed identity) skips straight into `pending` for
-    # Pass B. A pool, however many candidates or however clean the eventual
-    # match, is ALWAYS resolved right here as Suspense/Double-Collision -
-    # never deferred into Pass B's auto-commit. Only a locked identity is
-    # trusted enough to write a real match_group.
+    # Pass B. A pool is always resolved right here, never deferred into Pass
+    # B: 2+ clean matches -> Double-Collision (genuine ambiguity, no safe
+    # pick), exactly 1 clean match -> committed for real (2026-08 change -
+    # see run_phase_2's docstring), 0 matches -> Suspense with no suggestion.
     pending: list[tuple[dict, str | None]] = (
         []
     )  # (item, resolved_customer_id) for Pass B
@@ -988,6 +1015,13 @@ async def run_phase_2(
             # No customer anywhere (payment or invoice) - resolved by
             # run_phase_1's direct-match fallback. Bypasses Pass A/B's
             # customer-scoped machinery entirely; see _commit_direct_match.
+            if direct_match_rule is None:
+                # The "Document Number in Narration Match" (ALLOCATION)
+                # catalog row itself is disabled - this definition has opted
+                # out of the no-customer direct-match path entirely, so
+                # there's nothing left to resolve this payment with.
+                await _unapplied(outcome, None)
+                continue
             invoice = next(
                 (
                     i
@@ -1063,11 +1097,7 @@ async def run_phase_2(
         if len(per_candidate_matches) >= 2:
             # Double-Collision: 2+ different candidates each produced a clean match.
             amt_fmt = f"₹{amount / 100:,.2f}"
-            ref_str = (
-                f" (ref {bank_txn.get('bank_reference')})"
-                if bank_txn.get("bank_reference")
-                else ""
-            )
+            ref_str = _ref_str(bank_txn)
             candidate_names = [
                 cust_name_map.get(cid, cid[:8]) for cid, _, _ in per_candidate_matches
             ]
@@ -1228,11 +1258,7 @@ async def run_phase_2(
                 if alloc_result.ambiguous:
                     cust_name = cust_name_map.get(customer_id) or "Customer"
                     amt_fmt = f"₹{amount / 100:,.2f}"
-                    ref_str = (
-                        f" (ref {bank_txn.get('bank_reference')})"
-                        if bank_txn.get("bank_reference")
-                        else ""
-                    )
+                    ref_str = _ref_str(bank_txn)
                     reason = f"{cust_name} payment {amt_fmt}{ref_str} matches more than one open invoice ({alloc_result.reason})"
                     await dao.insert_exception(
                         run_id=run_id,

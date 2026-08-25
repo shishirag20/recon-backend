@@ -131,6 +131,7 @@ class ReconciliationService:
         *,
         enabled: bool | None,
         confidence: int | None = None,
+        name: str | None = None,
         config: dict | None,
     ):
         await self.get_definition(definition_id)

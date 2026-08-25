@@ -74,16 +74,22 @@ async def _promote_unresolved_invoice(
     ctx.invoices_by_customer.setdefault(customer_id, []).append(inv)
 
 
-def _matched_number(narration: str, inv: dict) -> str | None:
-    """invoice_number or document_number (migration 0033), whichever
-    actually appears in narration - either is equally strong evidence of
-    which invoice this is (see narration_invoice_owner's docstring)."""
-    if extract.contains_substring(narration, inv["invoice_number"]):
-        return inv["invoice_number"]
-    if inv.get("document_number") and extract.contains_substring(
-        narration, inv["document_number"]
-    ):
-        return inv["document_number"]
+DEFAULT_NARRATION_MATCH_FIELDS = ("invoice_number", "document_number")
+
+
+def _matched_number(
+    narration: str, inv: dict, fields: list[str] | tuple[str, ...] | None = None
+) -> str | None:
+    """Whichever of `fields` (default: invoice_number, then document_number
+    - migration 0033) actually appears in narration first - either is
+    equally strong evidence of which invoice this is (see
+    narration_invoice_owner's docstring). `fields` comes from the calling
+    rule's own `config['match_fields']` (Rules Studio's "Compares" picker) -
+    genuinely respected here, not just displayed (2026-08 fix)."""
+    for field in fields or DEFAULT_NARRATION_MATCH_FIELDS:
+        value = inv.get(field)
+        if value and extract.contains_substring(narration, value):
+            return value
     return None
 
 
@@ -285,6 +291,7 @@ async def invoice_number_match(
     net_cash = payment["total_received_minor"]
     explicit_fee = bank_txn.get("explicit_fee_minor") or 0
     gross_amount = net_cash + explicit_fee
+    fields = config.get("match_fields")
     for inv in _open_invoices(ctx, customer_id):
         if extract.contains_substring(narration, inv["invoice_number"]):
             applied_gross = min(gross_amount, inv["balance_due_minor"])
@@ -362,11 +369,16 @@ async def exact_balance_match(
     variance) is a deliberate refusal to guess (`ambiguous=True`) - the
     engine turns that into a MULTIPLE_INVOICE_MATCH exception.
 
-    Overpayment is handled separately below: unlike an exact-balance tie,
-    "which invoice is closest to being fully settled" always has a
-    deterministic answer (the smallest excess), so it never needs the
-    ambiguity refusal - unchanged from the old standalone overpay-on-account
-    rule's behavior."""
+    Overpayment is NOT handled here (2026-08 fix) - it used to be, as a
+    fallback at the bottom of this same function, but that let a rough
+    "closest invoice, excess on-account" guess grab a payment before
+    subset-sum (later priority) ever got a chance to check whether it
+    actually splits exactly across 2+ invoices - a strictly better
+    explanation when one exists. Overpayment is its own rule now,
+    `overpay_fallback` (kind "overpayment"), deliberately placed after
+    subset-sum in the catalog so it's only tried once nothing more precise
+    - neither a single clean invoice nor an exact multi-invoice split -
+    explains the payment."""
     amount = payment["total_received_minor"]
     closes = [
         (inv, resolve_invoice_settlement(amount, inv, bank_txn))
@@ -404,25 +416,48 @@ async def exact_balance_match(
             ],
             reason=f"{len(exacts)} invoices tie on {_rupees(amount)}",
         )
-
-    overpaid = [(inv, s) for inv, s in closes if s.status == "OVERPAID"]
-    if overpaid:
-        inv, settle = min(
-            overpaid, key=lambda pair: amount - pair[0]["balance_due_minor"]
-        )
-        return AllocationOutcome(
-            allocations=[
-                InvoiceAllocation(
-                    inv["invoice_id"],
-                    settle.cash_minor,
-                    close_full=settle.close_full,
-                    gl_role=settle.gap_role,
-                )
-            ],
-            match_type="TOLERANCE",
-            reason=settle.reason,
-        )
     return AllocationOutcome()
+
+
+async def overpay_fallback(
+    payment: dict,
+    bank_txn: dict,
+    customer_id: str,
+    ctx: AllocationContext,
+    config: dict,
+) -> AllocationOutcome:
+    """2.8 (after subset-sum, deliberately last-resort) - the payment
+    exceeds some open invoice's balance and nothing more precise explained
+    it: not a single exact/variance match (exact-amount, earlier priority),
+    not an exact multi-invoice split (subset-sum, earlier priority still).
+    Targets whichever invoice has the *smallest* excess (closest match)
+    rather than an arbitrary one - "which invoice is closest to being fully
+    settled" always has a deterministic answer, so this never needs an
+    ambiguity refusal the way exact_balance_match's ties do. The invoice
+    closes fully, the excess is left as on-account credit via the normal
+    payments.unapplied_minor bookkeeping - no separate exception, an
+    overpayment isn't a problem needing review."""
+    amount = payment["total_received_minor"]
+    closes = [
+        (inv, resolve_invoice_settlement(amount, inv, bank_txn))
+        for inv in _open_invoices(ctx, customer_id)
+    ]
+    overpaid = [(inv, s) for inv, s in closes if s.status == "OVERPAID"]
+    if not overpaid:
+        return AllocationOutcome()
+    inv, settle = min(overpaid, key=lambda pair: amount - pair[0]["balance_due_minor"])
+    return AllocationOutcome(
+        allocations=[
+            InvoiceAllocation(
+                inv["invoice_id"],
+                settle.cash_minor,
+                close_full=settle.close_full,
+                gl_role=settle.gap_role,
+            )
+        ],
+        match_type="TOLERANCE",
+        reason=settle.reason,
+    )
 
 
 def _subset_sum_variants(inv: dict, bank_txn: dict) -> list[tuple[int, str | None]]:
@@ -693,6 +728,7 @@ ALLOCATION_RULES: dict[str, RuleFn] = {
     "invoice-suffix": truncated_suffix_match,
     "exact-amount": exact_balance_match,
     "subset-sum": subset_sum_fifo,
+    "overpayment": overpay_fallback,
     "partial-payment": partial_pay,
     "deduction-settlement": deduction_settlement_match,
 }

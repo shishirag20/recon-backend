@@ -183,6 +183,7 @@ async def update_rule(
         str(definition_id),
         str(rule_id),
         enabled=payload.enabled,
+        name=payload.name,
         confidence=payload.confidence,
         config=payload.config,
     )

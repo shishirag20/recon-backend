@@ -224,9 +224,13 @@ async def document_number_match(
     Reuses narration_invoice_owner() - the same search the NARRATION_CHECK
     cross-check (Phase 1c) independently performs after this cascade runs;
     if this rule is what locked the payment, that cross-check will find the
-    same invoice and record agreement rather than raise a mismatch."""
+    same invoice and record agreement rather than raise a mismatch.
+    `config['match_fields']` (Rules Studio's "Compares" picker) genuinely
+    selects which field(s) to check - see narration_invoice_owner."""
     match = narration_invoice_owner(
-        bank_txn.get("narration") or "", ctx.all_open_invoices
+        bank_txn.get("narration") or "",
+        ctx.all_open_invoices,
+        fields=config.get("match_fields"),
     )
     if match is None or match["customer_id"] is None:
         # Either no invoice reference found, or it was found but that
@@ -241,8 +245,13 @@ async def document_number_match(
     )
 
 
+DEFAULT_NARRATION_MATCH_FIELDS = ("invoice_number", "document_number")
+
+
 def narration_invoice_owner(
-    narration: str, all_open_invoices: list[dict]
+    narration: str,
+    all_open_invoices: list[dict],
+    fields: list[str] | tuple[str, ...] | None = None,
 ) -> dict | None:
     """The "Invoice Number in Narration" cross-check (kind
     `invoice-number-in-narration`). Deliberately NOT in `IDENTIFICATION_RULES`
@@ -256,21 +265,22 @@ def narration_invoice_owner(
     is to catch a narration referencing a *different* customer's invoice than
     the one Phase 1a is about to lock.
 
-    Checks both invoice_number and document_number (migration 0033) - some
-    ERP exports label the customer-facing reference "Document Number" rather
-    than "Invoice Number" (see CMR_BOOK_DATA.csv), or carry both as
-    genuinely different values. Either one appearing in narration is
-    equally strong evidence of which invoice this is."""
+    Checks both invoice_number and document_number (migration 0033) by
+    default - some ERP exports label the customer-facing reference "Document
+    Number" rather than "Invoice Number" (see CMR_BOOK_DATA.csv), or carry
+    both as genuinely different values. `fields` (from the calling rule's own
+    `config['match_fields']`, e.g. `invoice-number-in-narration`'s Rules
+    Studio "Compares" picker) can narrow this to just one - genuinely
+    respected here now, not just displayed (2026-08 fix)."""
     if not narration:
         return None
     for inv in all_open_invoices:
         matched_number = None
-        if extract.contains_substring(narration, inv["invoice_number"]):
-            matched_number = inv["invoice_number"]
-        elif inv.get("document_number") and extract.contains_substring(
-            narration, inv["document_number"]
-        ):
-            matched_number = inv["document_number"]
+        for field in fields or DEFAULT_NARRATION_MATCH_FIELDS:
+            value = inv.get(field)
+            if value and extract.contains_substring(narration, value):
+                matched_number = value
+                break
         if matched_number is not None:
             return {
                 # None (migration 0031, an invoice ingested without a

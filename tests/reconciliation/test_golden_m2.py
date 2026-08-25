@@ -174,7 +174,7 @@ async def _run_full_reconciliation(conn, entity_id: str) -> str:
     definition = await dao.insert_definition(entity_id=entity_id, name="Golden AR (pytest)", recon_type="AR", cadence=None, owner_user_id=None)
     await dao.insert_rules_bulk(definition["definition_id"], list(DEFAULT_AR_RULE_CATALOG))
     await dao.seed_gl_account_roles(entity_id)
-    run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-GOLDEN", period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+    run = await dao.insert_run(definition_id=definition["definition_id"], run_no="RUN-PYTEST-GOLDEN", period_start=None, period_end=None)
     run_context = await dao.get_run_context(run["run_id"])
     await engine.run(conn, dao, run["run_id"], run_context)
     return run["run_id"]
@@ -182,12 +182,32 @@ async def _run_full_reconciliation(conn, entity_id: str) -> str:
 
 async def _payment_for(conn, bank_txn_id: str) -> dict | None:
     row = await conn.fetchrow("SELECT * FROM payments WHERE bank_txn_id = $1", bank_txn_id)
-    return dict(row) if row else None
+    if not row:
+        return None
+    d = dict(row)
+    if isinstance(d.get("candidate_pool"), str):
+        try:
+            d["candidate_pool"] = json.loads(d["candidate_pool"])
+        except Exception:
+            pass
+    return d
+
+
+import json
 
 
 async def _exceptions_for(conn, bank_txn_id: str) -> list[dict]:
     rows = await conn.fetch("SELECT * FROM reconciliation_exceptions WHERE bank_txn_id = $1", bank_txn_id)
-    return [dict(r) for r in rows]
+    res = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("detail"), str):
+            try:
+                d["detail"] = json.loads(d["detail"])
+            except Exception:
+                pass
+        res.append(d)
+    return res
 
 
 async def _invoice(conn, invoice_id: str) -> dict:

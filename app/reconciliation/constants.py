@@ -46,9 +46,7 @@ class ReconciliationErrors:
     NOT_A_SUSPENSE_EXCEPTION = (
         "Only a SUSPENSE exception (with a bank_txn_id) can be resolved this way"
     )
-    NOT_A_MULTIPLE_MATCH_EXCEPTION = (
-        "Only a MULTIPLE_INVOICE_MATCH exception (with a bank_txn_id) can be resolved this way"
-    )
+    NOT_A_MULTIPLE_MATCH_EXCEPTION = "Only a MULTIPLE_INVOICE_MATCH exception (with a bank_txn_id) can be resolved this way"
     SUSPENSE_PAYMENT_NOT_FOUND = (
         "No payment found for this exception's bank transaction"
     )
@@ -65,14 +63,9 @@ RECON_TYPES = ("AR", "AP", "BANK")  # only AR has an engine implementation today
 PHASE_INTAKE_VALIDATION = "INTAKE_VALIDATION"
 PHASE_CUSTOMER_LOCK = "CUSTOMER_LOCK"  # Phase 1a in the proposal doc
 PHASE_CANDIDATE_POOL = "CANDIDATE_POOL"  # Phase 1b
-PHASE_NARRATION_CROSS_CHECK = (
-    "NARRATION_CROSS_CHECK"  # Phase 1c - post-identification invoice narration audit
+PHASE_NARRATION_CHECK = (
+    "NARRATION_CHECK"  # Phase 1c - post-identification invoice narration audit
 )
-# Runs after both 1a and 1b have had their chance for a row, reconciled
-# against whichever (if either) actually identified a customer - not one of
-# the six CUSTOMER_LOCK rules, so it gets its own phase rather than
-# competing in that first-match-wins loop. See engine.py::run_phase_1.
-PHASE_NARRATION_CHECK = "NARRATION_CHECK"
 PHASE_ALLOCATION = "ALLOCATION"  # Phase 2
 PHASE_SHORT_PAY = "SHORT_PAY"
 PHASE_UNAPPLIED = "UNAPPLIED"
@@ -82,7 +75,7 @@ RECON_PHASES = (
     PHASE_INTAKE_VALIDATION,
     PHASE_CUSTOMER_LOCK,
     PHASE_CANDIDATE_POOL,
-    PHASE_NARRATION_CROSS_CHECK,
+    PHASE_NARRATION_CHECK,
     PHASE_ALLOCATION,
     PHASE_SHORT_PAY,
     PHASE_UNAPPLIED,
@@ -192,6 +185,7 @@ GL_ROLE_CODES = (
 # gl_posting.py (M3, to actually post it).
 GAP_ROLE_BY_RULE_KIND: dict[str, str] = {
     "tds-match": GL_ROLE_TDS_RECEIVABLE,
+    "bank-fee": GL_ROLE_BANK_CHARGES,
     "write-off": GL_ROLE_WRITE_OFF,
 }
 
@@ -302,23 +296,7 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
         85,
         {"source": "customers", "match_field": "company_name", "min_similarity": 0.85},
     ),
-    # Last resort: no UTR/account/VPA/customer-code/GSTIN/PAN/fuzzy-name
-    # match at all - e.g. a remittance with no rich payer data on the bank
-    # side, only a narration. Only fires if the referenced invoice already
-    # has its own customer_id (from ERP ingestion) - see
-    # app/reconciliation/rules/identification.py::document_number_match.
-    (
-        PHASE_CUSTOMER_LOCK,
-        "document-number-narration",
-        "Document Number in Narration Match",
-        7,
-        85,
-        {
-            "source": "invoices",
-            "match_field": "invoice_number",
-            "location": "narration",
-        },
-    ),
+
     # Phase 1b - CANDIDATE_POOL (only reached if Phase 1a locked nothing)
     (
         PHASE_CANDIDATE_POOL,
@@ -363,33 +341,26 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
         1,
         100,
         {
-            "description": "Cross-check: does the narration reference a real invoice belonging to a different customer than the one Phase 1a/1b identified?"
-        },
-    ),
-    # Phase 1c - NARRATION_CROSS_CHECK (runs after Phase 1a and 1b for every row)
-    # Cross-checks the narration against real invoices independently of the customer
-    # already identified. A disagreement flags for review rather than auto-committing.
-    (
-        PHASE_NARRATION_CROSS_CHECK,
-        "narration-invoice-check",
-        "Invoice Number in Narration",
-        1,
-        100,
-        {
             "match_field": "invoice_number",
             "location": "narration",
-            "description": "Independently checks whether the transaction narration references a real invoice belonging to a different customer than the one Customer Identification / Candidate Pool already identified. Runs after both, for every row — a disagreement is flagged for review instead of letting the identified customer stand unquestioned.",
+            "description": "Cross-check: independently checks whether the transaction narration references a real invoice belonging to a different customer than the one Phase 1a/1b identified — a disagreement is flagged for review instead of letting the identified customer stand unquestioned.",
         },
     ),
     # Phase 2 - ALLOCATION (scoped to the locked customer or candidate pool).
-    # tds-match/bank-fee/write-off/overpayment used to be standalone rules
-    # here (priorities 4/6/7/8) - removed. Every rule below now runs the same
-    # settlement check (allocation.py::resolve_invoice_settlement) against
-    # whichever invoice(s) it identifies: TDS/bank-fee/dust-write-off
-    # variance and overpayment are handled inline by exact-invoice-num,
-    # invoice-suffix, exact-amount, and subset-sum alike, not as their own
-    # later-priority fallback pass (2026-08 note - see engine.py's
-    # `_commit_direct_match` and allocation.py's rule docstrings).
+    # tds-match/bank-fee/write-off used to be standalone rules here - removed
+    # (2026-08a). Every rule below now runs the same settlement check
+    # (allocation.py::resolve_invoice_settlement) against whichever
+    # invoice(s) it identifies: TDS/bank-fee/dust-write-off variance is
+    # handled inline by exact-invoice-num, invoice-suffix, exact-amount, and
+    # subset-sum alike, not as their own later-priority fallback pass (see
+    # engine.py's `_commit_direct_match` and allocation.py's rule
+    # docstrings). `overpayment` (below) stayed a standalone rule but moved
+    # to AFTER subset-sum (2026-08b) - it used to be folded into
+    # exact-amount, but that let a rough "closest invoice, excess on-account"
+    # guess grab a payment before subset-sum ever got a chance to check for
+    # an exact multi-invoice split, a strictly better explanation when one
+    # exists (e.g. a payment that doesn't match any single invoice but sums
+    # exactly across two of that customer's open invoices).
     (
         PHASE_ALLOCATION,
         "exact-invoice-num",
@@ -397,7 +368,8 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
         1,
         98,
         {
-            "match_field": "invoice_number",
+            "source": "invoices",
+            "match_fields": ["invoice_number", "document_number"],
             "location": "narration",
             "description": "Automatically matches a payment to an invoice by finding that invoice's exact number written in the bank transaction narration.",
         },
@@ -427,12 +399,11 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
             "description": "Automatically matches a payment to an open invoice when the payment amount exactly equals the invoice's outstanding balance.",
         },
     ),
-
     (
         PHASE_ALLOCATION,
         "subset-sum",
         "Combined Invoice Match (Many-to-Many)",
-        5,
+        4,
         85,
         {
             "amount": {"mode": "subset_sum"},
@@ -441,12 +412,22 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
             "description": "Automatically matches a single payment against a combination of several open invoices whose amounts add up to the payment received.",
         },
     ),
-
+    (
+        PHASE_ALLOCATION,
+        "overpayment",
+        "Overpayment to On-Account Credit",
+        5,
+        100,
+        {
+            "gl_role": GL_ROLE_ON_ACCOUNT_ADVANCE,
+            "description": "Runs only after exact single-invoice and combined (subset-sum) matching both failed: fully settles the one open invoice the payment comes closest to covering, leaving the excess as on-account credit for the customer.",
+        },
+    ),
     (
         PHASE_ALLOCATION,
         "partial-payment",
         "Partial Payment Allocation",
-        9,
+        6,
         100,
         {
             "mode": "partial",
@@ -454,11 +435,38 @@ DEFAULT_AR_RULE_CATALOG: tuple[tuple[str, str, str, int, int | None, dict], ...]
             "description": "Universal fallback when no earlier rule matches: applies incoming cash to the customer's oldest open invoice to reduce its balance, leaving the residual shortfall open.",
         },
     ),
+    # Not dispatched through ALLOCATION_RULES like the five above - it never
+    # competes in the customer-scoped, per-payment cascade, since by
+    # definition no customer was ever identified (payment side or invoice
+    # side - migration 0031) for it to be scoped to. Exists as a catalog row
+    # purely so engine.py's no-customer direct-match path
+    # (`_commit_direct_match`, gated on this row's `enabled` at the top of
+    # `run_phase_2`) has a real rule_id/name/confidence to attach to its
+    # match_groups, instead of `rule_id=None` forcing the frontend to guess
+    # what happened (2026-08 fix). Same evidence/mechanism as the
+    # CUSTOMER_LOCK phase's "document-number-narration" rule - see that
+    # row's comment - just applied without a customer to lock. Named
+    # distinctly from that rule (and from "invoice-number-in-narration") on
+    # purpose - all three used to collide on nearly-identical display names,
+    # which is exactly what made "Resolved Via" confusing (2026-08 fix).
+    (
+        PHASE_ALLOCATION,
+        "direct-invoice-match",
+        "Direct Invoice Match",
+        7,
+        85,
+        {
+            "source": "invoices",
+            "match_fields": ["invoice_number", "document_number"],
+            "location": "narration",
+            "description": "Directly matches a payment with no customer identification to an open invoice referenced by number in the bank narration.",
+        },
+    ),
     (
         PHASE_ALLOCATION,
         "deduction-settlement",
         "Deduction Payment to Open Partial Match",
-        10,
+        8,
         100,
         {
             "magic_words": ["FEE", "CHG", "SERV", "SVC", "WIRE", "MONTHLY", "ANALYSIS"],
