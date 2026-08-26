@@ -29,7 +29,7 @@ import asyncpg
 from app.datahub import ai_mapping
 from app.datahub.canonical import KNOWN_FIELDS, STREAM_INSERTERS, RowRejected, row_hash, unknown_field_issues
 from app.datahub.dao import DataHubDAO
-from app.datahub.transforms import apply_mapping, normalize_header
+from app.datahub.transforms import apply_fill_down, apply_mapping, normalize_header
 from app.db.pool import create_pool
 
 logger = logging.getLogger(__name__)
@@ -166,6 +166,9 @@ async def process_ingestion_job(
             raise ValueError(
                 f"stream {job['stream']!r} has no active field mapping"
             )
+        # Must run once, over the whole file, before any row's own mapping -
+        # a no-op unless the active mapping actually uses FILL_DOWN.
+        rows = apply_fill_down(rows, mappings)
         source = await dao.get_data_source(job["source_id"])
         entity_id = source["entity_id"]
         home_currency = await dao.get_entity_home_currency(entity_id)
@@ -176,17 +179,25 @@ async def process_ingestion_job(
         # candidate for the AI-suggestion stub (currently a no-op - see
         # app/datahub/ai_mapping.py); anything still unresolved after that is
         # recorded on the job instead of silently failing every row.
-        mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+        mapped_headers = {
+            normalize_header(m["source_field"])
+            for m in mappings
+            if m.get("canonical_field") and str(m["canonical_field"]).strip() not in ("", "-")
+        }
         unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
         if unmapped_columns:
             suggestions = ai_mapping.suggest_canonical_fields(
                 job["stream"], unmapped_columns, KNOWN_FIELDS.get(job["stream"], set())
             )
             if suggestions:
-                mappings = await dao.insert_mapping_version(
+                mappings = await dao.save_mapping(
                     job["stream"], [dict(m) for m in mappings] + suggestions
                 )
-                mapped_headers = {normalize_header(m["source_field"]) for m in mappings}
+                mapped_headers = {
+                    normalize_header(m["source_field"])
+                    for m in mappings
+                    if m.get("canonical_field") and str(m["canonical_field"]).strip() not in ("", "-")
+                }
                 unmapped_columns = [h for h in headers if normalize_header(h) not in mapped_headers]
 
         row_count = 0
@@ -207,6 +218,17 @@ async def process_ingestion_job(
                 extra_raw = {
                     k: v for k, v in raw_row.items() if normalize_header(k) not in mapped_headers
                 } or None
+                # Snapshot before insert_fn runs: issues added here are genuine
+                # mapping/transform problems (a bad date, an unknown field, ...).
+                # An inserter (insert_invoice_row, for an unresolved
+                # customer_code - migration 0031) may append its own issue
+                # afterward for a row that landed fine but isn't fully linked
+                # yet - that's an expected, resolvable state, not a processing
+                # failure, so it shouldn't flip the whole job to FAILED/PARTIAL.
+                # The row itself still gets `valid=false` either way (insert_fn
+                # receives and stores the full, possibly-grown `issues` list) -
+                # only this job-level error_count ignores what's added here.
+                pre_insert_issue_count = len(issues)
                 try:
                     async with conn.transaction():  # nested -> savepoint, isolates this row only
                         await insert_fn(
@@ -219,17 +241,15 @@ async def process_ingestion_job(
                             home_currency=home_currency,
                             row_hash_value=row_hash(raw_row),
                         )
-                    if issues:
+                    if pre_insert_issue_count > 0:
                         error_count += 1
                 except RowRejected as exc:
                     error_count += 1
                     failed_rows.append({"raw": raw_row, "issues": issues + [str(exc)]})
 
-            mapping_version = mappings[0]["version"]
             await conn.execute(
-                "UPDATE ingestion_jobs SET mapping_version = $2, unmapped_columns = $3 WHERE job_id = $1",
+                "UPDATE ingestion_jobs SET unmapped_columns = $2 WHERE job_id = $1",
                 job["job_id"],
-                mapping_version,
                 unmapped_columns or None,
             )
 

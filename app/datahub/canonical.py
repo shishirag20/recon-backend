@@ -32,12 +32,12 @@ KNOWN_FIELDS = {
     "BANK": {
         "document_number", "line_number", "bank_reference", "transaction_date", "value_date",
         "fiscal_year", "fiscal_period", "narration", "payer_name", "payer_account_no", "payer_ifsc",
-        "currency", "amount_minor", "amount_home_minor", "fx_rate", "dr_cr",
+        "currency", "amount_minor", "fx_rate", "dr_cr",
         "explicit_fee_minor", "is_bank_charge", "contra_reference",
     },
     "INVOICE": {
-        "customer_code", "invoice_number", "issue_date", "due_date", "currency",
-        "total_amount_minor", "total_home_minor", "balance_due_minor",
+        "customer_code", "invoice_number", "document_number", "issue_date", "due_date", "currency",
+        "total_amount_minor", "balance_due_minor",
         "tds_rate_pct", "allowed_tds_minor", "status",
     },
     "CUSTOMER": {
@@ -69,7 +69,7 @@ EDITABLE_FIELDS = {
         "explicit_fee_minor", "is_bank_charge", "contra_reference", "valid",
     },
     "INVOICE": {
-        "invoice_number", "issue_date", "due_date", "currency",
+        "invoice_number", "document_number", "issue_date", "due_date", "currency",
         "total_amount_minor", "total_home_minor", "balance_due_minor",
         "tds_rate_pct", "allowed_tds_minor", "status", "valid",
     },
@@ -89,7 +89,11 @@ SEARCH_COLUMNS = {
 
 def unknown_field_issues(stream: str, canonical: dict) -> list[str]:
     known = KNOWN_FIELDS[stream]
-    return [f"unknown canonical_field {f!r} for stream {stream} (ignored)" for f in canonical if f not in known]
+    return [
+        f"unknown canonical_field {f!r} for stream {stream} (ignored)"
+        for f in canonical
+        if f and str(f).strip() not in ("", "-") and f not in known
+    ]
 
 
 def _require(canonical: dict, fields: tuple[str, ...]) -> None:
@@ -118,19 +122,18 @@ def _apply_home_currency_default(
 ) -> None:
     """Fills `home_field` from `native_field` only when the row's currency
     genuinely is the entity's home currency - otherwise leaves it unset (so
-    `_require` rejects the row with a clear reason) rather than silently
-    treating a foreign-currency amount as if no conversion were needed."""
+    `_require` reports it plainly)."""
     if canonical.get(home_field) is not None:
         return
     currency = canonical.get("currency")
-    if currency == home_currency:
+    effective_home = home_currency or "INR"
+    if currency == effective_home or not currency:
         canonical[home_field] = canonical.get(native_field)
     elif currency is not None:
         raise RowRejected(
-            f"currency {currency!r} differs from entity home currency {home_currency!r}; "
+            f"currency {currency!r} differs from entity home currency {effective_home!r}; "
             f"{home_field} must be explicitly mapped (no fx_rates lookup wired up yet)"
         )
-    # currency itself missing -> fall through, _require reports it plainly
 
 
 async def _insert(conn: asyncpg.Connection, table: str, pk_column: str, values: dict) -> None:
@@ -140,40 +143,63 @@ async def _insert(conn: asyncpg.Connection, table: str, pk_column: str, values: 
     try:
         await conn.execute(sql, *values.values())
     except asyncpg.PostgresError as exc:
-        # e.g. an unrecognized currency code, or a duplicate natural key -
-        # a real constraint violation, not a bug in this row's own data shape
         raise RowRejected(str(exc)) from exc
+
+
+def _safe_int(val, default=0):
+    if val is None or val == "":
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val, default=None):
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
 
 async def insert_bank_row(
     conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict | None, issues: list[str],
     home_currency: str, row_hash_value: str,
 ) -> None:
+    effective_home = home_currency or "INR"
+    if not canonical.get("currency"):
+        canonical["currency"] = effective_home
+    if not canonical.get("dr_cr"):
+        amt = canonical.get("amount_minor")
+        canonical["dr_cr"] = "DEBIT" if amt is not None and isinstance(amt, (int, float)) and amt < 0 else "CREDIT"
+
     _apply_home_currency_default(
-        canonical, native_field="amount_minor", home_field="amount_home_minor", home_currency=home_currency
+        canonical, native_field="amount_minor", home_field="amount_home_minor", home_currency=effective_home
     )
     _require(canonical, ("transaction_date", "currency", "amount_minor", "amount_home_minor", "dr_cr"))
     await _insert(conn, "bank_statements", "bank_txn_id", {
         "entity_id": entity_id,
         "source_job_id": source_job_id,
         "document_number": canonical.get("document_number"),
-        "line_number": canonical.get("line_number"),
+        "line_number": _safe_int(canonical.get("line_number"), None),
         "bank_reference": canonical.get("bank_reference"),
         "transaction_date": canonical["transaction_date"],
         "value_date": canonical.get("value_date"),
-        "fiscal_year": canonical.get("fiscal_year"),
-        "fiscal_period": canonical.get("fiscal_period"),
+        "fiscal_year": _safe_int(canonical.get("fiscal_year"), None),
+        "fiscal_period": _safe_int(canonical.get("fiscal_period"), None),
         "narration": canonical.get("narration"),
         "payer_name": canonical.get("payer_name"),
         "payer_account_no": canonical.get("payer_account_no"),
         "payer_ifsc": canonical.get("payer_ifsc"),
         "currency": canonical["currency"],
-        "amount_minor": canonical["amount_minor"],
-        "amount_home_minor": canonical["amount_home_minor"],
-        "fx_rate": canonical.get("fx_rate"),
+        "amount_minor": _safe_int(canonical.get("amount_minor"), 0),
+        "amount_home_minor": _safe_int(canonical.get("amount_home_minor"), 0),
+        "fx_rate": _safe_float(canonical.get("fx_rate"), None),
         "dr_cr": canonical["dr_cr"],
-        "explicit_fee_minor": canonical.get("explicit_fee_minor") or 0,
-        "is_bank_charge": canonical.get("is_bank_charge") or False,
+        "explicit_fee_minor": _safe_int(canonical.get("explicit_fee_minor"), 0),
+        "is_bank_charge": bool(canonical.get("is_bank_charge")),
         "contra_reference": canonical.get("contra_reference"),
         "raw": raw,
         "row_hash": row_hash_value,
@@ -196,7 +222,7 @@ async def insert_customer_row(
         "gstin": canonical.get("gstin"),
         "vpa_handle": canonical.get("vpa_handle"),
         "payment_terms": canonical.get("payment_terms"),
-        "credit_limit_minor": canonical.get("credit_limit_minor"),
+        "credit_limit_minor": _safe_int(canonical.get("credit_limit_minor"), None),
         "city": canonical.get("city"),
         "state": canonical.get("state"),
         "raw": raw,
@@ -228,18 +254,34 @@ async def insert_invoice_row(
     conn: asyncpg.Connection, *, entity_id, source_job_id, canonical: dict, raw: dict | None, issues: list[str],
     home_currency: str, row_hash_value: str,  # unused here, accepted for a uniform STREAM_INSERTERS call signature
 ) -> None:
+    effective_home = home_currency or "INR"
+    if not canonical.get("currency"):
+        canonical["currency"] = effective_home
+
     customer_code = canonical.get("customer_code")
-    if not customer_code:
-        raise RowRejected("missing required field(s): customer_code")
-    customer_id = await _resolve_customer_id(conn, entity_id=entity_id, customer_code=customer_code)
+    customer_id = await _resolve_customer_id(conn, entity_id=entity_id, customer_code=customer_code) if customer_code else None
     if customer_id is None:
-        raise RowRejected(
-            f"no customer found with customer_code={customer_code!r} "
-            "(checked customers.customer_code and customer_reference_codes) for this entity"
+        # Not a reject, in either case - customer_code missing/unmapped
+        # (deliberately, e.g. mapped to "-") and customer_code present but
+        # not yet in the customer master are the same outcome: the invoice
+        # is still ingested, unlinked. Reconciliation resolves it later via a
+        # narration-based invoice-number match (or a human), backfilling
+        # customer_id at that point. See migration 0031.
+        # Mutates the caller's list in place (append, not `issues = issues +
+        # [...]`) - ingestion_worker.py's own error_count/row status check
+        # reads the same list object after this call returns, and a rebind
+        # here would be invisible to it, silently reporting a clean SUCCESS
+        # for a row that actually landed without a customer link.
+        issues.append(
+            f"unresolved customer_code={customer_code!r} "
+            "(checked customers.customer_code and customer_reference_codes) for this entity - "
+            "invoice ingested without a customer link"
+            if customer_code else
+            "no customer_code supplied - invoice ingested without a customer link"
         )
 
     _apply_home_currency_default(
-        canonical, native_field="total_amount_minor", home_field="total_home_minor", home_currency=home_currency
+        canonical, native_field="total_amount_minor", home_field="total_home_minor", home_currency=effective_home
     )
     if canonical.get("balance_due_minor") is None:
         canonical["balance_due_minor"] = canonical.get("total_amount_minor")
@@ -251,14 +293,15 @@ async def insert_invoice_row(
         "source_job_id": source_job_id,
         "customer_id": customer_id,
         "invoice_number": canonical["invoice_number"],
+        "document_number": canonical.get("document_number"),
         "issue_date": canonical["issue_date"],
         "due_date": canonical["due_date"],
         "currency": canonical["currency"],
-        "total_amount_minor": canonical["total_amount_minor"],
-        "total_home_minor": canonical["total_home_minor"],
-        "balance_due_minor": canonical["balance_due_minor"],
-        "tds_rate_pct": canonical.get("tds_rate_pct"),
-        "allowed_tds_minor": canonical.get("allowed_tds_minor") or 0,
+        "total_amount_minor": _safe_int(canonical.get("total_amount_minor"), 0),
+        "total_home_minor": _safe_int(canonical.get("total_home_minor"), 0),
+        "balance_due_minor": _safe_int(canonical.get("balance_due_minor"), 0),
+        "tds_rate_pct": _safe_float(canonical.get("tds_rate_pct"), None),
+        "allowed_tds_minor": _safe_int(canonical.get("allowed_tds_minor"), 0),
         "status": canonical.get("status") or "OPEN",
         "raw": raw,
         "valid": len(issues) == 0,

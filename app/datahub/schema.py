@@ -24,7 +24,19 @@ _TRANSFORM_DESCRIPTION = (
     "e.g. '1000.00' -> 100000 - pass transform_param='negate' to also flip the sign), "
     "NEGATE (numeric sign flip), "
     "PARSE_DATE (transform_param is a comma-separated list of strptime formats to try in order), "
-    "REGEX (transform_param is a pattern with one capture group; the group's text is returned). "
+    "REGEX (transform_param is a pattern with one capture group; the group's text is returned), "
+    "PARSE_BOOL (true/false/1/0/yes/no, case-insensitive -> a real bool; use for a boolean-typed "
+    "canonical column like is_bank_charge, since TRIM leaves it a string and asyncpg rejects that), "
+    "TO_DECIMAL (parse a decimal at face value, no scaling - use for a numeric-typed canonical "
+    "column that isn't money, like invoices.tds_rate_pct, since TRIM leaves it a string too), "
+    "CONST_IF_PRESENT (like CONST, but only when the raw cell actually has a value; blank stays "
+    "blank - use for a column that's only sometimes populated, e.g. mapping both a Credit and a "
+    "Debit amount column to dr_cr with transform_param='CREDIT'/'DEBIT' respectively, so whichever "
+    "one actually has a value wins instead of one CONST stamping every row the same direction), "
+    "FILL_DOWN (parses a date exactly like PARSE_DATE, but first forward-fills a blank cell in "
+    "this raw column from the last non-blank row earlier in the file - use for a source that only "
+    "prints a value once per group, e.g. a bank statement date shown once per day on a header row, "
+    "left blank on every transaction row under it). "
     "See app/datahub/transforms.py for the reference implementation - this is the exact "
     "code path both /field-mappings/preview and the ingestion worker call, so a mapping "
     "that previews cleanly will ingest identically."
@@ -65,7 +77,8 @@ class DataSourceOut(BaseModel):
 class FieldMappingIn(BaseModel):
     source_field: str = Field(min_length=1, description="Column name as it appears in the raw uploaded file.")
     canonical_field: str = Field(
-        min_length=1,
+        default="",
+        min_length=0,
         description=(
             "Target column on the stream's canonical table. BANK: transaction_date, currency, "
             "amount_minor, amount_home_minor, dr_cr, bank_reference, narration, payer_name, ... "
@@ -81,18 +94,19 @@ class FieldMappingIn(BaseModel):
 
 
 class FieldMappingOut(FieldMappingIn):
+    canonical_field: str = Field(default="", min_length=0)
     mapping_id: UUID
     stream: str = Field(description="BANK, INVOICE, CUSTOMER, ... - mappings are shared globally per stream, not per data source.")
-    version: int = Field(description="Mapping sets are versioned; only one version per stream is is_active at a time.")
     is_active: bool
 
     model_config = {"from_attributes": True}
 
 
-class FieldMappingVersionCreate(BaseModel):
+class FieldMappingSet(BaseModel):
     mappings: list[FieldMappingIn] = Field(
         min_length=1,
-        description="The complete mapping set for this version - not a diff against the previous version.",
+        description="The complete mapping set for this stream - not a diff against what's currently active. "
+        "No version history is kept (migration 0032): a row omitted here is removed, not preserved.",
     )
 
     model_config = {
@@ -182,6 +196,29 @@ class ResolveHeadersResponse(BaseModel):
     results: list[ResolvedHeader]
 
 
+class ResolveMappingRequest(BaseModel):
+    headers: list[str] = Field(
+        min_length=1,
+        description="Raw column headers from an actual file - read client-side before upload.",
+    )
+
+
+class ResolvedFieldMapping(BaseModel):
+    source_field: str
+    canonical_field: str | None = None
+    transform: str = "NONE"
+    transform_param: str | None = None
+    is_matched: bool = Field(
+        description="Whether this source field was matched to an existing synonym in the active mapping."
+    )
+
+
+class ResolveMappingResponse(BaseModel):
+    stream: str
+    canonical_fields: list[str]
+    mappings: list[ResolvedFieldMapping]
+
+
 class CanonicalFieldsResponse(BaseModel):
     canonical_fields: list[str] = Field(
         description="Valid mapping targets for this stream - see app/datahub/canonical.py's KNOWN_FIELDS."
@@ -201,7 +238,6 @@ class IngestionJobOut(BaseModel):
     attempt_count: int
     max_attempts: int
     last_error: str | None = Field(description="Set when status is FAILED or a retry is pending.")
-    mapping_version: int | None = Field(description="Which field_mappings version was active when this job ran (audit trail).")
     unmapped_columns: list[str] | None = Field(
         default=None,
         description="Raw file headers that matched no synonym in the active stream mapping and that the "

@@ -46,14 +46,14 @@ Standard multi-tenant auth: users belong to organizations via role-gated members
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `uuid` PK | |
-| `email` | `varchar(255)` UNIQUE NOT NULL | |
-| `hashed_password` | `varchar(255)` NOT NULL | |
-| `full_name` | `varchar(120)` NOT NULL | |
-| `is_active` | `boolean` NOT NULL DEFAULT `true` | |
+| `id` | `uuid` PK | Primary key |
+| `email` | `varchar(255)` UNIQUE NOT NULL | Login identifier |
+| `hashed_password` | `varchar(255)` NOT NULL | Password hash at rest — the plaintext is never stored |
+| `full_name` | `varchar(120)` NOT NULL | Display name shown in the UI and resolved into `v_report_matched`/`v_report_runs` |
+| `is_active` | `boolean` NOT NULL DEFAULT `true` | Soft-disable flag; not enforced by any FK cascade |
 | `is_platform_admin` | `boolean` NOT NULL DEFAULT `false` | Cross-organization admin flag, separate from any per-org role |
-| `last_login_at` | `timestamptz` | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `last_login_at` | `timestamptz` | Updated on successful login; `NULL` for a user who has never signed in |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 
 Migrations: `0002`.
 
@@ -61,12 +61,12 @@ Migrations: `0002`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `uuid` PK | |
-| `name` | `varchar(120)` NOT NULL | |
-| `slug` | `varchar(60)` UNIQUE NOT NULL | |
-| `is_active` | `boolean` NOT NULL DEFAULT `true` | |
-| `created_by_user_id` | `uuid` FK → `users`, ON DELETE SET NULL | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `id` | `uuid` PK | Primary key |
+| `name` | `varchar(120)` NOT NULL | Display name |
+| `slug` | `varchar(60)` UNIQUE NOT NULL | URL-safe identifier |
+| `is_active` | `boolean` NOT NULL DEFAULT `true` | Soft-disable flag for the whole tenant |
+| `created_by_user_id` | `uuid` FK → `users`, ON DELETE SET NULL | Nullable so deleting that user doesn't block deleting/keeping the org |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 
 The tenancy root — every `entity` (legal company/site) belongs to exactly one organization. Migrations: `0003`.
 
@@ -74,16 +74,16 @@ The tenancy root — every `entity` (legal company/site) belongs to exactly one 
 
 | Table | Column | Type | Notes |
 |---|---|---|---|
-| `roles` | `id` | `uuid` PK | |
-| | `name` | `varchar(50)` UNIQUE NOT NULL | |
-| | `description` | `varchar(255)` | |
+| `roles` | `id` | `uuid` PK | Primary key |
+| | `name` | `varchar(50)` UNIQUE NOT NULL | Role label, e.g. "Admin", "Preparer", "Reviewer" |
+| | `description` | `varchar(255)` | Optional human-readable explanation |
 | | `is_system` | `boolean` NOT NULL DEFAULT `false` | System-defined roles vs. org-created ones |
-| | `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
-| `permissions` | `id` | `uuid` PK | |
+| | `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
+| `permissions` | `id` | `uuid` PK | Primary key |
 | | `code` | `varchar(100)` UNIQUE NOT NULL | e.g. a permission slug like `recon.run.approve` |
-| | `description` | `varchar(255)` | |
+| | `description` | `varchar(255)` | Optional human-readable explanation |
 | `role_permissions` | `role_id` | `uuid` FK → `roles`, ON DELETE CASCADE | Composite PK `(role_id, permission_id)` |
-| | `permission_id` | `uuid` FK → `permissions`, ON DELETE CASCADE | |
+| | `permission_id` | `uuid` FK → `permissions`, ON DELETE CASCADE | Other half of the composite PK |
 
 Many-to-many join between roles and permissions. Migrations: `0004`.
 
@@ -91,12 +91,12 @@ Many-to-many join between roles and permissions. Migrations: `0004`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `uuid` PK | |
-| `user_id` | `uuid` FK → `users`, ON DELETE CASCADE | |
-| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | |
+| `id` | `uuid` PK | Primary key |
+| `user_id` | `uuid` FK → `users`, ON DELETE CASCADE | Which user this membership grants a role to |
+| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | Which organization the role applies to |
 | `role_id` | `uuid` FK → `roles`, ON DELETE RESTRICT | Can't delete a role while a membership still uses it |
-| `is_active` | `boolean` NOT NULL DEFAULT `true` | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `is_active` | `boolean` NOT NULL DEFAULT `true` | Soft-disable flag for this membership, independent of the user's or org's own `is_active` |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 
 UNIQUE `(user_id, organization_id)` — a user has exactly one role per organization. Migrations: `0005`.
 
@@ -104,15 +104,15 @@ UNIQUE `(user_id, organization_id)` — a user has exactly one role per organiza
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `uuid` PK | |
-| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | |
+| `id` | `uuid` PK | Primary key |
+| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | Organization the invitee will join on acceptance |
 | `email` | `varchar(255)` NOT NULL | Invitee, not yet a `users` row |
 | `role_id` | `uuid` FK → `roles`, ON DELETE RESTRICT | Role the invitee will get on acceptance |
 | `token_hash` | `varchar(255)` UNIQUE NOT NULL | The invite link's token, hashed at rest |
-| `invited_by_user_id` | `uuid` FK → `users`, ON DELETE SET NULL | |
-| `expires_at` | `timestamptz` NOT NULL | |
+| `invited_by_user_id` | `uuid` FK → `users`, ON DELETE SET NULL | User who sent the invite |
+| `expires_at` | `timestamptz` NOT NULL | Invite link stops being acceptable after this time |
 | `accepted_at` / `revoked_at` | `timestamptz` | Mutually exclusive terminal states, both nullable |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the invite was sent |
 
 Migrations: `0006`.
 
@@ -120,15 +120,15 @@ Migrations: `0006`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `uuid` PK | |
-| `user_id` | `uuid` FK → `users`, ON DELETE CASCADE | |
+| `id` | `uuid` PK | Primary key |
+| `user_id` | `uuid` FK → `users`, ON DELETE CASCADE | Which user this session authenticates |
 | `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | Which org context this session is scoped to |
-| `refresh_token_hash` | `varchar(255)` UNIQUE NOT NULL | |
-| `user_agent` | `varchar(255)` | |
+| `refresh_token_hash` | `varchar(255)` UNIQUE NOT NULL | Refresh token's hash at rest, same convention as `invitations.token_hash` — the bearer token itself is never stored |
+| `user_agent` | `varchar(255)` | Browser/client string captured at login, for session-list display |
 | `ip_address` | `varchar(45)` | Sized for IPv6 |
-| `issued_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
-| `expires_at` | `timestamptz` NOT NULL | |
-| `last_used_at` / `revoked_at` | `timestamptz` | |
+| `issued_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the session/refresh token was created |
+| `expires_at` | `timestamptz` NOT NULL | Refresh token's hard expiry |
+| `last_used_at` / `revoked_at` | `timestamptz` | `last_used_at` updated on each refresh; `revoked_at` set on explicit logout or admin revocation |
 
 Index: `idx_sessions_user` on `user_id`. Migrations: `0007`.
 
@@ -143,7 +143,7 @@ Shared lookup/master data that every entity's transactions hang off of.
 | Column | Type | Notes |
 |---|---|---|
 | `code` | `char(3)` PK | ISO 4217, e.g. `INR`, `USD` |
-| `name` | `text` NOT NULL | |
+| `name` | `text` NOT NULL | Full currency name, e.g. "Indian Rupee" |
 | `minor_unit` | `smallint` NOT NULL DEFAULT `2` | Decimal places implied by every `..._minor` column referencing this currency |
 
 Migrations: `0008`.
@@ -152,14 +152,14 @@ Migrations: `0008`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `entity_id` | `uuid` PK | |
-| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | |
-| `company_code` | `text` NOT NULL | |
-| `name` | `text` NOT NULL | |
-| `site_code` | `text` | |
-| `home_currency` | `char(3)` NOT NULL DEFAULT `'INR'`, FK → `currencies` | |
-| `accounting_standard` | `text` | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `entity_id` | `uuid` PK | Primary key |
+| `organization_id` | `uuid` FK → `organizations`, ON DELETE CASCADE | Owning organization — every entity belongs to exactly one |
+| `company_code` | `text` NOT NULL | Short internal code for the legal entity/site, unique within the organization |
+| `name` | `text` NOT NULL | Display name of the entity |
+| `site_code` | `text` | Optional sub-location code when an entity spans multiple sites |
+| `home_currency` | `char(3)` NOT NULL DEFAULT `'INR'`, FK → `currencies` | Currency entity-level `..._home_minor` columns convert into |
+| `accounting_standard` | `text` | e.g. Ind AS, IFRS, US GAAP — descriptive only, not enforced anywhere |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 
 UNIQUE `(organization_id, company_code)`. This is the legal-entity/subsidiary row nearly everything else (`gl_accounts`, `customers`, `invoices`, `bank_statements`, `reconciliation_definitions`, ...) hangs off via `entity_id`. Migrations: `0008`.
 
@@ -167,10 +167,10 @@ UNIQUE `(organization_id, company_code)`. This is the legal-entity/subsidiary ro
 
 | Column | Type | Notes |
 |---|---|---|
-| `fx_rate_id` | `uuid` PK | |
-| `from_ccy` / `to_ccy` | `char(3)` FK → `currencies` | |
-| `rate_date` | `date` NOT NULL | |
-| `rate` | `numeric(18,8)` NOT NULL | |
+| `fx_rate_id` | `uuid` PK | Primary key |
+| `from_ccy` / `to_ccy` | `char(3)` FK → `currencies` | Currency pair the rate converts between |
+| `rate_date` | `date` NOT NULL | Date the rate applies to |
+| `rate` | `numeric(18,8)` NOT NULL | Multiplier: 1 unit of `from_ccy` = `rate` units of `to_ccy` |
 | `rate_type` | `text` | e.g. spot vs. period-average, application-defined |
 
 UNIQUE `(from_ccy, to_ccy, rate_date, rate_type)`. Migrations: `0008`.
@@ -179,11 +179,11 @@ UNIQUE `(from_ccy, to_ccy, rate_date, rate_type)`. Migrations: `0008`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `gl_account_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `account_code` | `text` NOT NULL | |
-| `account_name` | `text` NOT NULL | |
-| `account_type` | `text` | |
+| `gl_account_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity's chart of accounts |
+| `account_code` | `text` NOT NULL | Entity-specific GL code, e.g. `"1200"` |
+| `account_name` | `text` NOT NULL | Human-readable account name |
+| `account_type` | `text` | e.g. Balance Sheet vs. Income Statement — descriptive, application-validated |
 | `normal_balance` | `text` | `DEBIT` / `CREDIT`, application-validated |
 | `l1_group` / `l2_group` / `l3_group` | `text` | Chart-of-accounts hierarchy, coarsest to finest |
 | `is_control` | `boolean` NOT NULL DEFAULT `false` | Marks a control account (e.g. AR control) that `gl_control_balances` tracks against the sub-ledger |
@@ -198,16 +198,16 @@ UNIQUE `(entity_id, account_code)`. Migrations: `0008`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `customer_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
+| `customer_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
 | `customer_code` | `text` NOT NULL | Case-insensitively unique per entity — see `uniq_customers_code_ci` below |
-| `company_name` | `text` NOT NULL | |
+| `company_name` | `text` NOT NULL | Legal/trading name; matched by the fuzzy-name and narration-tokens customer-identification rules and full-text indexed via `idx_customers_name` |
 | `pan` / `gstin` | `text` | Indian tax identifiers, used by customer-identification matching rules |
 | `vpa_handle` | `text` | UPI virtual payment address |
-| `payment_terms` | `text` | |
-| `credit_limit_minor` | `bigint` | |
-| `city` / `state` | `text` | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `payment_terms` | `text` | Free-text payment terms, e.g. "Net 30" — descriptive only |
+| `credit_limit_minor` | `bigint` | Credit limit in minor units of the entity's home currency; not enforced by any constraint |
+| `city` / `state` | `text` | Address fields, used for reporting/segmentation |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 | `raw` | `jsonb` | Passthrough of unmapped source columns (`0019`) |
 | `source_job_id` | `uuid` FK → `ingestion_jobs` | Which ingestion job created this row (`0022`) |
 | `valid` | `boolean` NOT NULL DEFAULT `true` | (`0022`) |
@@ -219,13 +219,13 @@ UNIQUE `(entity_id, customer_code)`. Indexes: `idx_customers_gstin`; `idx_custom
 
 | Column | Type | Notes |
 |---|---|---|
-| `account_id` | `uuid` PK | |
-| `customer_id` | `uuid` FK → `customers`, ON DELETE CASCADE | |
-| `bank_account_no` | `text` NOT NULL | |
-| `ifsc_code` | `text` | |
-| `alias` | `text` | |
-| `is_primary` | `boolean` NOT NULL DEFAULT `false` | |
-| `status` | `text` NOT NULL DEFAULT `'ACTIVE'` | |
+| `account_id` | `uuid` PK | Primary key |
+| `customer_id` | `uuid` FK → `customers`, ON DELETE CASCADE | Owning customer |
+| `bank_account_no` | `text` NOT NULL | Account number as on file — matched against a bank statement row's `payer_account_no` |
+| `ifsc_code` | `text` | Bank branch code (India), paired with `bank_account_no` for the account+IFSC identification rule |
+| `alias` | `text` | Optional friendly label for the account |
+| `is_primary` | `boolean` NOT NULL DEFAULT `false` | Marks the customer's default account when more than one is on file |
+| `status` | `text` NOT NULL DEFAULT `'ACTIVE'` | e.g. `ACTIVE` / `INACTIVE` — application-validated, not enforced by a constraint |
 
 Index: `idx_cust_bank_acct` on `(bank_account_no, ifsc_code)` — the account+IFSC customer-identification matcher looks a bank statement row's payer account up here. Migrations: `0009`.
 
@@ -233,12 +233,12 @@ Index: `idx_cust_bank_acct` on `(bank_account_no, ifsc_code)` — the account+IF
 
 | Column | Type | Notes |
 |---|---|---|
-| `reference_id` | `uuid` PK | |
-| `customer_id` | `uuid` FK → `customers`, ON DELETE CASCADE | |
+| `reference_id` | `uuid` PK | Primary key |
+| `customer_id` | `uuid` FK → `customers`, ON DELETE CASCADE | Owning customer |
 | `code_type` | `text` NOT NULL | e.g. narration token, short code |
-| `code_value` | `text` NOT NULL | |
-| `match_priority` | `smallint` NOT NULL DEFAULT `5` | |
-| `is_active` | `boolean` NOT NULL DEFAULT `true` | |
+| `code_value` | `text` NOT NULL | The code text itself, matched as a substring inside bank narration |
+| `match_priority` | `smallint` NOT NULL DEFAULT `5` | Lower sorts first when multiple reference codes could match the same narration |
+| `is_active` | `boolean` NOT NULL DEFAULT `true` | Only active codes are matched — see `idx_cust_ref_code` below |
 
 Index: `idx_cust_ref_code` on `code_value` (partial, `WHERE is_active`) — backs the customer-code-in-narration identification rule. Migrations: `0009`.
 
@@ -246,14 +246,14 @@ Index: `idx_cust_ref_code` on `code_value` (partial, `WHERE is_active`) — back
 
 | Column | Type | Notes |
 |---|---|---|
-| `remittance_id` | `uuid` PK | |
-| `customer_id` | `uuid` FK → `customers` | |
+| `remittance_id` | `uuid` PK | Primary key |
+| `customer_id` | `uuid` FK → `customers` | The customer expected to send this remittance |
 | `utr_number` | `text` | The pre-advised UTR — highest-priority customer-identification signal when present |
-| `declared_amount_minor` | `bigint` NOT NULL | |
-| `currency` | `char(3)` FK → `currencies` | |
-| `declared_date` | `date` | |
-| `reconciled` | `boolean` NOT NULL DEFAULT `false` | |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `declared_amount_minor` | `bigint` NOT NULL | Amount the customer said they'd send, in `currency`'s minor unit |
+| `currency` | `char(3)` FK → `currencies` | Currency of `declared_amount_minor` |
+| `declared_date` | `date` | Date the customer said they'd send the remittance |
+| `reconciled` | `boolean` NOT NULL DEFAULT `false` | Set once a `bank_statements` row has been matched against this pre-advice |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the pre-advice was recorded |
 | `raw` | `jsonb` | (`0019`) |
 
 Migrations: `0009`, `0019`.
@@ -266,19 +266,19 @@ Migrations: `0009`, `0019`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `invoice_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `customer_id` | `uuid` FK → `customers` | |
-| `invoice_number` | `text` NOT NULL | |
-| `issue_date` / `due_date` | `date` NOT NULL | |
-| `currency` | `char(3)` FK → `currencies` | |
+| `invoice_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `customer_id` | `uuid` FK → `customers` | Customer being invoiced |
+| `invoice_number` | `text` NOT NULL | As printed on the invoice; unique per entity, matched against bank narration by the exact-invoice-num rule |
+| `issue_date` / `due_date` | `date` NOT NULL | Invoice date and payment due date; `due_date` drives `idx_invoices_open` and the period-cutoff-guard allocation rule |
+| `currency` | `char(3)` FK → `currencies` | Invoice's original currency; converted to entity home currency in `total_home_minor` |
 | `total_amount_minor` | `bigint` NOT NULL | Original invoice currency |
 | `total_home_minor` | `bigint` NOT NULL | Converted to entity home currency |
 | `balance_due_minor` | `bigint` NOT NULL | Outstanding balance, decremented as allocations land |
-| `tds_rate_pct` | `numeric(5,2)` | |
+| `tds_rate_pct` | `numeric(5,2)` | Tax deducted at source rate the customer is entitled to withhold, as a percentage |
 | `allowed_tds_minor` | `bigint` NOT NULL DEFAULT `0` | Tax deducted at source the customer is entitled to withhold — matching treats a payment short by exactly this much as fully settled, not a short-pay |
-| `status` | `text` NOT NULL DEFAULT `'OPEN'` | |
-| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `status` | `text` NOT NULL DEFAULT `'OPEN'` | e.g. `OPEN` / `PARTIALLY_PAID` / `PAID` — application-validated, drives `idx_invoices_open` |
+| `created_at` / `updated_at` | `timestamptz` NOT NULL DEFAULT `now()` | Standard bookkeeping timestamps |
 | `raw` | `jsonb` | (`0019`) |
 | `source_job_id` | `uuid` FK → `ingestion_jobs` | (`0022`) |
 | `valid` | `boolean` NOT NULL DEFAULT `true` | (`0022`) |
@@ -290,14 +290,14 @@ UNIQUE `(entity_id, invoice_number)`. Index: `idx_invoices_open` on `(customer_i
 
 | Column | Type | Notes |
 |---|---|---|
-| `memo_id` | `uuid` PK | |
-| `customer_id` | `uuid` FK → `customers` | |
+| `memo_id` | `uuid` PK | Primary key |
+| `customer_id` | `uuid` FK → `customers` | Owning customer |
 | `invoice_id` | `uuid` FK → `invoices` | Nullable — a memo need not be tied to one specific invoice |
 | `memo_type` | `text` NOT NULL | Credit or debit |
-| `memo_date` | `date` NOT NULL | |
-| `currency` | `char(3)` FK → `currencies` | |
-| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | |
-| `is_open` | `boolean` NOT NULL DEFAULT `true` | |
+| `memo_date` | `date` NOT NULL | Date the memo was issued |
+| `currency` | `char(3)` FK → `currencies` | Memo's original currency |
+| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | Memo amount in its own currency and converted to entity home currency |
+| `is_open` | `boolean` NOT NULL DEFAULT `true` | Whether the memo still has unapplied value; netted against invoices by the memo-netoff-guard allocation rule |
 | `raw` | `jsonb` | (`0019`) |
 
 Migrations: `0010`, `0019`.
@@ -312,9 +312,9 @@ Kept brief here — see `docs/data-hub.md` for the full ingestion pipeline, tran
 
 | Column | Type | Notes |
 |---|---|---|
-| `source_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `name` | `text` NOT NULL | |
+| `source_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `name` | `text` NOT NULL | Human-readable label for the feed, e.g. "HDFC Current A/C" |
 | `kind` | `text` NOT NULL | `BANK_FEED` \| `GATEWAY` \| `ERP` \| `MANUAL_UPLOAD` — descriptive only |
 | `status` | `text` NOT NULL DEFAULT `'CONNECTED'` | Not currently enforced anywhere |
 | `stream` | `text` NOT NULL | `BANK` \| `INVOICE` \| `CUSTOMER` \| `LEDGER` \| `GATEWAY` — fixed at creation, drives which canonical table an upload lands in |
@@ -325,14 +325,14 @@ Migrations: `0011` (create), `0023`/`0024` (add `stream`, backfill, then `NOT NU
 
 | Column | Type | Notes |
 |---|---|---|
-| `job_id` | `uuid` PK | |
-| `source_id` | `uuid` FK → `data_sources` | |
-| `file_name` / `format` | `text` | |
-| `trigger_type` | `text` NOT NULL DEFAULT `'MANUAL'` | |
-| `row_count` / `error_count` | `int` NOT NULL DEFAULT `0` | |
-| `status` | `text` NOT NULL DEFAULT `'PENDING'` (was `'RUNNING'` before `0020`) | |
-| `started_by` | `uuid` FK → `users` | |
-| `started_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `job_id` | `uuid` PK | Primary key |
+| `source_id` | `uuid` FK → `data_sources` | Which data source this job ingested for |
+| `file_name` / `format` | `text` | `format`: only `CSV` is actually parsed today — `XLSX`/`MT940`/`OFX` are accepted as valid values but fail every job that uses them |
+| `trigger_type` | `text` NOT NULL DEFAULT `'MANUAL'` | Always `'MANUAL'` in the current code — the column exists for a future scheduled/webhook trigger path |
+| `row_count` / `error_count` | `int` NOT NULL DEFAULT `0` | Rows read and rows rejected for this job; set when the job finishes |
+| `status` | `text` NOT NULL DEFAULT `'PENDING'` (was `'RUNNING'` before `0020`) | Lifecycle e.g. `PENDING` → `RUNNING` → `SUCCEEDED`/`FAILED`; see `0020`'s lease/retry columns below |
+| `started_by` | `uuid` FK → `users` | Always `NULL` today — auth isn't wired into the ingestion path yet |
+| `started_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the job was created/enqueued, not when a worker actually claimed it |
 | `locked_by` / `locked_at` / `lease_expires_at` | `text` / `timestamptz` / `timestamptz` | Lease-based claiming (`0020`) — a worker does `SELECT ... FOR UPDATE SKIP LOCKED`, and a dead worker's job self-heals once the lease expires |
 | `attempt_count` / `max_attempts` / `next_attempt_at` / `last_error` | | Exponential-backoff retry state (`0020`); dead-letters to `FAILED` past `max_attempts` |
 | `file_uri` | `text` | (`0020`) |
@@ -349,14 +349,14 @@ Index: `idx_ingestion_jobs_claimable` on `(status, next_attempt_at)`; `idx_inges
 
 | Column | Type | Notes |
 |---|---|---|
-| `mapping_id` | `uuid` PK | |
+| `mapping_id` | `uuid` PK | Primary key |
 | `stream` | `text` NOT NULL | Scoping key as of `0026` — **not** `source_id` (that column was dropped); one mapping set is shared by every data source/entity/org ingesting that stream |
-| `version` | `int` NOT NULL DEFAULT `1` | |
+| `version` | `int` NOT NULL DEFAULT `1` | Mapping-set version for the stream; lets a new mapping be staged without touching rows already ingested under the old one |
 | `source_field` | `text` NOT NULL | Raw column name as it appears in the source file; multiple rows may target the same `canonical_field` as synonyms |
 | `canonical_field` | `text` NOT NULL | Target column on the stream's real table |
-| `transform` | `text` NOT NULL DEFAULT `'NONE'` | |
-| `transform_param` | `text` | |
-| `is_active` | `boolean` NOT NULL DEFAULT `true` | |
+| `transform` | `text` NOT NULL DEFAULT `'NONE'` | One of 9 transforms applied to the raw value (`NONE`, `CONST`, `TO_MINOR_UNITS`, `PARSE_DATE`, `REGEX`, ...) — see `docs/data-hub.md` §4 |
+| `transform_param` | `text` | Meaning depends on `transform` — e.g. the constant for `CONST`, the multiplier/negate flag for `TO_MINOR_UNITS`, the date formats for `PARSE_DATE`, the capture pattern for `REGEX` |
+| `is_active` | `boolean` NOT NULL DEFAULT `true` | Lets a synonym row be retired without deleting history |
 
 Migrations: `0011` (create, originally `source_id`-scoped), `0026` (add `stream`, backfill from `data_sources.stream`, `NOT NULL`, drop `source_id`).
 
@@ -368,12 +368,12 @@ Migrations: `0011` (create, originally `source_id`-scoped), `0026` (add `stream`
 
 | Column | Type | Notes |
 |---|---|---|
-| `definition_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `name` | `text` NOT NULL | |
-| `recon_type` | `text` NOT NULL | e.g. AR, AP, Bank |
-| `cadence` | `text` | |
-| `owner_user_id` | `uuid` FK → `users` | |
+| `definition_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `name` | `text` NOT NULL | Display name for the reconciliation card, e.g. "AR - India" |
+| `recon_type` | `text` NOT NULL | e.g. AR, AP, Bank — only `AR` has an engine implementation today |
+| `cadence` | `text` | Free-text schedule description, e.g. "Monthly" — descriptive only, not tied to a scheduler |
+| `owner_user_id` | `uuid` FK → `users` | User responsible for this reconciliation |
 
 One row per configured reconciliation (the thing a "reconciliation card" in the UI represents). Migrations: `0012`.
 
@@ -381,14 +381,14 @@ One row per configured reconciliation (the thing a "reconciliation card" in the 
 
 | Column | Type | Notes |
 |---|---|---|
-| `rule_id` | `uuid` PK | |
-| `definition_id` | `uuid` FK → `reconciliation_definitions`, ON DELETE CASCADE | |
+| `rule_id` | `uuid` PK | Primary key |
+| `definition_id` | `uuid` FK → `reconciliation_definitions`, ON DELETE CASCADE | Owning reconciliation definition |
 | `phase` | `text` NOT NULL | e.g. customer identification, invoice allocation, GL check |
 | `kind` | `text` NOT NULL | The specific matcher, e.g. exact-amount, fuzzy-name |
-| `name` | `text` NOT NULL | |
+| `name` | `text` NOT NULL | Human-readable rule label shown in the UI |
 | `priority` | `int` NOT NULL | Cascading order within a phase — first match wins |
-| `enabled` | `boolean` NOT NULL DEFAULT `true` | |
-| `confidence` | `smallint` | |
+| `enabled` | `boolean` NOT NULL DEFAULT `true` | Disabled rules are skipped without deleting the row |
+| `confidence` | `smallint` | Score (0-100) attached to a match this rule produces; used to rank/display match certainty |
 | `config` | `jsonb` NOT NULL DEFAULT `'{}'` | Rule-specific tunables (thresholds, field selections) |
 
 UNIQUE `(definition_id, phase, priority)`. Migrations: `0012`.
@@ -397,17 +397,17 @@ UNIQUE `(definition_id, phase, priority)`. Migrations: `0012`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `run_id` | `uuid` PK | |
-| `definition_id` | `uuid` FK → `reconciliation_definitions` | |
+| `run_id` | `uuid` PK | Primary key |
+| `definition_id` | `uuid` FK → `reconciliation_definitions` | Which reconciliation this run executes |
 | `run_no` | `text` UNIQUE NOT NULL | Human-facing run identifier |
-| `period_start` / `period_end` | `date` | |
-| `status` | `text` NOT NULL DEFAULT `'DRAFT'` | |
-| `volume` / `matched_count` / `exception_count` | `int` | |
-| `matched_value_minor` / `exception_value_minor` / `unapplied_minor` | `bigint` | |
-| `prepared_by` / `reviewed_by` | `uuid` FK → `users` | |
-| `signed_at` | `timestamptz` | |
+| `period_start` / `period_end` | `date` | The date range this run reconciles |
+| `status` | `text` NOT NULL DEFAULT `'DRAFT'` | Lifecycle `DRAFT → QUEUED → RUNNING → COMPUTED → APPROVED → CLOSED` (or `FAILED`) |
+| `volume` / `matched_count` / `exception_count` | `int` | Row counts populated once the run computes: total items considered, matches, and open exceptions |
+| `matched_value_minor` / `exception_value_minor` / `unapplied_minor` | `bigint` | Value totals populated once the run computes, in the entity's home currency minor unit |
+| `prepared_by` / `reviewed_by` | `uuid` FK → `users` | The maker/checker pair shown on sign-off |
+| `signed_at` | `timestamptz` | When the run was approved/signed off |
 | `run_hash` | `text` | Integrity hash over the run's final state, computed at sign-off |
-| `started_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `started_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the run was created/queued |
 
 Index: `idx_runs_status` on `(status, period_end)`. This is the "one snapshot of a reconciliation actually running" row — `match_groups`, `reconciliation_exceptions`, and `gl_journal_entries` all key off `run_id`. Migrations: `0012`.
 
@@ -419,26 +419,26 @@ Index: `idx_runs_status` on `(status, period_end)`. This is the "one snapshot of
 
 | Column | Type | Notes |
 |---|---|---|
-| `bank_txn_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `gl_account_id` | `uuid` FK → `gl_accounts` | |
-| `source_job_id` | `uuid` FK → `ingestion_jobs` | |
+| `bank_txn_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `gl_account_id` | `uuid` FK → `gl_accounts` | Which bank/cash GL account this line posted against |
+| `source_job_id` | `uuid` FK → `ingestion_jobs` | Ingestion job that created this row |
 | `document_number` / `line_number` | `text` / `int` | Always `NULL` on the CSV ingestion path today — see `row_hash` below |
-| `bank_reference` | `text` | |
-| `transaction_date` / `value_date` | `date` | |
-| `fiscal_year` / `fiscal_period` | `int` / `smallint` | |
+| `bank_reference` | `text` | Bank's own reference/UTR; matched against `expected_remittances.utr_number` and used by the duplicate-UTR pre-check and `uniq_reconciled_ref` |
+| `transaction_date` / `value_date` | `date` | Date the transaction posted vs. the date value was available; `value_date` nullable when the source doesn't distinguish them |
+| `fiscal_year` / `fiscal_period` | `int` / `smallint` | Accounting period the transaction falls in, if the source supplies it |
 | `narration` | `text` | Free-text line — several customer-identification rules parse this (UPI handle, customer code, GSTIN) |
-| `payer_name` / `payer_account_no` / `payer_ifsc` | `text` | |
-| `currency` | `char(3)` FK → `currencies` | |
-| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | |
-| `fx_rate` | `numeric(18,8)` | |
-| `dr_cr` | `text` NOT NULL | |
-| `explicit_fee_minor` | `bigint` NOT NULL DEFAULT `0` | |
+| `payer_name` / `payer_account_no` / `payer_ifsc` | `text` | Payer's name and bank details as reported by the feed; `payer_account_no`/`payer_ifsc` back the account+IFSC identification rule via `idx_cust_bank_acct` |
+| `currency` | `char(3)` FK → `currencies` | Transaction's original currency |
+| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | Transaction amount in the statement's own currency and converted to entity home currency |
+| `fx_rate` | `numeric(18,8)` | Rate used for the `amount_minor` → `amount_home_minor` conversion |
+| `dr_cr` | `text` NOT NULL | `DEBIT` or `CREDIT` — a customer remittance is always a `CREDIT` row |
+| `explicit_fee_minor` | `bigint` NOT NULL DEFAULT `0` | Fee the bank already deducted before crediting this row, as reported by the source — decoupled from the settlement amount by the bank-fee allocation rule |
 | `is_bank_charge` | `boolean` NOT NULL DEFAULT `false` | A pure bank fee, not a customer remittance — bypasses customer identification entirely |
-| `contra_reference` | `text` | |
-| `recon_status` | `text` NOT NULL DEFAULT `'PENDING'` | |
-| `gl_posted` | `boolean` NOT NULL DEFAULT `false` | |
-| `raw` | `jsonb` | |
+| `contra_reference` | `text` | Cross-reference to a related/offsetting bank line, when the source supplies one |
+| `recon_status` | `text` NOT NULL DEFAULT `'PENDING'` | e.g. `PENDING` / `MATCHED` — drives `idx_bank_status` and `uniq_reconciled_ref` |
+| `gl_posted` | `boolean` NOT NULL DEFAULT `false` | Set once this row's matched outcome has been posted to `gl_journal_entries` |
+| `raw` | `jsonb` | Passthrough of unmapped source columns, same convention as `customers`/`invoices` |
 | `valid` | `boolean` NOT NULL DEFAULT `true` | (`0022`) |
 | `issues` | `text[]` | (`0022`) |
 | `row_hash` | `text` | Per-row content hash (`0025`) — rejects byte-identical rows even from a different, partially-overlapping file upload |
@@ -449,13 +449,13 @@ UNIQUE `(entity_id, document_number, line_number)`. Indexes: `idx_bank_ref` on `
 
 | Column | Type | Notes |
 |---|---|---|
-| `payment_id` | `uuid` PK | |
+| `payment_id` | `uuid` PK | Primary key |
 | `bank_txn_id` | `uuid` UNIQUE NOT NULL, FK → `bank_statements` | One payment per bank inflow row — a bank credit *is* the payment record, there's no separate payments upload |
 | `customer_id` | `uuid` FK → `customers` | Null until customer identification locks one |
-| `total_received_minor` / `unapplied_minor` | `bigint` NOT NULL | |
+| `total_received_minor` / `unapplied_minor` | `bigint` NOT NULL | `total_received_minor` mirrors the parent bank row's `amount_minor`; `unapplied_minor` is the portion not yet allocated to an invoice |
 | `locked_by_rule_id` | `uuid` FK → `reconciliation_rules` | Which rule identified the customer |
 | `candidate_pool` | `jsonb` | When identification can't lock to exactly one customer, the narrowed short list lands here for human resolution |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the payment record was created, alongside its parent bank row |
 
 Migrations: `0013`.
 
@@ -463,19 +463,19 @@ Migrations: `0013`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `settlement_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `source_job_id` | `uuid` FK → `ingestion_jobs` | |
+| `settlement_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `source_job_id` | `uuid` FK → `ingestion_jobs` | Ingestion job that created this row |
 | `gateway` | `text` NOT NULL | e.g. Razorpay, Stripe |
-| `gateway_transaction_id` | `text` NOT NULL | |
-| `customer_id` | `uuid` FK → `customers` | |
+| `gateway_transaction_id` | `text` NOT NULL | Gateway's own transaction ID, paired with `gateway` for uniqueness |
+| `customer_id` | `uuid` FK → `customers` | Customer identified for this settlement, once matched |
 | `bank_txn_id` | `uuid` FK → `bank_statements` | The payout leg this settlement nets into, once matched |
-| `currency` | `char(3)` FK → `currencies` | |
-| `gross_amount_minor` / `fee_minor` / `gst_on_fee_minor` / `net_settled_minor` | `bigint` NOT NULL (fee/GST default `0`) | |
-| `settlement_date` | `date` NOT NULL | |
-| `matched` | `boolean` NOT NULL DEFAULT `false` | |
-| `raw` | `jsonb` | |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `currency` | `char(3)` FK → `currencies` | Settlement's original currency |
+| `gross_amount_minor` / `fee_minor` / `gst_on_fee_minor` / `net_settled_minor` | `bigint` NOT NULL (fee/GST default `0`) | Gateway's own breakdown: amount collected, gateway fee, GST on that fee, and the net amount paid out — `net_settled_minor` should tie to the payout leg in `bank_statements` |
+| `settlement_date` | `date` NOT NULL | Date the gateway settled/paid out this batch |
+| `matched` | `boolean` NOT NULL DEFAULT `false` | Set once this settlement has been tied to its payout leg in `bank_statements` |
+| `raw` | `jsonb` | Passthrough of unmapped source columns |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the settlement row was ingested |
 
 UNIQUE `(gateway, gateway_transaction_id)`. Migrations: `0013`.
 
@@ -487,15 +487,15 @@ UNIQUE `(gateway, gateway_transaction_id)`. Migrations: `0013`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `match_group_id` | `uuid` PK | |
-| `run_id` | `uuid` FK → `reconciliation_runs`, ON DELETE CASCADE | |
+| `match_group_id` | `uuid` PK | Primary key |
+| `run_id` | `uuid` FK → `reconciliation_runs`, ON DELETE CASCADE | Owning run |
 | `match_type` | `text` NOT NULL | e.g. exact, subset-sum, manual |
 | `rule_id` | `uuid` FK → `reconciliation_rules` | Null for a manual match |
-| `confidence` | `smallint` | |
-| `status` | `text` NOT NULL DEFAULT `'AUTO_MATCHED'` | |
-| `reason` | `text` | |
-| `created_by` | `uuid` FK → `users` | |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `confidence` | `smallint` | Score (0-100) carried over from the producing rule, or set manually for a `MANUAL` match |
+| `status` | `text` NOT NULL DEFAULT `'AUTO_MATCHED'` | `AUTO_MATCHED` / `SUGGESTED` / `CONFIRMED` / `REJECTED` — whether a human still needs to confirm this match |
+| `reason` | `text` | Free-text explanation, mainly populated for a `SUGGESTED` or `REJECTED` match |
+| `created_by` | `uuid` FK → `users` | User who created a `MANUAL` match; `NULL` for an engine-produced one |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the match was made |
 
 A match group is one resolved outcome — it can cover one invoice/one payment, or several of each (subset-sum). Migrations: `0014`.
 
@@ -503,14 +503,14 @@ A match group is one resolved outcome — it can cover one invoice/one payment, 
 
 | Column | Type | Notes |
 |---|---|---|
-| `allocation_id` | `uuid` PK | |
-| `match_group_id` | `uuid` FK → `match_groups`, ON DELETE CASCADE | |
-| `invoice_id` | `uuid` FK → `invoices` | |
-| `payment_id` | `uuid` FK → `payments` | |
-| `bank_txn_id` | `uuid` FK → `bank_statements` | |
+| `allocation_id` | `uuid` PK | Primary key |
+| `match_group_id` | `uuid` FK → `match_groups`, ON DELETE CASCADE | Owning match group |
+| `invoice_id` | `uuid` FK → `invoices` | Invoice this allocation applies to |
+| `payment_id` | `uuid` FK → `payments` | Payment this allocation draws from |
+| `bank_txn_id` | `uuid` FK → `bank_statements` | Denormalized copy of the underlying bank line, for querying without joining through `payments` |
 | `allocated_minor` | `bigint` NOT NULL, CHECK `> 0` | The actual amount applied to this invoice from this payment |
 | `gl_journal_id` | `uuid` FK → `gl_journal_entries` | FK added in `0015` once that table exists (the column itself is created in `0014`) |
-| `allocated_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `allocated_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the allocation was made |
 
 UNIQUE `(match_group_id, invoice_id, payment_id)`. Indexes: `idx_alloc_invoice`, `idx_alloc_payment`. The line-item detail beneath a `match_group` — one payment can allocate across several invoices (or vice versa) as separate rows here. Migrations: `0014`, `0015` (FK).
 
@@ -522,14 +522,14 @@ UNIQUE `(match_group_id, invoice_id, payment_id)`. Indexes: `idx_alloc_invoice`,
 
 | Column | Type | Notes |
 |---|---|---|
-| `journal_id` | `uuid` PK | |
-| `entity_id` | `uuid` FK → `entities` | |
-| `run_id` | `uuid` FK → `reconciliation_runs` | |
-| `posting_date` | `date` NOT NULL | |
+| `journal_id` | `uuid` PK | Primary key |
+| `entity_id` | `uuid` FK → `entities` | Owning entity |
+| `run_id` | `uuid` FK → `reconciliation_runs` | Reconciliation run that generated this entry, if any |
+| `posting_date` | `date` NOT NULL | Date the entry posts to the ledger |
 | `source_type` | `text` NOT NULL | What generated this entry |
-| `memo` | `text` | |
-| `posted_by` | `uuid` FK → `users` | |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `memo` | `text` | Free-text description shown alongside the entry |
+| `posted_by` | `uuid` FK → `users` | User who posted the entry, when posted manually |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the entry was created |
 
 Migrations: `0015`.
 
@@ -537,14 +537,14 @@ Migrations: `0015`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `line_id` | `uuid` PK | |
-| `journal_id` | `uuid` FK → `gl_journal_entries`, ON DELETE CASCADE | |
-| `line_number` | `int` NOT NULL | |
-| `gl_account_id` | `uuid` FK → `gl_accounts`, NOT NULL | |
-| `dr_cr` | `text` NOT NULL | |
-| `currency` | `char(3)` FK → `currencies` | |
-| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | |
-| `business_partner_id` | `uuid` FK → `customers` | |
+| `line_id` | `uuid` PK | Primary key |
+| `journal_id` | `uuid` FK → `gl_journal_entries`, ON DELETE CASCADE | Owning journal entry |
+| `line_number` | `int` NOT NULL | Ordering/display index of this line within the journal entry |
+| `gl_account_id` | `uuid` FK → `gl_accounts`, NOT NULL | GL account this line debits or credits |
+| `dr_cr` | `text` NOT NULL | `DEBIT` or `CREDIT` |
+| `currency` | `char(3)` FK → `currencies` | Line's currency, usually the entity's home currency |
+| `amount_minor` / `amount_home_minor` | `bigint` NOT NULL | Line amount in its own currency and converted to entity home currency; every journal entry's lines must net to zero |
+| `business_partner_id` | `uuid` FK → `customers` | Customer this line is against, for AR-control lines |
 
 UNIQUE `(journal_id, line_number)`. Standard debit/credit line double-entry under a journal entry. Migrations: `0015`.
 
@@ -552,10 +552,10 @@ UNIQUE `(journal_id, line_number)`. Standard debit/credit line double-entry unde
 
 | Column | Type | Notes |
 |---|---|---|
-| `balance_id` | `uuid` PK | |
-| `gl_account_id` | `uuid` FK → `gl_accounts`, NOT NULL | |
-| `period_date` | `date` NOT NULL | |
-| `control_balance_minor` | `bigint` NOT NULL | |
+| `balance_id` | `uuid` PK | Primary key |
+| `gl_account_id` | `uuid` FK → `gl_accounts`, NOT NULL | The control account this balance is for |
+| `period_date` | `date` NOT NULL | Accounting period the balance is as-of |
+| `control_balance_minor` | `bigint` NOT NULL | The GL's stated balance for the period, compared against the summed sub-ledger to compute the GL-control variance exception |
 
 UNIQUE `(gl_account_id, period_date)`. What the general ledger's control account says the balance is for a period — compared against the summed sub-ledger (`invoices.balance_due_minor`) to compute the GL-control variance exception. Migrations: `0015`.
 
@@ -567,20 +567,20 @@ UNIQUE `(gl_account_id, period_date)`. What the general ledger's control account
 
 | Column | Type | Notes |
 |---|---|---|
-| `exception_id` | `uuid` PK | |
-| `run_id` | `uuid` FK → `reconciliation_runs`, ON DELETE CASCADE | |
-| `exception_no` | `text` | |
+| `exception_id` | `uuid` PK | Primary key |
+| `run_id` | `uuid` FK → `reconciliation_runs`, ON DELETE CASCADE | Owning run |
+| `exception_no` | `text` | Human-facing exception identifier, mirroring `reconciliation_runs.run_no` |
 | `exception_type` | `text` NOT NULL | e.g. Short-Pay, Suspense, Multiple Invoice Match, GL Control Mismatch |
-| `bank_txn_id` | `uuid` FK → `bank_statements` | |
-| `invoice_id` | `uuid` FK → `invoices` | |
-| `customer_id` | `uuid` FK → `customers` | |
-| `discrepancy_minor` | `bigint` | |
-| `reason_code` | `text` | |
-| `status` | `text` NOT NULL DEFAULT `'OPEN'` | |
-| `resolution_outcome` / `resolution_notes` | `text` | |
-| `resolver_id` | `uuid` FK → `users` | |
-| `resolved_at` | `timestamptz` | |
-| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `bank_txn_id` | `uuid` FK → `bank_statements` | Whichever of bank line / invoice / customer apply to the `exception_type`, the rest `NULL` |
+| `invoice_id` | `uuid` FK → `invoices` | See `bank_txn_id` above |
+| `customer_id` | `uuid` FK → `customers` | See `bank_txn_id` above |
+| `discrepancy_minor` | `bigint` | Size of the mismatch, e.g. the short-pay amount or GL variance, in minor units |
+| `reason_code` | `text` | Finer-grained categorization within `exception_type`, application-defined |
+| `status` | `text` NOT NULL DEFAULT `'OPEN'` | `OPEN` / `INVESTIGATING` / `RESOLVED` / `AUTO_RESOLVED` / `DEFERRED` / `WRITTEN_OFF` / `ADJUSTED` / `CARRIED_FORWARD` |
+| `resolution_outcome` / `resolution_notes` | `text` | `resolution_outcome`: how it was closed, e.g. `WRITEOFF` / `DISPUTE` / `JOURNAL` / `ON_ACCOUNT`; `resolution_notes`: free-text entered on resolution |
+| `resolver_id` | `uuid` FK → `users` | User who resolved the exception |
+| `resolved_at` | `timestamptz` | When the exception was resolved |
+| `created_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the exception was raised |
 
 Indexes: `idx_exc_run` on `(run_id, status, exception_type)`; `idx_exc_customer` on `customer_id`. Migrations: `0016`.
 
@@ -593,16 +593,16 @@ Indexes: `idx_exc_run` on `(run_id, status, exception_type)`; `idx_exc_customer`
 | Column | Type | Notes |
 |---|---|---|
 | `audit_id` | `bigserial` PK | The one sequential (non-UUID) PK in the schema — audit order matters, and a hash chain over insert order needs it |
-| `at` | `timestamptz` NOT NULL DEFAULT `now()` | |
-| `run_id` | `uuid` FK → `reconciliation_runs` | |
-| `entry_type` | `text` NOT NULL | |
-| `category` | `text` NOT NULL | |
-| `action` | `text` NOT NULL | |
-| `user_id` | `uuid` FK → `users` | |
-| `target_ref` | `text` | |
-| `impact_minor` | `bigint` | |
-| `entity_ref` | `text` | |
-| `old_state` / `new_state` | `jsonb` | |
+| `at` | `timestamptz` NOT NULL DEFAULT `now()` | When the audited event occurred |
+| `run_id` | `uuid` FK → `reconciliation_runs` | Reconciliation run the event relates to, if any |
+| `entry_type` | `text` NOT NULL | Broad classification of the audit row, e.g. state change vs. system event |
+| `category` | `text` NOT NULL | Subject area, e.g. matching, GL posting, exception resolution |
+| `action` | `text` NOT NULL | Specific action taken, e.g. `"MATCH_CONFIRMED"` |
+| `user_id` | `uuid` FK → `users` | User who performed the action; `NULL` for a system-generated event |
+| `target_ref` | `text` | Identifier of the record the action was performed on |
+| `impact_minor` | `bigint` | Monetary impact of the action, if any, in minor units |
+| `entity_ref` | `text` | Which entity the event belongs to |
+| `old_state` / `new_state` | `jsonb` | Before/after snapshot of the affected record, for a state-change event |
 | `prev_hash` / `row_hash` | `text` | Hash-chained — each row's hash covers its own content plus the previous row's hash, so a tampered/deleted row breaks the chain and is detectable |
 
 Indexes: `idx_audit_run` on `(run_id, at DESC)`; `idx_audit_user` on `(user_id, at DESC)`. Migrations: `0017`.
@@ -611,14 +611,14 @@ Indexes: `idx_audit_run` on `(run_id, at DESC)`; `idx_audit_user` on `(user_id, 
 
 | Column | Type | Notes |
 |---|---|---|
-| `document_id` | `uuid` PK | |
-| `file_name` | `text` NOT NULL | |
-| `byte_size` / `mime_type` | `bigint` / `text` | |
-| `category` | `text` | |
-| `storage_uri` | `text` | |
+| `document_id` | `uuid` PK | Primary key |
+| `file_name` | `text` NOT NULL | Original uploaded file name |
+| `byte_size` / `mime_type` | `bigint` / `text` | File size and content type as uploaded |
+| `category` | `text` | Application-defined classification, e.g. supporting evidence for an exception |
+| `storage_uri` | `text` | Where the file actually lives (object storage path) |
 | `linked_type` / `linked_id` | `text` / `uuid` | Polymorphic association — no FK constraint, `linked_type` says which table `linked_id` refers to |
-| `uploaded_by` | `uuid` FK → `users` | |
-| `uploaded_at` | `timestamptz` NOT NULL DEFAULT `now()` | |
+| `uploaded_by` | `uuid` FK → `users` | User who uploaded the document |
+| `uploaded_at` | `timestamptz` NOT NULL DEFAULT `now()` | When the document was uploaded |
 
 Migrations: `0017`.
 
