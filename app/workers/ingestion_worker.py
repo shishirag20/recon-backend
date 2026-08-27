@@ -245,7 +245,19 @@ async def process_ingestion_job(
                         error_count += 1
                 except RowRejected as exc:
                     error_count += 1
-                    failed_rows.append({"raw": raw_row, "issues": issues + [str(exc)]})
+                    # `row_number` is the 1-based *data* row (the header is not
+                    # counted), so it is one less than the file's line number.
+                    # Without it a rejected row is just a bag of values with no
+                    # way to find it again in a 5,000-line source file - which
+                    # is the only fix available, since these rows were never
+                    # inserted anywhere.
+                    failed_rows.append(
+                        {
+                            "row_number": row_count,
+                            "raw": raw_row,
+                            "issues": issues + [str(exc)],
+                        }
+                    )
 
             await conn.execute(
                 "UPDATE ingestion_jobs SET unmapped_columns = $2 WHERE job_id = $1",

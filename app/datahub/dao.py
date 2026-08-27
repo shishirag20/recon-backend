@@ -140,6 +140,29 @@ class DataHubDAO:
             return rows
 
     # -- ingestion_jobs --------------------------------------------------------
+    # `error_count` counts two different populations that need different
+    # remedies (see ingestion_worker.process_ingestion_job): rows that were
+    # inserted but flagged `valid=false` - fixable in place via PATCH
+    # .../records/{id} - and rows that were rejected outright and exist only
+    # in `failed_rows`, where the only fix is correcting the source file and
+    # re-uploading. Splitting them here means every caller gets the honest
+    # breakdown instead of re-deriving it (or, worse, showing one number for
+    # both). `failed_rows` is the authority for the rejected half, so the
+    # split needs no extra query.
+    _JOB_COUNTS_SQL = (
+        "COALESCE(jsonb_array_length(failed_rows), 0) AS rejected_row_count, "
+        "GREATEST(error_count - COALESCE(jsonb_array_length(failed_rows), 0), 0) AS flagged_row_count"
+    )
+
+    # Deliberately omits `failed_rows`: on a large upload it is the biggest
+    # column in the table, and listing jobs shipped every job's entire blob.
+    # Callers that need the rows themselves use get_job / the errors endpoint.
+    _JOB_LIST_COLUMNS = (
+        "job_id, source_id, stream, file_name, format, status, row_count, error_count, "
+        "attempt_count, max_attempts, last_error, unmapped_columns, started_at, "
+        + _JOB_COUNTS_SQL
+    )
+
     async def insert_ingest_job(
         self,
         *,
@@ -156,7 +179,7 @@ class DataHubDAO:
             "INSERT INTO ingestion_jobs "
             "(job_id, source_id, stream, file_name, file_uri, format, content_hash, trigger_type, status, started_by) "
             "VALUES ($1, $2, $3, $4, $5, $6, $7, 'MANUAL', 'PENDING', $8) "
-            "RETURNING *",
+            f"RETURNING *, {self._JOB_COUNTS_SQL}",
             job_id,
             source_id,
             stream,
@@ -172,7 +195,8 @@ class DataHubDAO:
         self, *, source_id: str, content_hash: str
     ) -> dict | None:
         row = await self.conn.fetchrow(
-            "SELECT * FROM ingestion_jobs WHERE source_id = $1 AND content_hash = $2 LIMIT 1",
+            f"SELECT *, {self._JOB_COUNTS_SQL} FROM ingestion_jobs "
+            "WHERE source_id = $1 AND content_hash = $2 LIMIT 1",
             source_id,
             content_hash,
         )
@@ -180,7 +204,8 @@ class DataHubDAO:
 
     async def get_job(self, job_id: str) -> dict | None:
         row = await self.conn.fetchrow(
-            "SELECT * FROM ingestion_jobs WHERE job_id = $1", job_id
+            f"SELECT *, {self._JOB_COUNTS_SQL} FROM ingestion_jobs WHERE job_id = $1",
+            job_id,
         )
         return _row(row)
 
@@ -188,7 +213,7 @@ class DataHubDAO:
         self, *, source_id: str | None, status: str | None, limit: int, offset: int
     ) -> list[dict]:
         rows = await self.conn.fetch(
-            "SELECT * FROM ingestion_jobs "
+            f"SELECT {self._JOB_LIST_COLUMNS} FROM ingestion_jobs "
             "WHERE ($1::uuid IS NULL OR source_id = $1) "
             "AND ($2::text IS NULL OR status = $2) "
             "ORDER BY started_at DESC LIMIT $3 OFFSET $4",
@@ -203,7 +228,7 @@ class DataHubDAO:
         row = await self.conn.fetchrow(
             "UPDATE ingestion_jobs SET status = 'PENDING', attempt_count = 0, next_attempt_at = NULL, last_error = NULL "
             "WHERE job_id = $1 AND status = 'FAILED' "
-            "RETURNING *",
+            f"RETURNING *, {self._JOB_COUNTS_SQL}",
             job_id,
         )
         return _row(row)

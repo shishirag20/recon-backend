@@ -235,6 +235,16 @@ class IngestionJobOut(BaseModel):
     status: str = Field(description="PENDING -> RUNNING -> SUCCESS/PARTIAL, or PENDING (retry) / FAILED on error.")
     row_count: int
     error_count: int = Field(description="Rows with issues but still inserted, plus rows in failed_rows that couldn't be inserted at all.")
+    rejected_row_count: int = Field(
+        default=0,
+        description="The failed_rows half of error_count: rows that were never inserted anywhere. "
+        "Fixing one means correcting the source file and re-uploading.",
+    )
+    flagged_row_count: int = Field(
+        default=0,
+        description="The other half of error_count: rows that WERE inserted but carry valid=false "
+        "and an issues list. Fixable in place via PATCH /ingestion-jobs/{job_id}/records/{record_id}.",
+    )
     attempt_count: int
     max_attempts: int
     last_error: str | None = Field(description="Set when status is FAILED or a retry is pending.")
@@ -244,10 +254,83 @@ class IngestionJobOut(BaseModel):
         "AI-suggestion stub couldn't resolve either - nothing auto-resolves these yet (see app/datahub/ai_mapping.py).",
     )
     failed_rows: list[dict] | None = Field(
+        default=None,
         description="Rows that couldn't satisfy the canonical table's required columns at all - "
-        "each is {raw, issues}. These were never inserted anywhere; fixing one means correcting "
-        "the source file and re-uploading, not an in-app edit."
+        "each is {row_number, raw, issues}. These were never inserted anywhere; fixing one means "
+        "correcting the source file and re-uploading, not an in-app edit. Only populated by "
+        "GET /ingestion-jobs/{job_id} - the list endpoint omits it because on a large upload it is "
+        "the biggest column in the table. Prefer GET /ingestion-jobs/{job_id}/errors, which returns "
+        "a grouped summary instead of the raw blob.",
     )
     started_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# -- ingestion errors ----------------------------------------------------------
+class IngestionErrorSample(BaseModel):
+    row_number: int | None = Field(
+        default=None,
+        description="1-based data row in the uploaded file, header excluded, so the file's line "
+        "number is this + 1. Null on jobs ingested before row numbers were recorded.",
+    )
+    raw: dict = Field(description="The source row exactly as read, before mapping.")
+    issues: list[str] = Field(
+        description="Every issue recorded for this row, in order. The last entry is the cause of "
+        "rejection; earlier entries are contributing problems."
+    )
+
+
+class IngestionErrorGroup(BaseModel):
+    code: str = Field(
+        description="Stable machine-readable reason: MISSING_REQUIRED_FIELD, TRANSFORM_FAILED, "
+        "DUPLICATE_ROW, DUPLICATE_KEY, CURRENCY_MISMATCH, INVALID_VALUE, VALUE_TOO_LONG, "
+        "UNKNOWN_REFERENCE, NUMERIC_OVERFLOW, UNKNOWN_FIELD, or OTHER."
+    )
+    reason: str = Field(description="Human-readable explanation, safe to render directly.")
+    field: str | None = Field(
+        default=None, description="The canonical field this reason concerns, when it concerns one."
+    )
+    count: int = Field(description="How many rejected rows share this reason.")
+    contributing_issues: list[str] = Field(
+        default_factory=list,
+        description="Other issues seen on rows in this group, with per-row literals stripped. "
+        "These did not on their own cause the rejection.",
+    )
+    samples: list[IngestionErrorSample] = Field(
+        default_factory=list, description="Up to `sample_limit` example rows from this group."
+    )
+
+
+class IngestionJobErrorsOut(BaseModel):
+    """Answers 'why did this upload go wrong?' in one call, without making the
+    client download and group the job's entire failed_rows blob."""
+
+    job_id: UUID
+    file_name: str | None
+    stream: str | None
+    status: str
+    row_count: int
+    error_count: int
+    rejected_row_count: int
+    flagged_row_count: int
+    last_error: str | None = Field(
+        description="Job-level fatal reason - the file never got far enough to produce rows at all "
+        "(no active field mapping, unreadable file, unsupported format). Distinct from row errors: "
+        "when this is set, row_count is typically 0 and `groups` is empty."
+    )
+    attempt_count: int
+    max_attempts: int
+    unmapped_columns: list[str] | None = Field(
+        default=None,
+        description="File headers that matched no synonym in the active mapping. Their values were "
+        "dropped silently - not an error, but a data-loss risk worth surfacing.",
+    )
+    groups: list[IngestionErrorGroup] = Field(
+        default_factory=list, description="Rejected rows grouped by cause, most frequent first."
+    )
+    sample_limit: int = Field(description="Max samples returned per group, echoed back.")
+    groups_truncated: bool = Field(
+        default=False,
+        description="True when there were more distinct causes than the response caps at.",
+    )

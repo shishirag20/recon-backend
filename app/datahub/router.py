@@ -23,6 +23,7 @@ from app.datahub.schema import (
     DataSourceUpdate,
     FieldMappingOut,
     FieldMappingSet,
+    IngestionJobErrorsOut,
     IngestionJobOut,
     MappingPreviewRequest,
     MappingPreviewResponse,
@@ -221,6 +222,40 @@ async def list_ingestion_jobs(
 @router.get("/ingestion-jobs/{job_id}", response_model=IngestionJobOut, summary="Get an ingestion job")
 async def get_ingestion_job(job_id: UUID, service: DataHubService = Depends(get_service)):
     return await service.get_job(job_id)
+
+
+@router.get(
+    "/ingestion-jobs/{job_id}/errors",
+    response_model=IngestionJobErrorsOut,
+    summary="Why an ingestion job produced errors",
+)
+async def get_ingestion_job_errors(
+    job_id: UUID,
+    sample_limit: int = Query(
+        3, ge=0, le=25, description="Example rows returned per reason group."
+    ),
+    service: DataHubService = Depends(get_service),
+):
+    """Groups the job's rejected rows (`failed_rows`) by *why* they were
+    rejected, so a 5,000-row upload with 800 rejects answers "what do I fix?"
+    in one small response instead of 800 raw rows the client has to group
+    itself.
+
+    Three populations are reported separately because their remedies differ:
+
+    - `last_error` - the job never produced rows at all (no active field
+      mapping, unreadable file, unsupported format). Fix the setup, then retry.
+    - `rejected_row_count` / `groups` - rows that could not be inserted.
+      They exist nowhere else; the only fix is correcting the source file and
+      re-uploading, so `samples` carry the raw row and its file row number.
+    - `flagged_row_count` - rows that WERE inserted with `valid=false`. Those
+      are editable in place; list them via
+      `GET /ingestion-jobs/{job_id}/records?valid=false`, not here.
+
+    `unmapped_columns` is reported alongside as a data-loss warning: those file
+    columns parsed fine and were silently discarded.
+    """
+    return await service.get_job_errors(job_id, sample_limit=sample_limit)
 
 
 @router.post(

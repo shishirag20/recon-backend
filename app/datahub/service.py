@@ -16,7 +16,7 @@ import os
 from fastapi import HTTPException, UploadFile, status
 from starlette.concurrency import run_in_threadpool
 
-from app.datahub import transforms
+from app.datahub import errors, transforms
 from app.datahub.canonical import (
     EDITABLE_FIELDS,
     KNOWN_FIELDS,
@@ -331,6 +331,46 @@ class DataHubService:
         return await self.dao.list_jobs(
             source_id=source_id, status=status_, limit=limit, offset=offset
         )
+
+    async def get_job_errors(self, job_id: str, *, sample_limit: int):
+        """Diagnosis for one job: the job-level fatal reason if there is one,
+        plus its rejected rows grouped by cause.
+
+        `flagged_row_count` is derived rather than queried. The worker
+        increments `error_count` once per inserted-but-flagged row and once
+        per rejected row, and every rejected row also lands in `failed_rows`
+        - so the difference is exactly the flagged population. Counting it off
+        the canonical table would cost a second query to reach the same
+        number, and would then disagree with the list endpoint, which has no
+        cheap way to do that per row.
+        """
+        job = await self.get_job(job_id)  # 404s if missing
+        failed_rows = [r for r in (job.get("failed_rows") or []) if isinstance(r, dict)]
+        groups = errors.group_failed_rows(failed_rows, sample_limit=sample_limit)
+        distinct_causes = len(
+            {
+                errors.classify(str((entry.get("issues") or [""])[-1]))
+                for entry in failed_rows
+            }
+        )
+        rejected = len(failed_rows)
+        return {
+            "job_id": job["job_id"],
+            "file_name": job.get("file_name"),
+            "stream": job.get("stream"),
+            "status": job["status"],
+            "row_count": job["row_count"],
+            "error_count": job["error_count"],
+            "rejected_row_count": rejected,
+            "flagged_row_count": max(job["error_count"] - rejected, 0),
+            "last_error": job.get("last_error"),
+            "attempt_count": job["attempt_count"],
+            "max_attempts": job["max_attempts"],
+            "unmapped_columns": job.get("unmapped_columns"),
+            "groups": groups,
+            "sample_limit": sample_limit,
+            "groups_truncated": distinct_causes > len(groups),
+        }
 
     async def retry_job(self, job_id: str):
         await self.get_job(job_id)  # 404s if missing
