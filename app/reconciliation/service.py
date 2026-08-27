@@ -126,7 +126,40 @@ class ReconciliationService:
         return row
 
     async def list_definitions(self, *, entity_id: str | None):
-        return await self.dao.list_definitions(entity_id=entity_id)
+        rows = await self.dao.list_definitions_with_latest_run(entity_id=entity_id)
+        return [self._summarize_definition(row) for row in rows]
+
+    @staticmethod
+    def _summarize_definition(row: dict) -> dict:
+        """Folds `list_definitions_with_latest_run`'s raw last-run columns
+        into the display-ready shape DefinitionOut expects - never run at
+        all vs. run but nothing matched are genuinely different states
+        (`status` distinguishes them; `match_rate` is 0 in both, since
+        there's no meaningful percentage of zero volume)."""
+        if row["last_run_id"] is None:
+            status_label = "NOT_RUN"
+            match_rate = 0
+        else:
+            status_label = "NEEDS_RESOLUTION" if row["open_exceptions"] > 0 else row["last_run_status"]
+            match_rate = (
+                round(100 * row["matched_count"] / row["volume"])
+                if row["volume"] else 0
+            )
+        return {
+            "definition_id": row["definition_id"],
+            "entity_id": row["entity_id"],
+            "name": row["name"],
+            "recon_type": row["recon_type"],
+            "cadence": row["cadence"],
+            "owner_user_id": row["owner_user_id"],
+            "status": status_label,
+            "match_rate": match_rate,
+            "volume": row["volume"] or 0,
+            "matched_count": row["matched_count"] or 0,
+            "open_exceptions": row["open_exceptions"],
+            "unreconciled_minor": row["unapplied_minor"] or 0,
+            "last_run_at": row["last_run_at"],
+        }
 
     # -- reconciliation_rules ------------------------------------------------------
     async def list_rules(self, definition_id: str):

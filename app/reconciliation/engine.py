@@ -225,7 +225,13 @@ async def run_phase_1(
                 break
 
         # Phase 1b (CANDIDATE_POOL) - only reached if 1a locked nothing.
+        # `pool_source_rule_id` records whichever rule actually produced
+        # `candidates` - either the pooling rule here, or (below) the
+        # NARRATION_CHECK cross-check's single-candidate fallback when no
+        # pooling rule found anything - so the UI can attribute a pooled
+        # match to the real rule that pooled it, not just say "pooled".
         candidates: list[str] = []
+        pool_source_rule_id: str | None = None
         if result is None or not result.customer_id:
             for rule in pooling_rules:
                 rule_fn = POOLING_RULES.get(rule["kind"])
@@ -233,6 +239,7 @@ async def run_phase_1(
                     continue
                 candidates = await rule_fn(bank_txn, ctx, rule["config"])
                 if candidates:
+                    pool_source_rule_id = rule["rule_id"]
                     break
 
         # Phase 1c (NARRATION_CHECK) - runs after both 1a and 1b have had
@@ -346,6 +353,7 @@ async def run_phase_1(
             # that would silently push a dead-end [None] candidate into Pass
             # A, which can never resolve to anything.)
             candidates = [narration_match["customer_id"]]
+            pool_source_rule_id = crosscheck_rule["rule_id"] if crosscheck_rule is not None else None
 
         if candidates:
             payment = await dao.insert_payment(
@@ -354,6 +362,7 @@ async def run_phase_1(
                 total_received_minor=amount_minor,
                 locked_by_rule_id=None,
                 candidate_pool=candidates,
+                pooled_by_rule_id=pool_source_rule_id,
             )
             outcomes.append(
                 {

@@ -28,6 +28,17 @@ class DefinitionOut(BaseModel):
     recon_type: str
     cadence: str | None
     owner_user_id: UUID | None
+    status: str = Field(
+        default="NOT_RUN",
+        description="NOT_RUN (never run) | NEEDS_RESOLUTION (latest run has open exceptions) | "
+        "the latest run's own status (QUEUED/RUNNING/COMPUTED/FAILED) otherwise.",
+    )
+    match_rate: int = Field(default=0, description="round(matched_count / volume * 100) for the latest run, 0 if never run.")
+    volume: int = Field(default=0, description="The latest run's total transaction volume (denominator of match_rate).")
+    matched_count: int = Field(default=0, description="The latest run's own matched_count snapshot.")
+    open_exceptions: int = Field(default=0, description="Live count of this definition's OPEN/INVESTIGATING exceptions - not a frozen run-time snapshot.")
+    unreconciled_minor: int = Field(default=0, description="The latest run's unapplied_minor - cash received but not yet applied to anything.")
+    last_run_at: datetime | None = Field(default=None, description="The latest run's started_at, or null if this definition has never been run.")
 
     model_config = {"from_attributes": True}
 
@@ -152,6 +163,11 @@ class AllocationOut(BaseModel):
     allocated_minor: int = Field(description="How much of this payment was actually applied to this invoice - may differ from both invoice_amount_minor and payment_amount_minor.")
 
 
+class CandidatePoolEntry(BaseModel):
+    customer_id: UUID
+    customer_name: str | None
+
+
 class MatchGroupOut(BaseModel):
     match_group_id: UUID
     run_id: UUID
@@ -160,6 +176,19 @@ class MatchGroupOut(BaseModel):
     locked_by_rule_id: UUID | None = Field(description="The CUSTOMER_LOCK-phase rule that identified the payment's customer.")
     narration_crosscheck_rule_id: UUID | None = Field(
         description="The 'Invoice Number in Narration' cross-check rule, set only when it found a narration-referenced invoice and confirmed it belongs to the locked customer."
+    )
+    pooled_by_rule_id: UUID | None = Field(
+        default=None,
+        description="The CANDIDATE_POOL-phase rule (or, when none fired, the NARRATION_CHECK "
+        "cross-check's single-candidate fallback) that produced candidate_pool. Mutually "
+        "exclusive with locked_by_rule_id, same as candidate_pool itself.",
+    )
+    candidate_pool: list[CandidatePoolEntry] = Field(
+        default_factory=list,
+        description="Non-empty only when Phase 1a locked nobody and a Phase 1b (CANDIDATE_POOL) "
+        "rule pooled candidates instead - every customer that pool named, resolved to a name. "
+        "locked_by_rule_id is null in exactly this case (1a never fired), so this is how the UI "
+        "tells 'locked directly' apart from 'narrowed from a candidate pool'.",
     )
     confidence: int | None
     status: str = Field(description="AUTO_MATCHED | SUGGESTED | CONFIRMED | REJECTED")

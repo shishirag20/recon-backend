@@ -78,10 +78,38 @@ class ReconciliationDAO:
         )
         return _row(row)
 
-    async def list_definitions(self, *, entity_id: str | None) -> list[dict]:
+    async def list_definitions_with_latest_run(self, *, entity_id: str | None) -> list[dict]:
+        """Same rows as `list_definitions`, each joined to its own most
+        recent `reconciliation_runs` row (by started_at) - the summary card
+        grid needs "as of the last run" stats without a second round trip
+        per definition. `open_exceptions` is deliberately a live COUNT
+        against `reconciliation_exceptions.status`, not the run's own frozen
+        `exception_count` snapshot - an exception can be resolved well after
+        its run finished, and the card's "Open Exceptions" number should
+        reflect that, not repeat a stale total forever. `matched_count`
+        stays the run's own snapshot (matches can also be unreconciled
+        later via ARMatchedTab's bulk action, but re-deriving a live matched
+        count isn't this card's job - the workspace itself is where that
+        detail lives). Both LEFT JOIN LATERAL - a definition with zero runs
+        still gets a row, every run-derived column just comes back NULL."""
         rows = await self.conn.fetch(
-            "SELECT definition_id, entity_id, name, recon_type, cadence, owner_user_id "
-            "FROM reconciliation_definitions WHERE ($1::uuid IS NULL OR entity_id = $1) ORDER BY name",
+            "SELECT d.definition_id, d.entity_id, d.name, d.recon_type, d.cadence, d.owner_user_id, "
+            "       r.run_id AS last_run_id, r.status AS last_run_status, r.started_at AS last_run_at, "
+            "       r.volume, r.matched_count, r.unapplied_minor, "
+            "       COALESCE(oe.open_exceptions, 0) AS open_exceptions "
+            "FROM reconciliation_definitions d "
+            "LEFT JOIN LATERAL ("
+            "    SELECT run_id, status, started_at, volume, matched_count, unapplied_minor "
+            "    FROM reconciliation_runs "
+            "    WHERE definition_id = d.definition_id "
+            "    ORDER BY started_at DESC LIMIT 1"
+            ") r ON true "
+            "LEFT JOIN LATERAL ("
+            "    SELECT count(*) AS open_exceptions FROM reconciliation_exceptions e "
+            "    WHERE e.run_id = r.run_id AND e.status IN ('OPEN', 'INVESTIGATING')"
+            ") oe ON true "
+            "WHERE ($1::uuid IS NULL OR d.entity_id = $1) "
+            "ORDER BY d.name",
             entity_id,
         )
         return _rows(rows)
@@ -420,6 +448,7 @@ class ReconciliationDAO:
         locked_by_rule_id: str | None,
         candidate_pool: list[str] | None,
         narration_crosscheck_rule_id: str | None = None,
+        pooled_by_rule_id: str | None = None,
     ) -> dict:
         """`unapplied_minor` starts equal to the full received amount -
         nothing's been allocated to an invoice yet; Phase 2 (M2) decrements
@@ -429,19 +458,23 @@ class ReconciliationDAO:
         is set only when the "Invoice Number in Narration" cross-check found a
         narration-referenced invoice AND it agreed with `customer_id` - a
         disagreement raises CUSTOMER_INVOICE_MISMATCH instead and never calls
-        this with a locked customer_id at all."""
+        this with a locked customer_id at all. `pooled_by_rule_id` is the
+        Phase 1b (or, when no pooling rule fired, the NARRATION_CHECK
+        cross-check's single-candidate fallback) rule that produced
+        `candidate_pool` - only meaningful alongside a non-empty pool."""
         row = await self.conn.fetchrow(
             "INSERT INTO payments (payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor, "
-            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id) "
-            "VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5::jsonb, $6) "
+            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id, pooled_by_rule_id) "
+            "VALUES (gen_random_uuid(), $1, $2, $3, $3, $4, $5::jsonb, $6, $7) "
             "RETURNING payment_id, bank_txn_id, customer_id, total_received_minor, unapplied_minor, "
-            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id",
+            "locked_by_rule_id, candidate_pool, narration_crosscheck_rule_id, pooled_by_rule_id",
             bank_txn_id,
             customer_id,
             total_received_minor,
             locked_by_rule_id,
             candidate_pool,
             narration_crosscheck_rule_id,
+            pooled_by_rule_id,
         )
         return _row(row)
 
@@ -839,6 +872,17 @@ class ReconciliationDAO:
             "(SELECT p.narration_crosscheck_rule_id FROM payments p "
             "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
             "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS narration_crosscheck_rule_id, "
+            "(SELECT p.pooled_by_rule_id FROM payments p "
+            "  JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
+            "  WHERE a2.match_group_id = m.match_group_id LIMIT 1) AS pooled_by_rule_id, "
+            "(SELECT COALESCE(json_agg(json_build_object('customer_id', c.customer_id, 'customer_name', c.company_name)), '[]'::json) "
+            "  FROM jsonb_array_elements_text(COALESCE("
+            "    (SELECT p.candidate_pool FROM payments p "
+            "      JOIN invoice_allocations a2 ON a2.payment_id = p.payment_id "
+            "      WHERE a2.match_group_id = m.match_group_id LIMIT 1), '[]'::jsonb"
+            "  )) AS cand(customer_id) "
+            "  JOIN customers c ON c.customer_id = cand.customer_id::uuid"
+            ") AS candidate_pool, "
             "COALESCE(json_agg(json_build_object("
             "  'allocation_id', a.allocation_id, 'invoice_id', a.invoice_id, 'invoice_number', inv.invoice_number, "
             "  'invoice_amount_minor', inv.total_amount_minor, "
